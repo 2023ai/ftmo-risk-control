@@ -13,8 +13,8 @@ namespace FtmoRiskControl
         [Parameter("Risk API Base URL", DefaultValue = "http://127.0.0.1:8765")]
         public string RiskApiBaseUrl { get; set; }
 
-        [Parameter("Risk API Token", DefaultValue = "")]
-        public string RiskApiToken { get; set; }
+        [Parameter("Account Credential", DefaultValue = "")]
+        public string AccountCredential { get; set; }
 
         [Parameter("Account ID", DefaultValue = "ctrader-account-001")]
         public string AccountId { get; set; }
@@ -61,9 +61,9 @@ namespace FtmoRiskControl
                 Stop();
                 return;
             }
-            if (string.IsNullOrWhiteSpace(RiskApiToken))
+            if (string.IsNullOrWhiteSpace(AccountCredential))
             {
-                Print("RiskGuard: Risk API token is required");
+                Print("RiskGuard: account credential is required");
                 Stop();
                 return;
             }
@@ -137,7 +137,9 @@ namespace FtmoRiskControl
                     Body = body
                 };
                 request.Headers.Add("Content-Type", "application/json");
-                request.Headers.Add("X-Risk-Token", RiskApiToken);
+                request.Headers.Add(
+                    "X-Account-Credential",
+                    AccountCredential);
                 request.Headers.Add("X-Request-Id", requestId);
 
                 var response = Http.Send(request);

@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FTMO 资格看板</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #f4f6f8;
+      color: #182026;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 64px;
+      padding: 12px 24px;
+      background: #ffffff;
+      border-bottom: 1px solid #d8dee4;
+    }
+    h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: 0; }
+    .session { display: flex; align-items: center; gap: 8px; }
+    input {
+      width: min(320px, 48vw);
+      height: 38px;
+      padding: 0 10px;
+      border: 1px solid #aeb8c2;
+      border-radius: 4px;
+      background: #ffffff;
+      color: #182026;
+      font-size: 14px;
+    }
+    button {
+      min-width: 64px;
+      height: 38px;
+      padding: 0 14px;
+      border: 1px solid #1f5f8b;
+      border-radius: 4px;
+      background: #1f5f8b;
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { cursor: wait; opacity: 0.6; }
+    main { padding: 20px 24px 36px; }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(120px, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .summary article {
+      min-height: 88px;
+      padding: 14px;
+      border: 1px solid #d8dee4;
+      border-radius: 6px;
+      background: #ffffff;
+    }
+    .label { color: #5b6670; font-size: 12px; }
+    .value { margin-top: 8px; font-size: 26px; font-weight: 650; }
+    .table-shell {
+      overflow-x: auto;
+      border: 1px solid #d8dee4;
+      border-radius: 6px;
+      background: #ffffff;
+    }
+    table { width: 100%; min-width: 1080px; border-collapse: collapse; }
+    th, td {
+      padding: 12px 14px;
+      border-bottom: 1px solid #e6eaee;
+      text-align: left;
+      vertical-align: middle;
+      font-size: 13px;
+    }
+    th {
+      background: #f7f8fa;
+      color: #4b5661;
+      font-size: 12px;
+      font-weight: 650;
+    }
+    tbody tr:last-child td { border-bottom: 0; }
+    .account { font-weight: 650; }
+    .muted { color: #6a7580; }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .eligible { background: #dff3e6; color: #17643a; }
+    .progress { background: #fff0cc; color: #7a5200; }
+    .uncertain { background: #f8dddd; color: #8a2530; }
+    .not-applicable { background: #e8edf2; color: #4d5965; }
+    .error {
+      display: none;
+      margin-bottom: 14px;
+      padding: 10px 12px;
+      border: 1px solid #e2a7ad;
+      border-radius: 4px;
+      background: #fff1f2;
+      color: #8a2530;
+      font-size: 13px;
+    }
+    .empty { padding: 28px; text-align: center; color: #6a7580; }
+    @media (max-width: 760px) {
+      header {
+        flex-direction: column;
+        align-items: flex-start;
+        padding: 12px 16px;
+      }
+      .session { width: 100%; }
+      input { width: 100%; min-width: 0; }
+      main { padding: 16px; }
+      .summary { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>FTMO 资格看板</h1>
+    <div class="session">
+      <input id="token" type="password" autocomplete="off" placeholder="管理员令牌" aria-label="管理员令牌">
+      <button id="connect" type="button">连接</button>
+    </div>
+  </header>
+  <main>
+    <div id="error" class="error" role="alert"></div>
+    <section class="summary" aria-label="资格汇总">
+      <article><div class="label">账户</div><div id="total" class="value">0</div></article>
+      <article><div class="label">已达标</div><div id="eligible" class="value">0</div></article>
+      <article><div class="label">进行中</div><div id="progress" class="value">0</div></article>
+      <article><div class="label">需复核</div><div id="uncertain" class="value">0</div></article>
+    </section>
+    <section class="table-shell">
+      <table>
+        <thead>
+          <tr>
+            <th>账户</th>
+            <th>阶段</th>
+            <th>周期</th>
+            <th>净利润</th>
+            <th>Profit Target</th>
+            <th>交易日</th>
+            <th>Best Day</th>
+            <th>历史完整性</th>
+            <th>资格</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td class="empty" colspan="9">等待连接</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+  <script>
+    const tokenInput = document.getElementById("token");
+    const connectButton = document.getElementById("connect");
+    const rows = document.getElementById("rows");
+    const errorBox = document.getElementById("error");
+
+    function text(value) {
+      return value === null || value === undefined ? "不适用" : String(value);
+    }
+
+    function statusLabel(status) {
+      const values = {
+        eligible: ["已达标", "eligible"],
+        in_progress: ["进行中", "progress"],
+        uncertain: ["需复核", "uncertain"],
+        not_applicable: ["不适用", "not-applicable"]
+      };
+      return values[status] || [status, "not-applicable"];
+    }
+
+    function objective(value, suffix) {
+      if (!value.applicable) return "不适用";
+      return value.met ? "已完成" : `${text(value.progress_pct)}${suffix}`;
+    }
+
+    function render(accounts) {
+      const counts = { eligible: 0, in_progress: 0, uncertain: 0 };
+      accounts.forEach((account) => {
+        if (counts[account.qualification_status] !== undefined) {
+          counts[account.qualification_status] += 1;
+        }
+      });
+      document.getElementById("total").textContent = accounts.length;
+      document.getElementById("eligible").textContent = counts.eligible;
+      document.getElementById("progress").textContent = counts.in_progress;
+      document.getElementById("uncertain").textContent = counts.uncertain;
+      if (!accounts.length) {
+        rows.innerHTML = '<tr><td class="empty" colspan="9">暂无账户</td></tr>';
+        return;
+      }
+      rows.innerHTML = accounts.map((account) => {
+        const status = statusLabel(account.qualification_status);
+        const days = account.minimum_trading_days;
+        const best = account.best_day_rule;
+        return `
+          <tr>
+            <td><div class="account">${text(account.account_id)}</div><div class="muted">${text(account.account_type)}</div></td>
+            <td>${text(account.phase)}</td>
+            <td>${text(account.history.cycle_id)}</td>
+            <td>${text(account.profit_target.net_profit)}</td>
+            <td>${objective(account.profit_target, "%")}</td>
+            <td>${days.applicable ? `${days.completed} / ${days.required}` : "不适用"}</td>
+            <td>${best.applicable ? `${best.ratio} / ${best.limit_ratio}` : "不适用"}</td>
+            <td>${account.history.complete && !account.data_uncertain ? "完整" : "需复核"}</td>
+            <td><span class="status ${status[1]}">${status[0]}</span></td>
+          </tr>`;
+      }).join("");
+    }
+
+    async function loadDashboard() {
+      const token = tokenInput.value;
+      if (!token) {
+        tokenInput.focus();
+        return;
+      }
+      connectButton.disabled = true;
+      errorBox.style.display = "none";
+      try {
+        const response = await fetch("/v1/qualification/accounts", {
+          headers: { Authorization: `Bearer ${token}` },
+          cache: "no-store"
+        });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+        render(body.accounts || []);
+        tokenInput.value = "";
+      } catch (error) {
+        errorBox.textContent = error.message;
+        errorBox.style.display = "block";
+      } finally {
+        connectButton.disabled = false;
+      }
+    }
+
+    connectButton.addEventListener("click", loadDashboard);
+    tokenInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") loadDashboard();
+    });
+  </script>
+</body>
+</html>

@@ -6,11 +6,17 @@
 python3 -m src.risk_api --config config/ftmo-v2.json
 ```
 
-生产环境必须使用随机的 `RISK_API_TOKEN`，平台端在请求头发送：
+生产环境使用两类凭证：
 
 ```text
-X-Risk-Token: <same-token>
+X-Risk-Token: <administrator-token>
+X-Account-Credential: <one-account-secret>
 ```
+
+- 管理员令牌：日历同步、健康检查、Prometheus、资格汇总和凭证管理。
+- 账户凭证：绑定一个 `account_id` 和作用域，用于账户同步、交易评估、执行回报、守护状态和资格历史。
+- 管理员令牌默认不能调用带 `account_id` 的 `/v1/evaluate`，防止平台误配共享高权限令牌。
+- Prometheus 可以使用 `Authorization: Bearer <administrator-token>`。
 
 ## `GET /health`
 
@@ -20,12 +26,16 @@ X-Risk-Token: <same-token>
 {
   "ok": true,
   "service": "ftmo-risk-api",
-  "rule_version": "ftmo-v2-2026-08-23",
+  "rule_version": "ftmo-v3-2026-08-23",
   "news_data_age_seconds": 0,
   "market_data_age_seconds": 0,
-  "persistent_state": true
+  "persistent_state": true,
+  "account_credentials_required": true,
+  "mtls_enabled": false
 }
 ```
+
+新闻和休市字段还包含最近持久化时间、年龄和是否已经从 SQLite 恢复。
 
 ## `POST /v1/news-sync`
 
@@ -46,7 +56,7 @@ X-Risk-Token: <same-token>
 }
 ```
 
-同步成功后，`/v1/evaluate` 可以省略 `news_events`，服务会使用最近一次缓存。生产评估只使用服务端缓存，客户端不能覆盖事件列表或新鲜度。事件 ID 必须唯一；相同 `fetched_at` 只能重放相同内容，不能用冲突内容覆盖缓存。
+同步成功后，服务先把快照、内容哈希、`fetched_at` 和 `rule_version` 原子写入 SQLite，再替换内存日历。重启时自动恢复最近快照。生产评估只使用服务端日历，客户端不能覆盖事件列表或新鲜度。事件 ID 必须唯一；相同 `fetched_at` 只能重放相同内容，不能用冲突内容覆盖。
 
 ## `POST /v1/market-sync`
 
@@ -222,7 +232,7 @@ X-Risk-Token: <same-token>
 ```json
 {
   "ok": true,
-  "rule_version": "ftmo-v2-2026-08-23",
+  "rule_version": "ftmo-v3-2026-08-23",
   "decision": {
     "code": "REJECT_NEWS",
     "allowed": false,
@@ -269,6 +279,125 @@ X-Risk-Token: <same-token>
 
 `occurred_at` 可以保留平台实际执行时间，便于断线后补报，但不能比服务器时间提前超过 30 秒。执行活动和保留释放使用服务器接收时间写入，客户端时间不能移动频率保留或清理窗口。
 
+## 账户凭证管理
+
+以下接口只接受管理员令牌：
+
+```text
+POST /v1/admin/accounts/{account_id}/credentials
+POST /v1/admin/credentials/{credential_id}/rotate
+POST /v1/admin/credentials/{credential_id}/revoke
+GET  /v1/admin/credentials?account_id={account_id}
+```
+
+创建请求可以指定 `not_before`、`expires_at` 和 `scopes`；省略时使用配置中的默认 TTL 和账户标准作用域。创建和轮换响应中的 `secret` 只返回一次，数据库只保存随机盐和摘要。
+
+```json
+{
+  "expires_at": "2026-09-22T12:00:00+00:00",
+  "scopes": [
+    "account:sync",
+    "trade:evaluate",
+    "trade:execution",
+    "calendar:read",
+    "qualification:read",
+    "qualification:write"
+  ]
+}
+```
+
+轮换可设置 `overlap_seconds`，旧凭证在重叠窗口结束后自动失效；设为 `0` 立即失效。凭证同时校验 `account_id`、作用域、`not_before`、`expires_at` 和 `revoked_at`，不能跨账户使用。列表接口从不返回明文秘密或摘要。
+
+## 资格历史同步
+
+资格统计按 `account_id + phase + cycle_id` 隔离。`phase` 支持 `evaluation`、`verification` 和 `ftmo_account`；1-Step 不允许 `verification`。切换 Verification 或新 Reward 周期时必须使用新的 `cycle_id`，避免把前一阶段利润带入当前资格。
+
+### `POST /v1/closed-trade-sync`
+
+同步包含佣金、Swap 和其他费用后的已平仓净损益：
+
+```json
+{
+  "account_id": "mt5-10001",
+  "trade_id": "deal-12345",
+  "phase": "evaluation",
+  "cycle_id": "challenge-2026-08",
+  "closed_at": "2026-08-22T14:00:00+00:00",
+  "net_profit": "2500.00",
+  "symbol": "EURUSD",
+  "source": "mt5-history"
+}
+```
+
+`trade_id` 在账户内幂等；相同 ID 的冲突内容会被拒绝。Best Day 和 Profit Target 使用当前阶段、当前周期的已平仓净损益。
+
+### `POST /v1/trading-day-sync`
+
+每次发现新开仓时同步开仓时间：
+
+```json
+{
+  "account_id": "mt5-10001",
+  "phase": "evaluation",
+  "cycle_id": "challenge-2026-08",
+  "opened_at": "2026-08-22T09:00:00+00:00",
+  "source": "mt5-history"
+}
+```
+
+服务按 `Europe/Prague` 将开仓事件归入 FTMO 日。同一天开多个仓位只计一个 Trading Day；持仓跨日不会增加天数。
+
+### `POST /v1/qualification-history-sync`
+
+已平仓交易和开仓日全部同步后提交完整性水位：
+
+```json
+{
+  "account_id": "mt5-10001",
+  "phase": "evaluation",
+  "cycle_id": "challenge-2026-08",
+  "history_start_at": "2026-08-01T00:00:00+02:00",
+  "complete_through": "2026-08-23T12:00:00+00:00",
+  "source": "mt5-history"
+}
+```
+
+`complete_through` 不能倒退，且必须覆盖最新账户快照。没有完整性水位、阶段不匹配、历史未覆盖最新快照或账户结算基线不确定时，看板返回 `data_uncertain=true`、`eligible=false`。
+
+## 资格看板
+
+```text
+GET /v1/qualification?account_id={account_id}
+GET /v1/qualification/accounts
+GET /dashboard/qualification
+```
+
+单账户接口接受账户凭证；账户汇总接口接受管理员令牌。浏览器页面本身不包含数据，连接后用 Bearer 管理员令牌读取汇总。
+
+响应分别返回：
+
+- `profit_target`：目标金额、当前净利润、完成百分比和是否达标；
+- `minimum_trading_days`：Prague 开仓日列表、已完成天数和要求天数；
+- `best_day_rule`：最盈利日、Positive Days' Profit、比率、上限和是否符合；
+- `history`：阶段、周期、起始时间、完整性水位和来源；
+- `qualification_status`：`eligible`、`in_progress`、`uncertain` 或 `not_applicable`。
+
+资格接口不参与 `/v1/evaluate` 的单笔交易许可。`ALLOW` 与资格达标是两个独立结论。
+
+## `GET /metrics`
+
+返回 Prometheus 文本格式，接受管理员令牌或 Bearer 管理员令牌。指标包括：
+
+- HTTP 请求和状态码；
+- 风控决定代码；
+- 新闻/休市日历是否存在、年龄、同步和恢复结果；
+- `GREEN/AMBER/RED/LOCKED/BREACH` 账户数量；
+- 未知执行结果数量；
+- SQLite 健康状态；
+- 备份/恢复结果和最后备份年龄。
+
+告警规则见 `monitoring/alerts.yml`。
+
 
 ## `POST /v1/position-size`
 
@@ -303,7 +432,7 @@ X-Risk-Token: <same-token>
 ```json
 {
   "ok": true,
-  "rule_version": "ftmo-v2-2026-08-23",
+  "rule_version": "ftmo-v3-2026-08-23",
   "position_size": {
     "volume": "2.50",
     "expected_loss": "250.00",

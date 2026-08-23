@@ -30,6 +30,155 @@ class StateStoreTests(unittest.TestCase):
         mode = stat.S_IMODE(os.stat(self.path).st_mode)
         self.assertEqual(mode, 0o600)
 
+    def test_calendar_snapshot_survives_restart(self):
+        fetched_at = self.now.replace(microsecond=0)
+        payload = [
+            {
+                "event_id": "NFP",
+                "release_time": fetched_at.isoformat(),
+                "affected_symbols": ["EURUSD"],
+                "importance": "high",
+                "source": "test",
+            }
+        ]
+        self.store.save_calendar_snapshot(
+            calendar_type="news",
+            fetched_at=fetched_at,
+            payload=payload,
+            rule_version="test-rule",
+        )
+        snapshot = StateStore(self.path).get_calendar_snapshots()["news"]
+        self.assertEqual(snapshot.payload, payload)
+        self.assertEqual(snapshot.rule_version, "test-rule")
+
+    def test_calendar_snapshot_rejects_older_and_conflicting_content(self):
+        fetched_at = self.now.replace(microsecond=0)
+        self.store.save_calendar_snapshot(
+            calendar_type="news",
+            fetched_at=fetched_at,
+            payload=[],
+            rule_version="test-rule",
+        )
+        with self.assertRaises(ValueError):
+            self.store.save_calendar_snapshot(
+                calendar_type="news",
+                fetched_at=fetched_at - timedelta(seconds=1),
+                payload=[],
+                rule_version="test-rule",
+            )
+        with self.assertRaises(ValueError):
+            self.store.save_calendar_snapshot(
+                calendar_type="news",
+                fetched_at=fetched_at,
+                payload=[{"event_id": "conflict"}],
+                rule_version="test-rule",
+            )
+
+    def test_account_credential_scope_expiry_and_revocation(self):
+        record, secret = self.store.create_account_credential(
+            account_id="mt5-credential",
+            scopes=("trade:evaluate",),
+            not_before=self.now,
+            expires_at=self.now + timedelta(hours=1),
+            now=self.now,
+        )
+        authenticated = self.store.authenticate_account_credential(
+            account_id="mt5-credential",
+            secret=secret,
+            scope="trade:evaluate",
+            now=self.now + timedelta(seconds=1),
+        )
+        self.assertIsNotNone(authenticated)
+        self.assertIsNone(
+            self.store.authenticate_account_credential(
+                account_id="other-account",
+                secret=secret,
+                scope="trade:evaluate",
+                now=self.now + timedelta(seconds=1),
+            )
+        )
+        self.assertIsNone(
+            self.store.authenticate_account_credential(
+                account_id="mt5-credential",
+                secret=secret,
+                scope="trade:execution",
+                now=self.now + timedelta(seconds=1),
+            )
+        )
+        self.assertIsNone(
+            self.store.authenticate_account_credential(
+                account_id="mt5-credential",
+                secret=secret,
+                scope="trade:evaluate",
+                now=self.now + timedelta(hours=2),
+            )
+        )
+        self.store.revoke_account_credential(
+            record.credential_id,
+            revoked_at=self.now + timedelta(minutes=5),
+        )
+        self.assertIsNone(
+            self.store.authenticate_account_credential(
+                account_id="mt5-credential",
+                secret=secret,
+                scope="trade:evaluate",
+                now=self.now + timedelta(minutes=6),
+            )
+        )
+
+    def test_credential_rotation_supports_bounded_overlap(self):
+        old_record, old_secret = self.store.create_account_credential(
+            account_id="rotation-account",
+            scopes=("trade:evaluate",),
+            not_before=self.now,
+            expires_at=self.now + timedelta(hours=1),
+            now=self.now,
+        )
+        new_record, new_secret = self.store.rotate_account_credential(
+            credential_id=old_record.credential_id,
+            scopes=None,
+            not_before=self.now,
+            expires_at=self.now + timedelta(hours=1),
+            overlap_seconds=60,
+            now=self.now,
+        )
+        self.assertNotEqual(old_record.credential_id, new_record.credential_id)
+        self.assertIsNotNone(
+            self.store.authenticate_account_credential(
+                account_id="rotation-account",
+                secret=old_secret,
+                scope="trade:evaluate",
+                now=self.now + timedelta(seconds=30),
+            )
+        )
+        self.assertIsNone(
+            self.store.authenticate_account_credential(
+                account_id="rotation-account",
+                secret=old_secret,
+                scope="trade:evaluate",
+                now=self.now + timedelta(seconds=61),
+            )
+        )
+        self.assertIsNotNone(
+            self.store.authenticate_account_credential(
+                account_id="rotation-account",
+                secret=new_secret,
+                scope="trade:evaluate",
+                now=self.now + timedelta(seconds=61),
+            )
+        )
+
+    def test_online_backup_is_owner_only_and_readable(self):
+        self.sync()
+        output = Path(self.tempdir.name) / "backups" / "risk.db"
+        result = self.store.backup_to(output)
+        self.assertEqual(result, output.resolve())
+        self.assertEqual(stat.S_IMODE(os.stat(result).st_mode), 0o600)
+        restored = StateStore(result).get_account("mt5-10001")
+        self.assertEqual(restored.snapshot.equity, Decimal("99800"))
+        metrics = self.store.backup_metrics()
+        self.assertEqual(metrics["backup_success"], 1)
+
     def tearDown(self):
         self.tempdir.cleanup()
 
@@ -296,6 +445,23 @@ class StateStoreTests(unittest.TestCase):
                 bootstrap_day_start_balance=None,
                 bootstrap_highest_settled_balance=None,
             )
+
+    def test_two_step_phase_advances_through_verification(self):
+        self.sync(account_type=AccountType.TWO_STEP)
+        verified = self.sync(
+            account_type=AccountType.TWO_STEP,
+            phase=AccountPhase.VERIFICATION,
+            bootstrap_day_start_balance=None,
+            bootstrap_highest_settled_balance=None,
+        )
+        self.assertEqual(verified.phase, AccountPhase.VERIFICATION)
+        funded = self.sync(
+            account_type=AccountType.TWO_STEP,
+            phase=AccountPhase.FTMO_ACCOUNT,
+            bootstrap_day_start_balance=None,
+            bootstrap_highest_settled_balance=None,
+        )
+        self.assertEqual(funded.phase, AccountPhase.FTMO_ACCOUNT)
 
     def test_failed_execution_can_release_open_reservation(self):
         self.sync()

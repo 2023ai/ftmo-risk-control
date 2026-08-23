@@ -20,6 +20,7 @@ class AccountType(str, Enum):
 
 class AccountPhase(str, Enum):
     EVALUATION = "evaluation"
+    VERIFICATION = "verification"
     FTMO_ACCOUNT = "ftmo_account"
 
 
@@ -96,6 +97,11 @@ class RuleProfile:
         market_close = config.get("market_close_controls", {})
         if account_type == AccountType.ONE_STEP and style == AccountStyle.SWING:
             raise ValueError("Swing style is only available for 2-Step accounts")
+        if (
+            account_type == AccountType.ONE_STEP
+            and phase == AccountPhase.VERIFICATION
+        ):
+            raise ValueError("Verification is only available for 2-Step accounts")
         return cls(
             account_type=account_type,
             phase=phase,
@@ -1016,6 +1022,90 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError(
             "force_flat_before_minutes cannot exceed "
             "gap_open_block_before_minutes"
+        )
+
+    qualification = config.get("qualification_controls")
+    if not isinstance(qualification, Mapping):
+        raise ValueError("qualification_controls must be an object")
+    one_step = qualification.get(AccountType.ONE_STEP.value)
+    two_step = qualification.get(AccountType.TWO_STEP.value)
+    if not isinstance(one_step, Mapping):
+        raise ValueError("qualification_controls.one_step must be an object")
+    if not isinstance(two_step, Mapping):
+        raise ValueError("qualification_controls.two_step must be an object")
+    phase_maps = (
+        (
+            AccountType.ONE_STEP.value,
+            one_step,
+            (AccountPhase.EVALUATION.value, AccountPhase.FTMO_ACCOUNT.value),
+        ),
+        (
+            AccountType.TWO_STEP.value,
+            two_step,
+            (
+                AccountPhase.EVALUATION.value,
+                AccountPhase.VERIFICATION.value,
+                AccountPhase.FTMO_ACCOUNT.value,
+            ),
+        ),
+    )
+    for qualification_type, account_controls, phases in phase_maps:
+        for phase_name in phases:
+            controls = account_controls.get(phase_name)
+            prefix = (
+                f"qualification_controls.{qualification_type}.{phase_name}"
+            )
+            if not isinstance(controls, Mapping):
+                raise ValueError(f"{prefix} must be an object")
+            target_value = controls.get("profit_target_pct")
+            if target_value is not None:
+                target = _config_decimal(
+                    target_value,
+                    f"{prefix}.profit_target_pct",
+                )
+                if not ZERO < target < Decimal("1"):
+                    raise ValueError(
+                        f"{prefix}.profit_target_pct must be between 0 and 1"
+                    )
+            _validate_nonnegative_int(
+                controls.get("minimum_trading_days"),
+                f"{prefix}.minimum_trading_days",
+            )
+            best_day = controls.get("best_day_rule_pct")
+            if best_day is not None:
+                best_day_decimal = _config_decimal(
+                    best_day,
+                    f"{prefix}.best_day_rule_pct",
+                )
+                if not ZERO < best_day_decimal <= Decimal("1"):
+                    raise ValueError(
+                        f"{prefix}.best_day_rule_pct must be between 0 and 1"
+                    )
+    security = config.get("security", {})
+    if not isinstance(security, Mapping):
+        raise ValueError("security must be an object")
+    if not isinstance(
+        security.get("require_account_credentials", True),
+        bool,
+    ):
+        raise ValueError("security.require_account_credentials must be a boolean")
+    if not isinstance(security.get("require_mtls", False), bool):
+        raise ValueError("security.require_mtls must be a boolean")
+    for security_field in (
+        "credential_default_ttl_seconds",
+        "credential_max_ttl_seconds",
+        "credential_rotation_overlap_seconds",
+    ):
+        _validate_positive_int(
+            security.get(security_field),
+            f"security.{security_field}",
+        )
+    if int(security["credential_default_ttl_seconds"]) > int(
+        security["credential_max_ttl_seconds"]
+    ):
+        raise ValueError(
+            "security.credential_default_ttl_seconds cannot exceed "
+            "credential_max_ttl_seconds"
         )
 
 

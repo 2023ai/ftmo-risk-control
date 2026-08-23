@@ -5,7 +5,7 @@
 ## 自动测试
 
 ```text
-90 tests passed
+113 tests passed
 ResourceWarning treated as error
 Python source compilation passed
 JSON configuration validation passed
@@ -30,10 +30,17 @@ mypy passed
 - 当前报价到止损的开放风险扣减、服务器日界线权威和请求量预警。
 - 执行时间偏差、未来活动清理隔离、重复日历 ID 和同时间戳内容冲突。
 - 日内 `LOCKED` 跨权益反弹持续到下一 FTMO 日，官方 `BREACH` 持久锁定。
+- 新闻和休市日历 SQLite 持久化、内容冲突拒绝和 API 重启恢复。
+- SQLite 在线备份、`0600`、完整性校验、恢复和运行中服务锁拒绝。
+- 每账户凭证绑定、作用域、跨账户拒绝、轮换重叠、过期、撤销和只显示一次的秘密。
+- Prometheus 数据库、日历、决定、账户状态、未知执行和备份指标。
+- Qualification 的阶段/周期隔离、历史完整性、Best Day、Profit Target 和基于开仓日的 Minimum Trading Days。
+- 浏览器资格看板静态入口和受认证的账户汇总 API。
+- 资格看板在 1440x900 和 390x844 视口检查通过，页面无横向溢出；明细表在移动端使用受控横向滚动。
 
 ## MT5
 
-使用本机 MetaTrader 5 的 `metaeditor64.exe` 编译：
+使用本机 MetaTrader 5 的 `metaeditor64.exe` 重新编译：
 
 ```text
 Result: 0 errors, 0 warnings
@@ -44,7 +51,7 @@ Target: X64 Regular
 
 ## cTrader
 
-使用 FTMO Platform cTrader `5.9.140`、cTrader.Automate `1.0.19` 构建：
+使用 FTMO Platform cTrader 的 `cAlgo.API.dll` 和 .NET SDK `10.0.302` 对 `net9.0` 重新构建：
 
 ```text
 0 errors
@@ -58,6 +65,8 @@ Target: X64 Regular
 - 未连接 FTMO 模拟账户执行真实下单回放；
 - 未验证具体账户的佣金、点值、滑点和所有品种交易时间；
 - 未启用服务器端网关拦截人工交易。
+- 未连接生产 Prometheus/Alertmanager 通知路由。
+- 未使用公司 PKI 执行真实 mTLS 证书握手；自动测试覆盖缺少证书/密钥时的启动拒绝。
 
 这些项目必须在上线检查中使用公司的目标账户和批准数据源完成。
 
@@ -72,5 +81,10 @@ market sync: accepted
 account sync: accepted
 evaluation decision: ALLOW
 audit request_id: smoke-evaluate
-audit rule_version: ftmo-v2-2026-08-23
+audit rule_version: ftmo-v3-2026-08-23
+calendar restart restore: passed
+account credential isolation and rotation: passed
+qualification dashboard API: passed
+backup and restore round trip: passed
+Prometheus metrics: passed
 ```

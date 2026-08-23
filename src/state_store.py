@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import secrets
 import sqlite3
 import threading
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from hmac import compare_digest
 from typing import Any, Callable, Mapping
+from uuid import uuid4
 
 from .risk_engine import (
     AccountPhase,
@@ -33,6 +37,28 @@ class StoredAccount:
     style: AccountStyle
     snapshot: AccountSnapshot
     ftmo_day: str
+
+
+@dataclass(frozen=True)
+class CalendarSnapshot:
+    calendar_type: str
+    fetched_at: datetime
+    content_hash: str
+    payload: list[dict[str, Any]]
+    rule_version: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class CredentialRecord:
+    credential_id: str
+    account_id: str
+    not_before: datetime
+    expires_at: datetime
+    revoked_at: datetime | None
+    last_used_at: datetime | None
+    scopes: tuple[str, ...]
+    created_at: datetime
 
 
 class StateStore:
@@ -165,10 +191,91 @@ class StateStore:
                     account_id TEXT NOT NULL,
                     request_id TEXT NOT NULL,
                     request_hash TEXT NOT NULL,
+                    action TEXT NOT NULL DEFAULT '',
+                    symbol TEXT NOT NULL DEFAULT '',
+                    outcome TEXT NOT NULL DEFAULT 'unknown',
                     response_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(account_id, request_id),
                     FOREIGN KEY(account_id) REFERENCES accounts(account_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS calendar_snapshots (
+                    calendar_type TEXT PRIMARY KEY,
+                    fetched_at TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    rule_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS account_credentials (
+                    credential_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    secret_salt BLOB NOT NULL,
+                    secret_hash BLOB NOT NULL,
+                    not_before TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    revoked_at TEXT,
+                    last_used_at TEXT,
+                    scopes_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS account_credentials_account
+                    ON account_credentials(account_id, expires_at);
+
+                CREATE TABLE IF NOT EXISTS closed_trades (
+                    account_id TEXT NOT NULL,
+                    trade_id TEXT NOT NULL,
+                    phase TEXT NOT NULL DEFAULT 'evaluation',
+                    cycle_id TEXT NOT NULL DEFAULT 'default',
+                    closed_at TEXT NOT NULL,
+                    ftmo_day TEXT NOT NULL,
+                    net_profit TEXT NOT NULL,
+                    symbol TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL,
+                    request_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(account_id, trade_id),
+                    FOREIGN KEY(account_id) REFERENCES accounts(account_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS closed_trades_account_day
+                    ON closed_trades(
+                        account_id, phase, cycle_id, ftmo_day
+                    );
+
+                CREATE TABLE IF NOT EXISTS qualification_history_status (
+                    account_id TEXT PRIMARY KEY,
+                    phase TEXT NOT NULL,
+                    cycle_id TEXT NOT NULL,
+                    history_start_at TEXT NOT NULL,
+                    complete_through TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(account_id) REFERENCES accounts(account_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS qualification_trading_days (
+                    account_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    cycle_id TEXT NOT NULL,
+                    ftmo_day TEXT NOT NULL,
+                    first_opened_at TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(account_id, phase, cycle_id, ftmo_day),
+                    FOREIGN KEY(account_id) REFERENCES accounts(account_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS backup_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation TEXT NOT NULL,
+                    success INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT ''
                 );
                 """
             )
@@ -193,7 +300,931 @@ class StateStore:
                     "ALTER TABLE accounts ADD COLUMN breach_latched "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            execution_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(executions)"
+                ).fetchall()
+            }
+            if "action" not in execution_columns:
+                connection.execute(
+                    "ALTER TABLE executions ADD COLUMN action TEXT NOT NULL "
+                    "DEFAULT ''"
+                )
+            if "symbol" not in execution_columns:
+                connection.execute(
+                    "ALTER TABLE executions ADD COLUMN symbol TEXT NOT NULL "
+                    "DEFAULT ''"
+                )
+            if "outcome" not in execution_columns:
+                connection.execute(
+                    "ALTER TABLE executions ADD COLUMN outcome TEXT NOT NULL "
+                    "DEFAULT 'unknown'"
+                )
+            closed_trade_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(closed_trades)"
+                ).fetchall()
+            }
+            if "phase" not in closed_trade_columns:
+                connection.execute(
+                    "ALTER TABLE closed_trades ADD COLUMN phase TEXT NOT NULL "
+                    "DEFAULT 'evaluation'"
+                )
+            if "cycle_id" not in closed_trade_columns:
+                connection.execute(
+                    "ALTER TABLE closed_trades ADD COLUMN cycle_id TEXT NOT NULL "
+                    "DEFAULT 'default'"
+                )
+            connection.execute(
+                "DROP INDEX IF EXISTS closed_trades_account_day"
+            )
+            connection.execute(
+                """
+                CREATE INDEX closed_trades_account_day
+                ON closed_trades(account_id, phase, cycle_id, ftmo_day)
+                """
+            )
             connection.commit()
+
+    @staticmethod
+    def _credential_digest(secret: str, salt: bytes) -> bytes:
+        return hashlib.sha256(salt + secret.encode("utf-8")).digest()
+
+    @staticmethod
+    def _credential_record_from_row(
+        row: sqlite3.Row,
+    ) -> CredentialRecord:
+        return CredentialRecord(
+            credential_id=row["credential_id"],
+            account_id=row["account_id"],
+            not_before=datetime.fromisoformat(row["not_before"]),
+            expires_at=datetime.fromisoformat(row["expires_at"]),
+            revoked_at=(
+                datetime.fromisoformat(row["revoked_at"])
+                if row["revoked_at"]
+                else None
+            ),
+            last_used_at=(
+                datetime.fromisoformat(row["last_used_at"])
+                if row["last_used_at"]
+                else None
+            ),
+            scopes=tuple(json.loads(row["scopes_json"])),
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    def save_calendar_snapshot(
+        self,
+        *,
+        calendar_type: str,
+        fetched_at: datetime,
+        payload: list[dict[str, Any]],
+        rule_version: str,
+    ) -> CalendarSnapshot:
+        if calendar_type not in {"news", "market"}:
+            raise ValueError("calendar_type must be news or market")
+        if fetched_at.tzinfo is None:
+            raise ValueError("fetched_at must be timezone-aware")
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        content_hash = hashlib.sha256(
+            payload_json.encode("utf-8")
+        ).hexdigest()
+        fetched_at_utc = fetched_at.astimezone(timezone.utc)
+        created_at = datetime.now(timezone.utc)
+        with self._lock, self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM calendar_snapshots
+                WHERE calendar_type = ?
+                """,
+                (calendar_type,),
+            ).fetchone()
+            if existing is not None:
+                existing_at = datetime.fromisoformat(existing["fetched_at"])
+                if fetched_at_utc < existing_at:
+                    raise ValueError(
+                        f"{calendar_type} calendar update is older than "
+                        "the persisted update"
+                    )
+                if (
+                    fetched_at_utc == existing_at
+                    and existing["content_hash"] != content_hash
+                ):
+                    raise ValueError(
+                        f"{calendar_type} calendar timestamp already has "
+                        "different persisted content"
+                    )
+            connection.execute(
+                """
+                INSERT INTO calendar_snapshots (
+                    calendar_type, fetched_at, content_hash, payload_json,
+                    rule_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(calendar_type) DO UPDATE SET
+                    fetched_at = excluded.fetched_at,
+                    content_hash = excluded.content_hash,
+                    payload_json = excluded.payload_json,
+                    rule_version = excluded.rule_version,
+                    created_at = excluded.created_at
+                """,
+                (
+                    calendar_type,
+                    fetched_at_utc.isoformat(),
+                    content_hash,
+                    payload_json,
+                    rule_version,
+                    created_at.isoformat(),
+                ),
+            )
+            connection.commit()
+        return CalendarSnapshot(
+            calendar_type=calendar_type,
+            fetched_at=fetched_at_utc,
+            content_hash=content_hash,
+            payload=payload,
+            rule_version=rule_version,
+            created_at=created_at,
+        )
+
+    def get_calendar_snapshots(self) -> dict[str, CalendarSnapshot]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM calendar_snapshots"
+            ).fetchall()
+        result: dict[str, CalendarSnapshot] = {}
+        for row in rows:
+            result[row["calendar_type"]] = CalendarSnapshot(
+                calendar_type=row["calendar_type"],
+                fetched_at=datetime.fromisoformat(row["fetched_at"]),
+                content_hash=row["content_hash"],
+                payload=json.loads(row["payload_json"]),
+                rule_version=row["rule_version"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+            )
+        return result
+
+    def create_account_credential(
+        self,
+        *,
+        account_id: str,
+        scopes: tuple[str, ...] | list[str],
+        not_before: datetime,
+        expires_at: datetime,
+        now: datetime | None = None,
+    ) -> tuple[CredentialRecord, str]:
+        if not account_id:
+            raise ValueError("account_id must be non-empty")
+        if not scopes:
+            raise ValueError("at least one credential scope is required")
+        if not not_before.tzinfo or not expires_at.tzinfo:
+            raise ValueError("credential timestamps must be timezone-aware")
+        if expires_at <= not_before:
+            raise ValueError("expires_at must be after not_before")
+        now = now or datetime.now(timezone.utc)
+        if not now.tzinfo:
+            raise ValueError("now must be timezone-aware")
+        credential_id = uuid4().hex
+        secret = f"rsk_{credential_id}.{secrets.token_urlsafe(32)}"
+        salt = secrets.token_bytes(16)
+        digest = self._credential_digest(secret, salt)
+        created_at = now.astimezone(timezone.utc)
+        scopes_tuple = tuple(sorted(set(scopes)))
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO account_credentials (
+                    credential_id, account_id, secret_salt, secret_hash,
+                    not_before, expires_at, scopes_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    credential_id,
+                    account_id,
+                    salt,
+                    digest,
+                    not_before.astimezone(timezone.utc).isoformat(),
+                    expires_at.astimezone(timezone.utc).isoformat(),
+                    json.dumps(scopes_tuple, ensure_ascii=True),
+                    created_at.isoformat(),
+                ),
+            )
+            connection.commit()
+            row = connection.execute(
+                "SELECT * FROM account_credentials WHERE credential_id = ?",
+                (credential_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("credential was not created")
+        return self._credential_record_from_row(row), secret
+
+    def authenticate_account_credential(
+        self,
+        *,
+        account_id: str,
+        secret: str,
+        scope: str,
+        now: datetime | None = None,
+    ) -> CredentialRecord | None:
+        if not account_id or not secret or not scope:
+            return None
+        prefix, separator, _ = secret.partition(".")
+        if separator != "." or not prefix.startswith("rsk_"):
+            return None
+        credential_id = prefix[4:]
+        if len(credential_id) != 32:
+            return None
+        now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM account_credentials
+                WHERE account_id = ? AND credential_id = ?
+                """,
+                (account_id, credential_id),
+            ).fetchone()
+            if row is None:
+                return None
+            record = self._credential_record_from_row(row)
+            valid = (
+                record.not_before.astimezone(timezone.utc) <= now
+                and record.expires_at.astimezone(timezone.utc) > now
+                and (
+                    record.revoked_at is None
+                    or record.revoked_at.astimezone(timezone.utc) > now
+                )
+                and (
+                    scope in record.scopes
+                    or "admin:*" in record.scopes
+                )
+            )
+            digest = self._credential_digest(
+                secret,
+                bytes(row["secret_salt"]),
+            )
+            if not valid or not compare_digest(
+                digest,
+                bytes(row["secret_hash"]),
+            ):
+                return None
+            connection.execute(
+                """
+                UPDATE account_credentials
+                SET last_used_at = ?
+                WHERE credential_id = ?
+                """,
+                (now.isoformat(), record.credential_id),
+            )
+            connection.commit()
+            return replace(record, last_used_at=now)
+        return None
+
+    def rotate_account_credential(
+        self,
+        *,
+        credential_id: str,
+        scopes: tuple[str, ...] | list[str] | None,
+        not_before: datetime,
+        expires_at: datetime,
+        overlap_seconds: int = 0,
+        now: datetime | None = None,
+    ) -> tuple[CredentialRecord, str]:
+        if overlap_seconds < 0:
+            raise ValueError("overlap_seconds cannot be negative")
+        now = now or datetime.now(timezone.utc)
+        if not_before.tzinfo is None or expires_at.tzinfo is None:
+            raise ValueError("credential timestamps must be timezone-aware")
+        if expires_at <= not_before:
+            raise ValueError("expires_at must be after not_before")
+        new_credential_id = uuid4().hex
+        new_secret = (
+            f"rsk_{new_credential_id}.{secrets.token_urlsafe(32)}"
+        )
+        salt = secrets.token_bytes(16)
+        digest = self._credential_digest(new_secret, salt)
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT account_id, scopes_json
+                FROM account_credentials
+                WHERE credential_id = ?
+                """,
+                (credential_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown credential_id: {credential_id}")
+            selected_scopes = tuple(
+                scopes or tuple(json.loads(row["scopes_json"]))
+            )
+            old_revoked_at = now + timedelta(seconds=overlap_seconds)
+            connection.execute(
+                """
+                INSERT INTO account_credentials (
+                    credential_id, account_id, secret_salt, secret_hash,
+                    not_before, expires_at, scopes_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_credential_id,
+                    row["account_id"],
+                    salt,
+                    digest,
+                    not_before.astimezone(timezone.utc).isoformat(),
+                    expires_at.astimezone(timezone.utc).isoformat(),
+                    json.dumps(
+                        tuple(sorted(set(selected_scopes))),
+                        ensure_ascii=True,
+                    ),
+                    now.astimezone(timezone.utc).isoformat(),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE account_credentials
+                SET revoked_at = ?
+                WHERE credential_id = ?
+                  AND (revoked_at IS NULL OR revoked_at > ?)
+                """,
+                (
+                    old_revoked_at.astimezone(timezone.utc).isoformat(),
+                    credential_id,
+                    old_revoked_at.astimezone(timezone.utc).isoformat(),
+                ),
+            )
+            connection.commit()
+            new_row = connection.execute(
+                """
+                SELECT * FROM account_credentials
+                WHERE credential_id = ?
+                """,
+                (new_credential_id,),
+            ).fetchone()
+        if new_row is None:
+            raise RuntimeError("rotated credential was not created")
+        return self._credential_record_from_row(new_row), new_secret
+
+    def revoke_account_credential(
+        self,
+        credential_id: str,
+        revoked_at: datetime | None = None,
+    ) -> CredentialRecord:
+        revoked_at = (revoked_at or datetime.now(timezone.utc)).astimezone(
+            timezone.utc
+        )
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE account_credentials
+                SET revoked_at = ?
+                WHERE credential_id = ?
+                """,
+                (revoked_at.isoformat(), credential_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM account_credentials WHERE credential_id = ?",
+                (credential_id,),
+            ).fetchone()
+            connection.commit()
+        if row is None:
+            raise KeyError(f"unknown credential_id: {credential_id}")
+        return self._credential_record_from_row(row)
+
+    def list_account_credentials(
+        self,
+        account_id: str | None = None,
+    ) -> list[CredentialRecord]:
+        with self._lock, self._connection() as connection:
+            if account_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM account_credentials
+                    ORDER BY account_id, created_at DESC
+                    """
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM account_credentials
+                    WHERE account_id = ?
+                    ORDER BY created_at DESC
+                    """,
+                    (account_id,),
+                ).fetchall()
+        return [self._credential_record_from_row(row) for row in rows]
+
+    def record_closed_trade(
+        self,
+        *,
+        account_id: str,
+        trade_id: str,
+        phase: AccountPhase,
+        cycle_id: str,
+        closed_at: datetime,
+        ftmo_day: str,
+        net_profit: Decimal,
+        symbol: str,
+        source: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        if closed_at.tzinfo is None:
+            raise ValueError("closed_at must be timezone-aware")
+        if not trade_id:
+            raise ValueError("trade_id must be non-empty")
+        if not source.strip():
+            raise ValueError("source must be non-empty")
+        payload = {
+            "account_id": account_id,
+            "trade_id": trade_id,
+            "phase": phase.value,
+            "cycle_id": cycle_id,
+            "closed_at": closed_at.astimezone(timezone.utc).isoformat(),
+            "ftmo_day": ftmo_day,
+            "net_profit": str(net_profit),
+            "symbol": symbol,
+            "source": source,
+            "request_id": request_id,
+        }
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            account = connection.execute(
+                "SELECT 1 FROM accounts WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if account is None:
+                raise KeyError(f"unknown account_id: {account_id}")
+            existing = connection.execute(
+                """
+                SELECT closed_at, ftmo_day, net_profit, symbol, source,
+                       request_id, phase, cycle_id
+                FROM closed_trades
+                WHERE account_id = ? AND trade_id = ?
+                """,
+                (account_id, trade_id),
+            ).fetchone()
+            if existing is not None:
+                existing_payload = {
+                    "account_id": account_id,
+                    "trade_id": trade_id,
+                    "phase": existing["phase"],
+                    "cycle_id": existing["cycle_id"],
+                    "closed_at": existing["closed_at"],
+                    "ftmo_day": existing["ftmo_day"],
+                    "net_profit": existing["net_profit"],
+                    "symbol": existing["symbol"],
+                    "source": existing["source"],
+                    "request_id": existing["request_id"],
+                }
+                if existing_payload != payload:
+                    raise ValueError(
+                        "trade_id has already been used with different content"
+                    )
+                connection.commit()
+                return {
+                    "ok": True,
+                    "account_id": account_id,
+                    "trade_id": trade_id,
+                    "recorded": False,
+                    "idempotent": True,
+                }
+            connection.execute(
+                """
+                INSERT INTO closed_trades (
+                    account_id, trade_id, phase, cycle_id, closed_at,
+                    ftmo_day, net_profit, symbol, source, request_id,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_id,
+                    trade_id,
+                    phase.value,
+                    cycle_id,
+                    payload["closed_at"],
+                    ftmo_day,
+                    str(net_profit),
+                    symbol,
+                    source,
+                    request_id,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            connection.commit()
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "trade_id": trade_id,
+            "recorded": True,
+            "idempotent": False,
+        }
+
+    def closed_trades(
+        self,
+        account_id: str,
+        *,
+        phase: AccountPhase | None = None,
+        cycle_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connection() as connection:
+            if phase is None and cycle_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT trade_id, phase, cycle_id, closed_at, ftmo_day,
+                           net_profit, symbol, source, request_id, created_at
+                    FROM closed_trades
+                    WHERE account_id = ?
+                    ORDER BY closed_at, trade_id
+                    """,
+                    (account_id,),
+                ).fetchall()
+            elif phase is not None and cycle_id is not None:
+                rows = connection.execute(
+                    """
+                    SELECT trade_id, phase, cycle_id, closed_at, ftmo_day,
+                           net_profit, symbol, source, request_id, created_at
+                    FROM closed_trades
+                    WHERE account_id = ? AND phase = ? AND cycle_id = ?
+                    ORDER BY closed_at, trade_id
+                    """,
+                    (account_id, phase.value, cycle_id),
+                ).fetchall()
+            else:
+                raise ValueError(
+                    "phase and cycle_id must be supplied together"
+                )
+        return [dict(row) for row in rows]
+
+    def set_qualification_history_status(
+        self,
+        *,
+        account_id: str,
+        phase: AccountPhase,
+        cycle_id: str,
+        history_start_at: datetime,
+        complete_through: datetime,
+        source: str,
+    ) -> dict[str, Any]:
+        if history_start_at.tzinfo is None or complete_through.tzinfo is None:
+            raise ValueError("qualification history timestamps need timezones")
+        if complete_through < history_start_at:
+            raise ValueError(
+                "complete_through cannot be before history_start_at"
+            )
+        now = datetime.now(timezone.utc)
+        start_utc = history_start_at.astimezone(timezone.utc)
+        complete_utc = complete_through.astimezone(timezone.utc)
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            account = connection.execute(
+                "SELECT phase FROM accounts WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if account is None:
+                raise KeyError(f"unknown account_id: {account_id}")
+            if account["phase"] != phase.value:
+                raise ValueError(
+                    "qualification history phase must match current account phase"
+                )
+            existing = connection.execute(
+                """
+                SELECT phase, cycle_id, history_start_at, complete_through
+                FROM qualification_history_status
+                WHERE account_id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+            if (
+                existing is not None
+                and existing["phase"] == phase.value
+                and existing["cycle_id"] == cycle_id
+            ):
+                if datetime.fromisoformat(
+                    existing["history_start_at"]
+                ) != start_utc:
+                    raise ValueError(
+                        "history_start_at cannot change within one cycle"
+                    )
+                if complete_utc < datetime.fromisoformat(
+                    existing["complete_through"]
+                ):
+                    raise ValueError(
+                        "qualification history completeness cannot move backwards"
+                    )
+            connection.execute(
+                """
+                INSERT INTO qualification_history_status (
+                    account_id, phase, cycle_id, history_start_at,
+                    complete_through, source, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    phase = excluded.phase,
+                    cycle_id = excluded.cycle_id,
+                    history_start_at = excluded.history_start_at,
+                    complete_through = excluded.complete_through,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    account_id,
+                    phase.value,
+                    cycle_id,
+                    start_utc.isoformat(),
+                    complete_utc.isoformat(),
+                    source,
+                    now.isoformat(),
+                ),
+            )
+            connection.commit()
+        return {
+            "account_id": account_id,
+            "phase": phase.value,
+            "cycle_id": cycle_id,
+            "history_start_at": start_utc.isoformat(),
+            "complete_through": complete_utc.isoformat(),
+            "source": source,
+            "updated_at": now.isoformat(),
+        }
+
+    def record_qualification_trading_day(
+        self,
+        *,
+        account_id: str,
+        phase: AccountPhase,
+        cycle_id: str,
+        opened_at: datetime,
+        ftmo_day: str,
+        source: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        if opened_at.tzinfo is None:
+            raise ValueError("opened_at must be timezone-aware")
+        opened_at_utc = opened_at.astimezone(timezone.utc)
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            account = connection.execute(
+                "SELECT 1 FROM accounts WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if account is None:
+                raise KeyError(f"unknown account_id: {account_id}")
+            existing = connection.execute(
+                """
+                SELECT first_opened_at, source, request_id
+                FROM qualification_trading_days
+                WHERE account_id = ? AND phase = ? AND cycle_id = ?
+                  AND ftmo_day = ?
+                """,
+                (account_id, phase.value, cycle_id, ftmo_day),
+            ).fetchone()
+            recorded = existing is None
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO qualification_trading_days (
+                        account_id, phase, cycle_id, ftmo_day,
+                        first_opened_at, source, request_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        phase.value,
+                        cycle_id,
+                        ftmo_day,
+                        opened_at_utc.isoformat(),
+                        source,
+                        request_id,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+            elif opened_at_utc < datetime.fromisoformat(
+                existing["first_opened_at"]
+            ):
+                connection.execute(
+                    """
+                    UPDATE qualification_trading_days
+                    SET first_opened_at = ?, source = ?, request_id = ?
+                    WHERE account_id = ? AND phase = ? AND cycle_id = ?
+                      AND ftmo_day = ?
+                    """,
+                    (
+                        opened_at_utc.isoformat(),
+                        source,
+                        request_id,
+                        account_id,
+                        phase.value,
+                        cycle_id,
+                        ftmo_day,
+                    ),
+                )
+            connection.commit()
+        return {
+            "account_id": account_id,
+            "phase": phase.value,
+            "cycle_id": cycle_id,
+            "ftmo_day": ftmo_day,
+            "first_opened_at": (
+                opened_at_utc.isoformat()
+                if existing is None
+                else min(
+                    opened_at_utc,
+                    datetime.fromisoformat(existing["first_opened_at"]),
+                ).isoformat()
+            ),
+            "recorded": recorded,
+        }
+
+    def qualification_trading_days(
+        self,
+        account_id: str,
+        *,
+        phase: AccountPhase,
+        cycle_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT ftmo_day, first_opened_at, source, request_id,
+                       created_at
+                FROM qualification_trading_days
+                WHERE account_id = ? AND phase = ? AND cycle_id = ?
+                ORDER BY ftmo_day
+                """,
+                (account_id, phase.value, cycle_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def qualification_history_status(
+        self,
+        account_id: str,
+    ) -> dict[str, Any] | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT phase, cycle_id, history_start_at, complete_through,
+                       source, updated_at
+                FROM qualification_history_status
+                WHERE account_id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def all_accounts(self) -> list[StoredAccount]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM accounts ORDER BY account_id"
+            ).fetchall()
+        return [self._stored_account_from_row(row) for row in rows]
+
+    def database_healthy(self) -> bool:
+        if self.path != ":memory:" and not Path(self.path).is_file():
+            return False
+        try:
+            with self._lock, self._connection() as connection:
+                row = connection.execute("SELECT 1").fetchone()
+                tables = {
+                    item["name"]
+                    for item in connection.execute(
+                        """
+                        SELECT name
+                        FROM sqlite_master
+                        WHERE type = 'table'
+                        """
+                    ).fetchall()
+                }
+            required = {
+                "accounts",
+                "calendar_snapshots",
+                "account_credentials",
+            }
+            return bool(row and row[0] == 1 and required <= tables)
+        except (OSError, sqlite3.DatabaseError):
+            return False
+
+    def unknown_execution_count(self) -> int:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM executions
+                WHERE outcome = 'unknown'
+                """
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def record_backup_event(
+        self,
+        *,
+        operation: str,
+        success: bool,
+        detail: str = "",
+    ) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO backup_runs (
+                    operation, success, created_at, detail
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    operation,
+                    int(success),
+                    datetime.now(timezone.utc).isoformat(),
+                    detail[:500],
+                ),
+            )
+            connection.commit()
+
+    def backup_metrics(self) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT operation, success, COUNT(*) AS count
+                FROM backup_runs
+                GROUP BY operation, success
+                """
+            ).fetchall()
+            latest = connection.execute(
+                """
+                SELECT created_at, success
+                FROM backup_runs
+                WHERE operation = 'backup'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        counts: dict[str, Any] = {
+            "backup_success": 0,
+            "backup_failure": 0,
+            "restore_success": 0,
+            "restore_failure": 0,
+        }
+        for row in rows:
+            key = (
+                f"{row['operation']}_"
+                f"{'success' if row['success'] else 'failure'}"
+            )
+            if key in counts:
+                counts[key] = int(row["count"])
+        counts["last_backup_at"] = (
+            latest["created_at"] if latest is not None else None
+        )
+        counts["last_backup_success"] = (
+            bool(latest["success"]) if latest is not None else None
+        )
+        return counts
+
+    def backup_to(self, output_path: str | Path) -> Path:
+        if self.path == ":memory:":
+            raise ValueError("in-memory state cannot be backed up by path")
+        destination = Path(output_path).expanduser().resolve()
+        source = Path(self.path).expanduser().resolve()
+        if destination == source:
+            raise ValueError("backup destination cannot equal state database")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = destination.with_name(
+            f".{destination.name}.{secrets.token_hex(8)}.tmp"
+        )
+        try:
+            with self._lock, self._connection() as source_connection:
+                backup_connection = sqlite3.connect(str(temp_path))
+                try:
+                    source_connection.backup(backup_connection)
+                    backup_connection.execute("PRAGMA wal_checkpoint(FULL)")
+                    backup_connection.commit()
+                finally:
+                    backup_connection.close()
+            os.chmod(temp_path, 0o600)
+            with closing(sqlite3.connect(str(temp_path))) as verification:
+                check = verification.execute("PRAGMA quick_check").fetchone()
+                if not check or check[0] != "ok":
+                    raise ValueError("backup quick_check failed")
+            os.replace(temp_path, destination)
+            os.chmod(destination, 0o600)
+            self.record_backup_event(
+                operation="backup",
+                success=True,
+                detail=str(destination),
+            )
+            return destination
+        except Exception as exc:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+                self.record_backup_event(
+                    operation="backup",
+                    success=False,
+                    detail=str(exc),
+                )
+            except Exception:
+                pass
+            raise
 
     def sync_account(
         self,
@@ -223,6 +1254,11 @@ class StateStore:
             raise ValueError("current_open_risk cannot be negative")
         if account_type == AccountType.ONE_STEP and style == AccountStyle.SWING:
             raise ValueError("Swing style is only available for 2-Step accounts")
+        if (
+            account_type == AccountType.ONE_STEP
+            and phase == AccountPhase.VERIFICATION
+        ):
+            raise ValueError("Verification is only available for 2-Step accounts")
         if profile is not None and (
             profile.account_type != account_type
             or profile.phase != phase
@@ -275,13 +1311,13 @@ class StateStore:
                     raise ValueError(
                         "account sync timestamp cannot move backwards"
                     )
-                if (
-                    row["phase"] == AccountPhase.FTMO_ACCOUNT.value
-                    and phase == AccountPhase.EVALUATION
-                ):
-                    raise ValueError(
-                        "phase cannot move from ftmo_account back to evaluation"
-                    )
+                phase_order = {
+                    AccountPhase.EVALUATION.value: 0,
+                    AccountPhase.VERIFICATION.value: 1,
+                    AccountPhase.FTMO_ACCOUNT.value: 2,
+                }
+                if phase_order[phase.value] < phase_order[row["phase"]]:
+                    raise ValueError("account phase cannot move backwards")
                 day_start_balance = Decimal(row["day_start_balance"])
                 highest_settled_balance = Decimal(
                     row["highest_settled_balance"]
@@ -728,14 +1764,17 @@ class StateStore:
             connection.execute(
                 """
                 INSERT INTO executions (
-                    account_id, request_id, request_hash, response_json,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    account_id, request_id, request_hash, action, symbol,
+                    outcome, response_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account_id,
                     request_id,
                     request_hash,
+                    action,
+                    symbol.upper(),
+                    outcome,
                     response_json,
                     datetime.now(timezone.utc).isoformat(),
                 ),

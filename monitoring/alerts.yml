@@ -1,0 +1,83 @@
+groups:
+  - name: ftmo-risk-control
+    rules:
+      - alert: FtmoRiskDatabaseDown
+        expr: ftmo_risk_database_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: FTMO risk SQLite state is unavailable
+          description: Stop all risk-increasing trading until state is healthy.
+
+      - alert: FtmoRiskNewsCalendarMissing
+        expr: ftmo_risk_calendar_present{calendar="news"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: News calendar is missing
+          description: Risk-increasing trading is fail-closed without news data.
+
+      - alert: FtmoRiskNewsCalendarStale
+        expr: ftmo_risk_calendar_age_seconds{calendar="news"} > 60
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: News calendar is stale
+          description: News data has exceeded the configured 60-second age.
+
+      - alert: FtmoRiskMarketCalendarMissing
+        expr: ftmo_risk_calendar_present{calendar="market"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Market closure calendar is missing
+          description: Risk-increasing trading is fail-closed without closures.
+
+      - alert: FtmoRiskMarketCalendarStale
+        expr: ftmo_risk_calendar_age_seconds{calendar="market"} > 3600
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Market closure calendar is stale
+          description: Closure data has exceeded the configured one-hour age.
+
+      - alert: FtmoRiskUnknownExecution
+        expr: ftmo_risk_unknown_execution_records > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: One or more execution outcomes are unknown
+          description: Reconcile platform orders before releasing reservations.
+
+      - alert: FtmoRiskOfficialBreach
+        expr: ftmo_risk_account_status{status="BREACH"} > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: An account has a latched official breach
+          description: Keep the account blocked and start compliance review.
+
+      - alert: FtmoRiskBackupFailed
+        expr: increase(ftmo_risk_backup_runs_total{operation="backup",result="failure"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: A state backup failed
+          description: Inspect storage permissions, capacity, and SQLite health.
+
+      - alert: FtmoRiskBackupOverdue
+        expr: ftmo_risk_last_backup_age_seconds < 0 or ftmo_risk_last_backup_age_seconds > 90000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: State backup is missing or overdue
+          description: No successful state backup has completed within 25 hours.

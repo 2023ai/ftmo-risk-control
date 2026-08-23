@@ -2,6 +2,15 @@
 
 核对日期：2026-08-23。
 
+官方核对来源：
+
+- [FTMO Challenge: 1-Step Trading Objectives](https://ftmo.com/en/trading-objectives/1-step/)
+- [FTMO Challenge: 2-Step Trading Objectives](https://ftmo.com/en/trading-objectives/2-step/)
+- [How long does it take to become an FTMO Trader?](https://ftmo.com/en/faq/how-long-does-it-take-to-become-an-ftmo-trader/)
+- [I have successfully passed my FTMO Challenge. What’s next?](https://ftmo.com/en/faq/i-have-successfully-passed-what-to-do-now/)
+
+规则仍以目标账户页面和当日生效条款为准；配置值不能替代上线时的账户级人工核对。
+
 ## 系统硬控制
 
 | 规则 | 实现 |
@@ -21,16 +30,23 @@
 | 触线记忆 | 内部 `LOCKED` 保持到下一 FTMO 日；官方 `BREACH` 跨日持久锁定 |
 | 重启规避 | SQLite 保存账户日界线、开仓和请求频率 |
 | 审计 | `request_id` 关联规则版本、决定和平台执行结果 |
+| 日历持久化 | 新闻和休市快照、哈希、时间和规则版本写入 SQLite，重启恢复但不刷新年龄 |
+| 备份恢复 | SQLite 在线一致性备份、`quick_check`、`0600`、停机锁和原子恢复 |
+| 账户凭证 | 每账户作用域绑定、一次性明文、摘要存储、轮换重叠、过期和撤销 |
+| 传输安全 | 默认 loopback；远程监听显式授权；支持直接 mTLS 或反向代理 mTLS |
+| 可观测性 | Prometheus 请求、决定、日历年龄、账户状态、未知执行、数据库和备份指标 |
 
-## 当前未覆盖的交易目标
+## 独立资格目标
 
-以下目标不会改变某一笔交易是否可以安全提交，因此当前交易前闸门不做自动判定：
+以下目标不会改变某一笔交易是否可以安全提交，因此不进入交易前闸门，而由独立资格看板判定：
 
-- 1-Step Best Day Rule：最盈利日不得超过 Positive Days' Profit 的 50%；超过不是账户违规，但会延迟通过 Challenge 或 Reward 资格。
-- 2-Step FTMO Challenge 和 Verification 的最低交易日。
-- Evaluation 阶段的 Profit Target。
+- 1-Step Best Day Rule：按 Prague 日聚合当前阶段/周期已平仓净损益，计算 `best_day_profit / positive_days_profit`。
+- 2-Step FTMO Challenge 和 Verification 的 Minimum Trading Days：按 Prague 日统计至少开过一个仓位的日期，跨日持仓不重复计数。
+- 1-Step Evaluation、2-Step Evaluation 和 Verification 的 Profit Target。
 
-这些项目需要独立的已平仓交易日统计和资格看板。上线时不得把本项目的 `ALLOW` 解释为“已满足全部 FTMO Trading Objectives”。
+资格记录使用 `account_id + phase + cycle_id` 隔离，防止把 Evaluation 利润带入 Verification，或把上一 Reward 周期带入下一周期。已平仓交易、开仓日和历史完整性水位缺一不可；缺失时返回 `uncertain`，不能显示正式达标。
+
+上线时不得把本项目的 `ALLOW` 解释为“已满足全部 FTMO Trading Objectives”。同样，看板 `eligible=true` 只代表当前配置和完整同步历史的计算结果，最终状态仍以 FTMO 账户页面和公司合规复核为准。
 
 ## 组织控制
 
@@ -42,6 +58,7 @@
 - 人工订单、其他 EA/cBot 和移动端订单必须被账户权限或交易网关隔离。
 - 新闻和市场休市数据必须来自经过批准且与 FTMO 品种名称一致的数据源。
 - FTMO 更新条款后，由合规负责人核对规则，更新配置并增加 `rule_version`。
+- Prometheus 告警必须连接公司值班路由；仓库内规则文件本身不能证明通知已经送达。
 
 ## 上线结论
 

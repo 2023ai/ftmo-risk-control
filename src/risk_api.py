@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import socket
+import ssl
 import threading
 import time
 from dataclasses import asdict
@@ -24,7 +25,8 @@ from enum import EnumMeta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from .risk_engine import (
@@ -44,6 +46,7 @@ from .risk_engine import (
     ftmo_day_key,
     validate_config,
 )
+from .qualification import qualification_snapshot
 from .state_store import StateStore, StoredAccount
 
 
@@ -57,6 +60,60 @@ class RequestError(ValueError):
 
 class EndpointDisabledError(RequestError):
     """An endpoint is intentionally disabled in the current server mode."""
+
+
+class AuthorizationError(RequestError):
+    """The caller is not authorized for the requested account or scope."""
+
+
+class ForbiddenError(AuthorizationError):
+    """The caller is authenticated but lacks the requested scope."""
+
+
+ACCOUNT_SCOPES = {
+    "/v1/account-sync": "account:sync",
+    "/v1/evaluate": "trade:evaluate",
+    "/v1/execution-result": "trade:execution",
+    "/v1/news-status": "calendar:read",
+    "/v1/market-status": "calendar:read",
+    "/v1/closed-trade-sync": "qualification:write",
+    "/v1/trading-day-sync": "qualification:write",
+    "/v1/qualification-history-sync": "qualification:write",
+}
+
+
+def _path_only(path: str) -> str:
+    return urlsplit(path).path
+
+
+def _news_calendar_payload(
+    values: list[NewsEvent],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "event_id": item.event_id,
+            "release_time": item.release_time.isoformat(),
+            "affected_symbols": sorted(item.affected_symbols),
+            "importance": item.importance,
+            "source": item.source,
+        }
+        for item in values
+    ]
+
+
+def _market_calendar_payload(
+    values: list[MarketClosure],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "closure_id": item.closure_id,
+            "start_time": item.start_time.isoformat(),
+            "end_time": item.end_time.isoformat(),
+            "affected_symbols": sorted(item.affected_symbols),
+            "source": item.source,
+        }
+        for item in values
+    ]
 
 
 def _decimal(value: Any, field: str) -> Decimal:
@@ -510,6 +567,47 @@ def _is_loopback_host(host: str) -> bool:
         address[4][0] in {"127.0.0.1", "::1"}
         for address in addresses
     )
+
+
+def _process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _acquire_state_server_lock(state_path: str | Path) -> Path:
+    state = Path(state_path).expanduser().resolve()
+    lock_path = state.with_name(state.name + ".server.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(2):
+        try:
+            descriptor = os.open(
+                lock_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            try:
+                pid = int(lock_path.read_text(encoding="ascii").strip())
+            except (OSError, ValueError):
+                pid = -1
+            if _process_alive(pid):
+                raise ValueError(
+                    f"state database is already owned by server process {pid}"
+                )
+            lock_path.unlink(missing_ok=True)
+            continue
+        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+            handle.write(str(os.getpid()))
+        os.chmod(lock_path, 0o600)
+        return lock_path
+    raise ValueError("unable to acquire state database server lock")
 
 
 def account_sync_payload(
@@ -981,6 +1079,317 @@ def market_status_payload(
     }
 
 
+def _credential_json(record: Any) -> dict[str, Any]:
+    return {
+        "credential_id": record.credential_id,
+        "account_id": record.account_id,
+        "not_before": record.not_before.isoformat(),
+        "expires_at": record.expires_at.isoformat(),
+        "revoked_at": (
+            record.revoked_at.isoformat()
+            if record.revoked_at is not None
+            else None
+        ),
+        "last_used_at": (
+            record.last_used_at.isoformat()
+            if record.last_used_at is not None
+            else None
+        ),
+        "scopes": list(record.scopes),
+        "created_at": record.created_at.isoformat(),
+    }
+
+
+def _credential_scopes(raw: Any) -> tuple[str, ...]:
+    if raw is None:
+        return tuple(
+            sorted(
+                {
+                    "account:sync",
+                    "trade:evaluate",
+                    "trade:execution",
+                    "calendar:read",
+                    "qualification:read",
+                    "qualification:write",
+                }
+            )
+        )
+    if not isinstance(raw, list) or not raw:
+        raise RequestError("scopes must be a non-empty JSON list")
+    scopes = tuple(sorted({str(item).strip() for item in raw if str(item).strip()}))
+    if not scopes or any(len(item) > 64 for item in scopes):
+        raise RequestError("scopes must contain non-empty values of at most 64 characters")
+    if "admin:*" in scopes:
+        raise RequestError("admin:* cannot be assigned to an account credential")
+    return scopes
+
+
+def _credential_expiry(
+    payload: Mapping[str, Any],
+    config_source: ConfigSource,
+    now: datetime,
+) -> tuple[datetime, datetime]:
+    security = _load_config(config_source).get("security", {})
+    default_ttl = int(security.get("credential_default_ttl_seconds", 2592000))
+    max_ttl = int(security.get("credential_max_ttl_seconds", 7776000))
+    not_before = (
+        _timestamp(payload["not_before"], "not_before")
+        if payload.get("not_before") is not None
+        else now
+    )
+    expires_at = (
+        _timestamp(payload["expires_at"], "expires_at")
+        if payload.get("expires_at") is not None
+        else now + timedelta(seconds=default_ttl)
+    )
+    if expires_at <= not_before:
+        raise RequestError("expires_at must be after not_before")
+    if expires_at > now + timedelta(seconds=max_ttl):
+        raise RequestError("credential expiry exceeds configured maximum TTL")
+    if not_before > now + timedelta(seconds=30):
+        raise RequestError("not_before cannot be more than 30 seconds in the future")
+    return not_before, expires_at
+
+
+def create_credential_payload(
+    *,
+    account_id: str,
+    payload: Mapping[str, Any],
+    state_store: StateStore,
+    config_source: ConfigSource,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    not_before, expires_at = _credential_expiry(payload, config_source, now)
+    record, secret = state_store.create_account_credential(
+        account_id=account_id,
+        scopes=_credential_scopes(payload.get("scopes")),
+        not_before=not_before,
+        expires_at=expires_at,
+        now=now,
+    )
+    return {
+        "ok": True,
+        "credential": _credential_json(record),
+        "secret": secret,
+        "secret_disclosure": "shown_once",
+    }
+
+
+def rotate_credential_payload(
+    *,
+    credential_id: str,
+    payload: Mapping[str, Any],
+    state_store: StateStore,
+    config_source: ConfigSource,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    not_before, expires_at = _credential_expiry(payload, config_source, now)
+    security = _load_config(config_source).get("security", {})
+    overlap_seconds = int(
+        payload.get(
+            "overlap_seconds",
+            security.get("credential_rotation_overlap_seconds", 300),
+        )
+    )
+    if overlap_seconds < 0 or overlap_seconds > 86400:
+        raise RequestError("overlap_seconds must be between 0 and 86400")
+    record, secret = state_store.rotate_account_credential(
+        credential_id=credential_id,
+        scopes=(
+            _credential_scopes(payload["scopes"])
+            if payload.get("scopes") is not None
+            else None
+        ),
+        not_before=not_before,
+        expires_at=expires_at,
+        overlap_seconds=overlap_seconds,
+        now=now,
+    )
+    return {
+        "ok": True,
+        "credential": _credential_json(record),
+        "secret": secret,
+        "secret_disclosure": "shown_once",
+        "old_credential_overlap_seconds": overlap_seconds,
+    }
+
+
+def revoke_credential_payload(
+    credential_id: str,
+    state_store: StateStore,
+) -> dict[str, Any]:
+    record = state_store.revoke_account_credential(credential_id)
+    return {"ok": True, "credential": _credential_json(record)}
+
+
+def list_credentials_payload(
+    *,
+    account_id: str | None,
+    state_store: StateStore,
+) -> dict[str, Any]:
+    records = state_store.list_account_credentials(account_id)
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "credentials": [_credential_json(record) for record in records],
+    }
+
+
+def closed_trade_sync_payload(
+    *,
+    payload: Mapping[str, Any],
+    state_store: StateStore,
+    request_id: str,
+) -> dict[str, Any]:
+    account_id = _account_id(_required(payload, "account_id"))
+    trade_id = str(_required(payload, "trade_id")).strip()
+    if not 1 <= len(trade_id) <= 160:
+        raise RequestError("trade_id must contain 1 to 160 characters")
+    if not re.fullmatch(r"[A-Za-z0-9._:/-]+", trade_id):
+        raise RequestError("trade_id contains unsupported characters")
+    closed_at = _timestamp(_required(payload, "closed_at"), "closed_at")
+    if closed_at.astimezone(timezone.utc) > (
+        datetime.now(timezone.utc) + timedelta(seconds=30)
+    ):
+        raise RequestError("closed_at cannot be more than 30 seconds in the future")
+    net_profit = _decimal(_required(payload, "net_profit"), "net_profit")
+    phase = _enum(
+        AccountPhase,
+        _required(payload, "phase"),
+        "phase",
+    )
+    cycle_id = _request_id(_required(payload, "cycle_id"))
+    symbol = str(payload.get("symbol", "")).strip().upper()
+    source = str(payload.get("source", "platform-history")).strip()
+    if len(symbol) > 64:
+        raise RequestError("symbol must contain at most 64 characters")
+    if not source or len(source) > 128:
+        raise RequestError("source must contain 1 to 128 characters")
+    result = state_store.record_closed_trade(
+        account_id=account_id,
+        trade_id=trade_id,
+        phase=phase,
+        cycle_id=cycle_id,
+        closed_at=closed_at,
+        ftmo_day=ftmo_day_key(closed_at, state_store.day_timezone),
+        net_profit=net_profit,
+        symbol=symbol,
+        source=source,
+        request_id=_request_id(str(payload.get("request_id", request_id))),
+    )
+    return result
+
+
+def qualification_history_sync_payload(
+    *,
+    payload: Mapping[str, Any],
+    state_store: StateStore,
+) -> dict[str, Any]:
+    account_id = _account_id(_required(payload, "account_id"))
+    phase = _enum(
+        AccountPhase,
+        _required(payload, "phase"),
+        "phase",
+    )
+    cycle_id = _request_id(_required(payload, "cycle_id"))
+    history_start_at = _timestamp(
+        _required(payload, "history_start_at"),
+        "history_start_at",
+    )
+    complete_through = _timestamp(
+        _required(payload, "complete_through"),
+        "complete_through",
+    )
+    if complete_through.astimezone(timezone.utc) > (
+        datetime.now(timezone.utc) + timedelta(seconds=30)
+    ):
+        raise RequestError(
+            "complete_through cannot be more than 30 seconds in the future"
+        )
+    source = str(payload.get("source", "platform-history")).strip()
+    if not source or len(source) > 128:
+        raise RequestError("source must contain 1 to 128 characters")
+    status = state_store.set_qualification_history_status(
+        account_id=account_id,
+        phase=phase,
+        cycle_id=cycle_id,
+        history_start_at=history_start_at,
+        complete_through=complete_through,
+        source=source,
+    )
+    return {"ok": True, "history": status}
+
+
+def trading_day_sync_payload(
+    *,
+    payload: Mapping[str, Any],
+    state_store: StateStore,
+    request_id: str,
+) -> dict[str, Any]:
+    account_id = _account_id(_required(payload, "account_id"))
+    phase = _enum(
+        AccountPhase,
+        _required(payload, "phase"),
+        "phase",
+    )
+    cycle_id = _request_id(_required(payload, "cycle_id"))
+    opened_at = _timestamp(_required(payload, "opened_at"), "opened_at")
+    if opened_at.astimezone(timezone.utc) > (
+        datetime.now(timezone.utc) + timedelta(seconds=30)
+    ):
+        raise RequestError(
+            "opened_at cannot be more than 30 seconds in the future"
+        )
+    source = str(payload.get("source", "platform-history")).strip()
+    if not source or len(source) > 128:
+        raise RequestError("source must contain 1 to 128 characters")
+    trading_day = state_store.record_qualification_trading_day(
+        account_id=account_id,
+        phase=phase,
+        cycle_id=cycle_id,
+        opened_at=opened_at,
+        ftmo_day=ftmo_day_key(opened_at, state_store.day_timezone),
+        source=source,
+        request_id=_request_id(str(payload.get("request_id", request_id))),
+    )
+    return {"ok": True, "trading_day": trading_day}
+
+
+def qualification_payload(
+    *,
+    account_id: str,
+    state_store: StateStore,
+    config_source: ConfigSource,
+) -> dict[str, Any]:
+    account = state_store.get_account(account_id)
+    history_status = state_store.qualification_history_status(account_id)
+    closed_trades = (
+        state_store.closed_trades(
+            account_id,
+            phase=AccountPhase(history_status["phase"]),
+            cycle_id=str(history_status["cycle_id"]),
+        )
+        if history_status is not None
+        else []
+    )
+    trading_day_events = (
+        state_store.qualification_trading_days(
+            account_id,
+            phase=AccountPhase(history_status["phase"]),
+            cycle_id=str(history_status["cycle_id"]),
+        )
+        if history_status is not None
+        else []
+    )
+    return qualification_snapshot(
+        config=_load_config(config_source),
+        account=account,
+        closed_trades=closed_trades,
+        trading_day_events=trading_day_events,
+        history_status=history_status,
+    )
+
+
 def _decimal_json(value: Decimal) -> str:
     return format(value, "f")
 
@@ -1150,7 +1559,7 @@ def position_size_payload(
 
 
 class RiskRequestHandler(BaseHTTPRequestHandler):
-    server_version = "FTMO-RiskAPI/1.0"
+    server_version = "FTMO-RiskAPI/3.0"
 
     def setup(self) -> None:
         super().setup()
@@ -1164,12 +1573,76 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
     def risk_server(self) -> "RiskHTTPServer":
         return self.server  # type: ignore[return-value]
 
-    def _authorized(self) -> bool:
+    def _global_authorized(self) -> bool:
         expected = self.risk_server.auth_token
         if not self.risk_server.require_auth:
             return True
         supplied = self.headers.get("X-Risk-Token", "")
+        if not supplied:
+            authorization = self.headers.get("Authorization", "")
+            scheme, separator, value = authorization.partition(" ")
+            if separator and scheme.lower() == "bearer":
+                supplied = value
         return hmac.compare_digest(supplied, expected)
+
+    def _authorize_account(
+        self,
+        *,
+        account_id: str,
+        scope: str,
+        allow_admin: bool = False,
+    ) -> str:
+        if self._global_authorized():
+            if (
+                allow_admin
+                or not self.risk_server.account_credentials_required
+            ):
+                return "admin"
+            raise ForbiddenError(
+                "account credential is required for this endpoint"
+            )
+        secret = self.headers.get("X-Account-Credential", "")
+        if self.risk_server.state_store is None:
+            raise AuthorizationError("account credential state is unavailable")
+        record = self.risk_server.state_store.authenticate_account_credential(
+            account_id=account_id,
+            secret=secret,
+            scope=scope,
+        )
+        if record is None:
+            raise AuthorizationError(
+                "invalid, expired, revoked, or out-of-scope account credential"
+            )
+        return record.credential_id
+
+    def _authorize_payload(self, path: str, payload: Mapping[str, Any]) -> str:
+        if path in {"/v1/news-sync", "/v1/market-sync"}:
+            if not self._global_authorized():
+                raise AuthorizationError("invalid administrator token")
+            return "admin"
+        if path.startswith("/v1/admin/"):
+            if not self._global_authorized():
+                raise AuthorizationError("invalid administrator token")
+            return "admin"
+        if path == "/v1/position-size":
+            if not self._global_authorized():
+                raise AuthorizationError("invalid administrator token")
+            return "admin"
+        if path == "/v1/evaluate" and "account_id" not in payload:
+            if not self._global_authorized():
+                raise AuthorizationError("invalid administrator token")
+            return "admin"
+        scope = ACCOUNT_SCOPES.get(path)
+        if scope is None:
+            if self._global_authorized():
+                return "admin"
+            raise AuthorizationError("invalid authentication credentials")
+        account_id = _account_id(_required(payload, "account_id"))
+        return self._authorize_account(
+            account_id=account_id,
+            scope=scope,
+            allow_admin=path == "/v1/account-sync",
+        )
 
     def _send_json(self, status: HTTPStatus, body: Mapping[str, Any]) -> None:
         encoded = json.dumps(
@@ -1183,6 +1656,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(encoded)
+        self.risk_server.observe_response(self.command, self.path, status, body)
 
     def _audit(
         self,
@@ -1206,6 +1680,12 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
             }
         )
 
+    def _calendar_sync_failure(self, path: str) -> None:
+        if path == "/v1/news-sync":
+            self.risk_server.observe_calendar_sync("news", "failure")
+        elif path == "/v1/market-sync":
+            self.risk_server.observe_calendar_sync("market", "failure")
+
     def _read_json(self) -> Mapping[str, Any]:
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -1226,30 +1706,185 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
         return _request_id(value if value is not None else str(uuid4()))
 
     def do_GET(self) -> None:
-        if self.path != "/health":
-            self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
-            return
-        if not self._authorized():
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED,
-                {"ok": False, "error": "invalid X-Risk-Token"},
+        path = _path_only(self.path)
+        if path == "/dashboard/qualification":
+            try:
+                encoded = self.risk_server.qualification_dashboard_path.read_bytes()
+            except OSError:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"ok": False, "error": "qualification dashboard is unavailable"},
+                )
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")
+            self.end_headers()
+            self.wfile.write(encoded)
+            self.risk_server.observe_response(
+                self.command,
+                self.path,
+                HTTPStatus.OK,
+                {},
             )
             return
-        self._send_json(
-            HTTPStatus.OK,
-            {
-                "ok": True,
-                "service": "ftmo-risk-api",
-                "rule_version": self.risk_server.rule_version,
-                "news_data_age_seconds": self.risk_server.news_age_seconds(),
-                "market_data_age_seconds": (
-                    self.risk_server.market_age_seconds()
+        if path == "/health":
+            if not self._global_authorized():
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"ok": False, "error": "invalid administrator token"},
+                )
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "service": "ftmo-risk-api",
+                    "rule_version": self.risk_server.rule_version,
+                    "news_data_age_seconds": (
+                        self.risk_server.news_age_seconds()
+                    ),
+                    "market_data_age_seconds": (
+                        self.risk_server.market_age_seconds()
+                    ),
+                    "news_calendar": self.risk_server.calendar_health("news"),
+                    "market_calendar": self.risk_server.calendar_health(
+                        "market"
+                    ),
+                    "persistent_state": self.risk_server.state_store is not None,
+                    "account_credentials_required": (
+                        self.risk_server.account_credentials_required
+                    ),
+                    "mtls_enabled": self.risk_server.mtls_enabled,
+                    "mtls_client_certificate_required": (
+                        self.risk_server.require_client_cert
+                    ),
+                },
+            )
+            return
+        if path == "/metrics":
+            if not self._global_authorized():
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"ok": False, "error": "invalid administrator token"},
+                )
+                return
+            encoded = self.risk_server.metrics_text().encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header(
+                "Content-Type",
+                "text/plain; version=0.0.4; charset=utf-8",
+            )
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(encoded)
+            self.risk_server.observe_response(
+                self.command,
+                self.path,
+                HTTPStatus.OK,
+                {},
+            )
+            return
+        if path == "/v1/qualification":
+            if self.risk_server.state_store is None:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": "persistent state is disabled"},
+                )
+                return
+            query = parse_qs(urlsplit(self.path).query)
+            values = query.get("account_id", [])
+            if len(values) != 1:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": "account_id query parameter is required"},
+                )
+                return
+            try:
+                account_id = _account_id(values[0])
+                self._authorize_account(
+                    account_id=account_id,
+                    scope="qualification:read",
+                )
+                body = qualification_payload(
+                    account_id=account_id,
+                    state_store=self.risk_server.state_store,
+                    config_source=self.risk_server.config,
+                )
+                self._send_json(HTTPStatus.OK, body)
+            except ForbiddenError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"ok": False, "error": str(exc)},
+                )
+            except (AuthorizationError, KeyError, ValueError) as exc:
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED
+                    if isinstance(exc, AuthorizationError)
+                    else HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": str(exc)},
+                )
+            return
+        if path == "/v1/qualification/accounts":
+            if not self._global_authorized():
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"ok": False, "error": "invalid administrator token"},
+                )
+                return
+            if self.risk_server.state_store is None:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": "persistent state is disabled"},
+                )
+                return
+            accounts = [
+                qualification_payload(
+                    account_id=account.account_id,
+                    state_store=self.risk_server.state_store,
+                    config_source=self.risk_server.config,
+                )
+                for account in self.risk_server.state_store.all_accounts()
+            ]
+            self._send_json(
+                HTTPStatus.OK,
+                {"ok": True, "rule_version": self.risk_server.rule_version, "accounts": accounts},
+            )
+            return
+        if path == "/v1/admin/credentials":
+            if not self._global_authorized():
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"ok": False, "error": "invalid administrator token"},
+                )
+                return
+            if self.risk_server.state_store is None:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": "persistent state is disabled"},
+                )
+                return
+            query = parse_qs(urlsplit(self.path).query)
+            values = query.get("account_id", [])
+            credential_account_id: str | None = (
+                _account_id(values[0]) if values else None
+            )
+            self._send_json(
+                HTTPStatus.OK,
+                list_credentials_payload(
+                    account_id=credential_account_id,
+                    state_store=self.risk_server.state_store,
                 ),
-                "persistent_state": self.risk_server.state_store is not None,
-            },
-        )
+            )
+            return
+        self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:
+        path = _path_only(self.path)
         try:
             request_id = self._request_id_from_headers()
         except RequestError as exc:
@@ -1272,19 +1907,10 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
             )
             self._send_json(HTTPStatus.TOO_MANY_REQUESTS, body)
             return
-        if not self._authorized():
-            body = {"ok": False, "error": "invalid X-Risk-Token"}
-            self._audit(
-                request_id,
-                self.path,
-                HTTPStatus.UNAUTHORIZED,
-                body,
-            )
-            self._send_json(HTTPStatus.UNAUTHORIZED, body)
-            return
         try:
             payload = self._read_json()
-            if self.path == "/v1/evaluate":
+            self._authorize_payload(path, payload)
+            if path == "/v1/evaluate":
                 with self.risk_server.news_lock:
                     cached_events = list(self.risk_server.news_events)
                     cached_news_age = self.risk_server.news_age_seconds()
@@ -1332,7 +1958,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                         default_market_age_seconds=cached_market_age,
                         day_timezone=self.risk_server.day_timezone,
                     )
-            elif self.path == "/v1/position-size":
+            elif path == "/v1/position-size":
                 if not self.risk_server.allow_stateless_position_size:
                     raise EndpointDisabledError(
                         "stateless /v1/position-size is disabled on this server"
@@ -1341,7 +1967,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     payload,
                     self.risk_server.config,
                 )
-            elif self.path == "/v1/account-sync":
+            elif path == "/v1/account-sync":
                 if self.risk_server.state_store is None:
                     raise RequestError(
                         "persistent state is disabled on this server"
@@ -1351,7 +1977,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     self.risk_server.state_store,
                     self.risk_server.config,
                 )
-            elif self.path == "/v1/settlement-sync":
+            elif path == "/v1/settlement-sync":
                 if self.risk_server.state_store is None:
                     raise RequestError(
                         "persistent state is disabled on this server"
@@ -1360,7 +1986,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     payload,
                     self.risk_server.state_store,
                 )
-            elif self.path == "/v1/execution-result":
+            elif path == "/v1/execution-result":
                 if self.risk_server.state_store is None:
                     raise RequestError(
                         "persistent state is disabled on this server"
@@ -1369,7 +1995,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     payload,
                     self.risk_server.state_store,
                 )
-            elif self.path == "/v1/news-status":
+            elif path == "/v1/news-status":
                 if self.risk_server.state_store is None:
                     raise RequestError(
                         "persistent state is disabled on this server"
@@ -1384,7 +2010,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     cached_news_age,
                     self.risk_server.config,
                 )
-            elif self.path == "/v1/market-status":
+            elif path == "/v1/market-status":
                 if self.risk_server.state_store is None:
                     raise RequestError(
                         "persistent state is disabled on this server"
@@ -1403,7 +2029,36 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     cached_market_age,
                     self.risk_server.config,
                 )
-            elif self.path == "/v1/news-sync":
+            elif path == "/v1/closed-trade-sync":
+                if self.risk_server.state_store is None:
+                    raise RequestError(
+                        "persistent state is disabled on this server"
+                    )
+                body = closed_trade_sync_payload(
+                    payload=payload,
+                    state_store=self.risk_server.state_store,
+                    request_id=request_id,
+                )
+            elif path == "/v1/qualification-history-sync":
+                if self.risk_server.state_store is None:
+                    raise RequestError(
+                        "persistent state is disabled on this server"
+                    )
+                body = qualification_history_sync_payload(
+                    payload=payload,
+                    state_store=self.risk_server.state_store,
+                )
+            elif path == "/v1/trading-day-sync":
+                if self.risk_server.state_store is None:
+                    raise RequestError(
+                        "persistent state is disabled on this server"
+                    )
+                body = trading_day_sync_payload(
+                    payload=payload,
+                    state_store=self.risk_server.state_store,
+                    request_id=request_id,
+                )
+            elif path == "/v1/news-sync":
                 events = _news_events(_required(payload, "events"))
                 fetched_at = _timestamp(
                     _required(payload, "fetched_at"),
@@ -1442,14 +2097,32 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                         raise RequestError(
                             "news calendar timestamp already has different content"
                         )
+                    if self.risk_server.state_store is not None:
+                        self.risk_server.state_store.save_calendar_snapshot(
+                            calendar_type="news",
+                            fetched_at=fetched_at,
+                            payload=_news_calendar_payload(events),
+                            rule_version=self.risk_server.rule_version,
+                        )
                     self.risk_server.news_events = events
                     self.risk_server.news_fetched_at = fetched_at
+                    with self.risk_server.metrics_lock:
+                        sync_metric_key = ("news", "success")
+                        self.risk_server.calendar_sync_counts[
+                            sync_metric_key
+                        ] = (
+                            self.risk_server.calendar_sync_counts.get(
+                                sync_metric_key,
+                                0,
+                            )
+                            + 1
+                        )
                 body = {
                     "ok": True,
                     "event_count": len(events),
                     "news_data_age_seconds": age,
                 }
-            elif self.path == "/v1/market-sync":
+            elif path == "/v1/market-sync":
                 closures = _market_closures(
                     _required(payload, "closures")
                 )
@@ -1490,13 +2163,70 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                         raise RequestError(
                             "market calendar timestamp already has different content"
                         )
+                    if self.risk_server.state_store is not None:
+                        self.risk_server.state_store.save_calendar_snapshot(
+                            calendar_type="market",
+                            fetched_at=fetched_at,
+                            payload=_market_calendar_payload(closures),
+                            rule_version=self.risk_server.rule_version,
+                        )
                     self.risk_server.market_closures = closures
                     self.risk_server.market_fetched_at = fetched_at
+                    with self.risk_server.metrics_lock:
+                        sync_metric_key = ("market", "success")
+                        self.risk_server.calendar_sync_counts[
+                            sync_metric_key
+                        ] = (
+                            self.risk_server.calendar_sync_counts.get(
+                                sync_metric_key,
+                                0,
+                            )
+                            + 1
+                        )
                 body = {
                     "ok": True,
                     "closure_count": len(closures),
                     "market_data_age_seconds": age,
                 }
+            elif re.fullmatch(
+                r"/v1/admin/accounts/[^/]+/credentials",
+                path,
+            ):
+                if self.risk_server.state_store is None:
+                    raise RequestError(
+                        "persistent state is disabled on this server"
+                    )
+                account_id = _account_id(
+                    path.split("/")[4]
+                )
+                body = create_credential_payload(
+                    account_id=account_id,
+                    payload=payload,
+                    state_store=self.risk_server.state_store,
+                    config_source=self.risk_server.config,
+                )
+            elif re.fullmatch(r"/v1/admin/credentials/[^/]+/rotate", path):
+                if self.risk_server.state_store is None:
+                    raise RequestError(
+                        "persistent state is disabled on this server"
+                    )
+                credential_id = path.split("/")[4]
+                body = rotate_credential_payload(
+                    credential_id=credential_id,
+                    payload=payload,
+                    state_store=self.risk_server.state_store,
+                    config_source=self.risk_server.config,
+                )
+            elif re.fullmatch(r"/v1/admin/credentials/[^/]+/revoke", path):
+                if self.risk_server.state_store is None:
+                    raise RequestError(
+                        "persistent state is disabled on this server"
+                    )
+                credential_id = path.split("/")[4]
+                body = revoke_credential_payload(
+                    credential_id,
+                    self.risk_server.state_store,
+                )
             else:
                 body = {"ok": False, "error": "not found"}
                 self._audit(request_id, self.path, HTTPStatus.NOT_FOUND, body)
@@ -1505,15 +2235,28 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
             body.setdefault("request_id", request_id)
             self._audit(request_id, self.path, HTTPStatus.OK, body)
             self._send_json(HTTPStatus.OK, body)
+        except ForbiddenError as exc:
+            self._calendar_sync_failure(path)
+            body = {"ok": False, "error": str(exc), "request_id": request_id}
+            self._audit(request_id, self.path, HTTPStatus.FORBIDDEN, body)
+            self._send_json(HTTPStatus.FORBIDDEN, body)
+        except AuthorizationError as exc:
+            self._calendar_sync_failure(path)
+            body = {"ok": False, "error": str(exc), "request_id": request_id}
+            self._audit(request_id, self.path, HTTPStatus.UNAUTHORIZED, body)
+            self._send_json(HTTPStatus.UNAUTHORIZED, body)
         except EndpointDisabledError as exc:
+            self._calendar_sync_failure(path)
             body = {"ok": False, "error": str(exc), "request_id": request_id}
             self._audit(request_id, self.path, HTTPStatus.FORBIDDEN, body)
             self._send_json(HTTPStatus.FORBIDDEN, body)
         except (RequestError, KeyError, ValueError) as exc:
+            self._calendar_sync_failure(path)
             body = {"ok": False, "error": str(exc), "request_id": request_id}
             self._audit(request_id, self.path, HTTPStatus.BAD_REQUEST, body)
             self._send_json(HTTPStatus.BAD_REQUEST, body)
         except Exception:
+            self._calendar_sync_failure(path)
             # Do not leak stack traces or local paths to a platform adapter.
             LOGGER.exception(
                 "Unhandled risk service error request_id=%s endpoint=%s",
@@ -1549,6 +2292,11 @@ class RiskHTTPServer(ThreadingHTTPServer):
         allow_stateless_position_size: bool = False,
         allow_remote_bind: bool = False,
         read_timeout_seconds: float = 5.0,
+        tls_cert_path: str | Path | None = None,
+        tls_key_path: str | Path | None = None,
+        tls_ca_path: str | Path | None = None,
+        require_client_cert: bool = False,
+        require_account_credentials: bool | None = None,
     ):
         self.config_path = str(config_path)
         self.auth_token = auth_token
@@ -1575,13 +2323,23 @@ class RiskHTTPServer(ThreadingHTTPServer):
         self.market_lock = threading.Lock()
         self.audit_lock = threading.Lock()
         self.rate_lock = threading.Lock()
+        self.metrics_lock = threading.Lock()
         self.rate_by_client: dict[str, list[float]] = {}
         self.max_requests_per_minute = 1200
+        self.http_requests: dict[tuple[str, str, str], int] = {}
+        self.decision_counts: dict[str, int] = {}
+        self.calendar_sync_counts: dict[tuple[str, str], int] = {}
+        self.calendar_restore_counts: dict[tuple[str, str], int] = {}
         self.news_events: list[NewsEvent] = []
         self.news_fetched_at: datetime | None = None
         self.market_closures: list[MarketClosure] = []
         self.market_fetched_at: datetime | None = None
         self.audit_path = os.environ.get("RISK_AUDIT_PATH", "")
+        self.qualification_dashboard_path = (
+            Path(__file__).resolve().parents[1]
+            / "dashboard"
+            / "qualification.html"
+        )
         config = dict(_load_config(config_path))
         validate_config(config)
         self.config = config
@@ -1594,7 +2352,80 @@ class RiskHTTPServer(ThreadingHTTPServer):
             if state_path
             else None
         )
-        super().__init__(server_address, RiskRequestHandler)
+        security = config.get("security", {})
+        self.account_credentials_required = (
+            bool(security.get("require_account_credentials", True))
+            if require_account_credentials is None
+            else require_account_credentials
+        )
+        config_requires_mtls = bool(security.get("require_mtls", False))
+        self.require_client_cert = bool(
+            require_client_cert or config_requires_mtls
+        )
+        if self.require_client_cert and tls_ca_path is None:
+            raise ValueError(
+                "tls_ca_path is required when client certificate validation "
+                "is enabled"
+            )
+        if (tls_cert_path is None) != (tls_key_path is None):
+            raise ValueError(
+                "tls_cert_path and tls_key_path must be supplied together"
+            )
+        if self.require_client_cert and tls_cert_path is None:
+            raise ValueError(
+                "client certificate validation requires TLS certificate and key"
+            )
+        self.mtls_enabled = tls_cert_path is not None
+        self._state_server_lock_path = (
+            _acquire_state_server_lock(state_path) if state_path else None
+        )
+        try:
+            super().__init__(server_address, RiskRequestHandler)
+            if self.mtls_enabled:
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
+                context.load_cert_chain(
+                    certfile=str(tls_cert_path),
+                    keyfile=str(tls_key_path),
+                )
+                if tls_ca_path is not None:
+                    context.load_verify_locations(cafile=str(tls_ca_path))
+                context.verify_mode = (
+                    ssl.CERT_REQUIRED
+                    if self.require_client_cert
+                    else ssl.CERT_NONE
+                )
+                self.socket = context.wrap_socket(
+                    self.socket,
+                    server_side=True,
+                )
+            elif self.require_client_cert:
+                raise ValueError(
+                    "client certificate validation requires TLS certificate "
+                    "and key"
+                )
+            self._restore_calendars()
+        except Exception:
+            try:
+                super().server_close()
+            except Exception:
+                pass
+            self._release_state_server_lock()
+            raise
+
+    def _release_state_server_lock(self) -> None:
+        if self._state_server_lock_path is None:
+            return
+        try:
+            self._state_server_lock_path.unlink(missing_ok=True)
+        finally:
+            self._state_server_lock_path = None
+
+    def server_close(self) -> None:
+        try:
+            super().server_close()
+        finally:
+            self._release_state_server_lock()
 
     def news_age_seconds(self) -> int | None:
         if self.news_fetched_at is None:
@@ -1621,6 +2452,271 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 ).total_seconds()
             ),
         )
+
+    def _restore_calendars(self) -> None:
+        if self.state_store is None:
+            return
+        try:
+            snapshots = self.state_store.get_calendar_snapshots()
+            for calendar_type, snapshot in snapshots.items():
+                if calendar_type == "news":
+                    events = _news_events(
+                        cast(list[Mapping[str, Any]], snapshot.payload)
+                    )
+                    with self.news_lock:
+                        self.news_events = events
+                        self.news_fetched_at = snapshot.fetched_at
+                elif calendar_type == "market":
+                    closures = _market_closures(
+                        cast(list[Mapping[str, Any]], snapshot.payload)
+                    )
+                    with self.market_lock:
+                        self.market_closures = closures
+                        self.market_fetched_at = snapshot.fetched_at
+                else:
+                    raise ValueError(
+                        f"unsupported persisted calendar type: {calendar_type}"
+                    )
+                with self.metrics_lock:
+                    self.calendar_restore_counts[
+                        (calendar_type, "success")
+                    ] = (
+                        self.calendar_restore_counts.get(
+                            (calendar_type, "success"),
+                            0,
+                        )
+                        + 1
+                    )
+        except Exception:
+            LOGGER.exception("failed to restore persisted calendars")
+            with self.metrics_lock:
+                for calendar_type in ("news", "market"):
+                    self.calendar_restore_counts[
+                        (calendar_type, "failure")
+                    ] = (
+                        self.calendar_restore_counts.get(
+                            (calendar_type, "failure"),
+                            0,
+                        )
+                        + 1
+                    )
+
+    def calendar_health(self, calendar_type: str) -> dict[str, Any]:
+        if calendar_type == "news":
+            fetched_at = self.news_fetched_at
+            age = self.news_age_seconds()
+        else:
+            fetched_at = self.market_fetched_at
+            age = self.market_age_seconds()
+        return {
+            "present": fetched_at is not None,
+            "fetched_at": fetched_at.isoformat() if fetched_at else None,
+            "age_seconds": age,
+            "persistent": self.state_store is not None,
+        }
+
+    def observe_response(
+        self,
+        method: str,
+        path: str,
+        status: HTTPStatus,
+        body: Mapping[str, Any],
+    ) -> None:
+        endpoint = _path_only(path)
+        status_text = str(int(status))
+        decision = body.get("decision")
+        decision_code = (
+            str(decision.get("code"))
+            if isinstance(decision, Mapping) and decision.get("code")
+            else None
+        )
+        with self.metrics_lock:
+            key = (method.upper(), endpoint, status_text)
+            self.http_requests[key] = self.http_requests.get(key, 0) + 1
+            if decision_code is not None:
+                self.decision_counts[decision_code] = (
+                    self.decision_counts.get(decision_code, 0) + 1
+                )
+
+    def observe_calendar_sync(self, calendar: str, result: str) -> None:
+        with self.metrics_lock:
+            key = (calendar, result)
+            self.calendar_sync_counts[key] = (
+                self.calendar_sync_counts.get(key, 0) + 1
+            )
+
+    def _metric_lines(self) -> list[str]:
+        lines = [
+            "# HELP ftmo_risk_http_requests_total HTTP responses by endpoint.",
+            "# TYPE ftmo_risk_http_requests_total counter",
+        ]
+        with self.metrics_lock:
+            requests = dict(self.http_requests)
+            decisions = dict(self.decision_counts)
+            calendar_sync = dict(self.calendar_sync_counts)
+            calendar_restore = dict(self.calendar_restore_counts)
+        for (method, endpoint, status), count in sorted(requests.items()):
+            lines.append(
+                "ftmo_risk_http_requests_total"
+                f'{{method="{method}",endpoint="{endpoint}",status="{status}"}} '
+                f"{count}"
+            )
+        lines.extend(
+            [
+                "# HELP ftmo_risk_decisions_total Risk decisions by code.",
+                "# TYPE ftmo_risk_decisions_total counter",
+            ]
+        )
+        for code, count in sorted(decisions.items()):
+            lines.append(
+                f'ftmo_risk_decisions_total{{code="{code}"}} {count}'
+            )
+        lines.extend(
+            [
+                "# HELP ftmo_risk_calendar_sync_total Calendar sync results.",
+                "# TYPE ftmo_risk_calendar_sync_total counter",
+            ]
+        )
+        for (calendar, result), count in sorted(calendar_sync.items()):
+            lines.append(
+                "ftmo_risk_calendar_sync_total"
+                f'{{calendar="{calendar}",result="{result}"}} {count}'
+            )
+        lines.extend(
+            [
+                "# HELP ftmo_risk_calendar_restore_total Calendar restore results.",
+                "# TYPE ftmo_risk_calendar_restore_total counter",
+            ]
+        )
+        for (calendar, result), count in sorted(calendar_restore.items()):
+            lines.append(
+                "ftmo_risk_calendar_restore_total"
+                f'{{calendar="{calendar}",result="{result}"}} {count}'
+            )
+        lines.extend(
+            [
+                "# HELP ftmo_risk_calendar_present Whether a calendar is loaded.",
+                "# TYPE ftmo_risk_calendar_present gauge",
+                "# HELP ftmo_risk_calendar_age_seconds Calendar age.",
+                "# TYPE ftmo_risk_calendar_age_seconds gauge",
+            ]
+        )
+        for calendar in ("news", "market"):
+            health = self.calendar_health(calendar)
+            present = 1 if health["present"] else 0
+            age = health["age_seconds"]
+            lines.append(
+                f'ftmo_risk_calendar_present{{calendar="{calendar}"}} '
+                f"{present}"
+            )
+            lines.append(
+                f'ftmo_risk_calendar_age_seconds{{calendar="{calendar}"}} '
+                f"{age if age is not None else -1}"
+            )
+
+        lines.extend(
+            [
+                "# HELP ftmo_risk_account_status Account status counts.",
+                "# TYPE ftmo_risk_account_status gauge",
+            ]
+        )
+        database_up = (
+            1
+            if (
+                self.state_store is not None
+                and self.state_store.database_healthy()
+            )
+            else 0
+        )
+        accounts: list[StoredAccount] = []
+        unknown = 0
+        backup: dict[str, Any] = {}
+        if database_up and self.state_store is not None:
+            try:
+                accounts = self.state_store.all_accounts()
+                unknown = self.state_store.unknown_execution_count()
+                backup = self.state_store.backup_metrics()
+            except Exception:
+                LOGGER.exception("failed to collect SQLite metrics")
+                database_up = 0
+        status_counts = {
+            "GREEN": 0,
+            "AMBER": 0,
+            "RED": 0,
+            "LOCKED": 0,
+            "BREACH": 0,
+        }
+        for account in accounts:
+            profile, _ = _profile(
+                self.config,
+                {
+                    "account_type": account.account_type.value,
+                    "phase": account.phase.value,
+                    "style": account.style.value,
+                },
+            )
+            status = RiskEngine(
+                profile,
+                day_timezone=self.day_timezone,
+            ).status(account.snapshot)
+            status_counts[status] = status_counts.get(status, 0) + 1
+        for status, count in sorted(status_counts.items()):
+            lines.append(
+                f'ftmo_risk_account_status{{status="{status}"}} {count}'
+            )
+        lines.extend(
+            [
+                "# HELP ftmo_risk_unknown_execution_records Unknown executions.",
+                "# TYPE ftmo_risk_unknown_execution_records gauge",
+                f"ftmo_risk_unknown_execution_records {unknown}",
+            ]
+        )
+        lines.extend(
+            [
+                "# HELP ftmo_risk_database_up SQLite health status.",
+                "# TYPE ftmo_risk_database_up gauge",
+                f"ftmo_risk_database_up {database_up}",
+            ]
+        )
+        lines.extend(
+            [
+                "# HELP ftmo_risk_backup_runs_total Backup and restore outcomes.",
+                "# TYPE ftmo_risk_backup_runs_total counter",
+            ]
+        )
+        for operation in ("backup", "restore"):
+            for result in ("success", "failure"):
+                key = f"{operation}_{result}"
+                lines.append(
+                    "ftmo_risk_backup_runs_total"
+                    f'{{operation="{operation}",result="{result}"}} '
+                    f"{backup.get(key, 0)}"
+                )
+        latest = backup.get("last_backup_at")
+        latest_age = -1
+        if latest:
+            latest_age = max(
+                0,
+                int(
+                    (
+                        datetime.now(timezone.utc)
+                        - datetime.fromisoformat(latest).astimezone(
+                            timezone.utc
+                        )
+                    ).total_seconds()
+                ),
+            )
+        lines.extend(
+            [
+                "# HELP ftmo_risk_last_backup_age_seconds Age of last backup.",
+                "# TYPE ftmo_risk_last_backup_age_seconds gauge",
+                f"ftmo_risk_last_backup_age_seconds {latest_age}",
+            ]
+        )
+        return lines
+
+    def metrics_text(self) -> str:
+        return "\n".join(self._metric_lines()) + "\n"
 
     def write_audit(self, record: Mapping[str, Any]) -> None:
         if not self.audit_path:
@@ -1674,6 +2770,11 @@ def make_server(
     allow_stateless_position_size: bool = False,
     allow_remote_bind: bool = False,
     read_timeout_seconds: float = 5.0,
+    tls_cert_path: str | Path | None = None,
+    tls_key_path: str | Path | None = None,
+    tls_ca_path: str | Path | None = None,
+    require_client_cert: bool = False,
+    require_account_credentials: bool | None = None,
 ) -> RiskHTTPServer:
     return RiskHTTPServer(
         (host, port),
@@ -1684,6 +2785,11 @@ def make_server(
         allow_stateless_position_size=allow_stateless_position_size,
         allow_remote_bind=allow_remote_bind,
         read_timeout_seconds=read_timeout_seconds,
+        tls_cert_path=tls_cert_path,
+        tls_key_path=tls_key_path,
+        tls_ca_path=tls_ca_path,
+        require_client_cert=require_client_cert,
+        require_account_credentials=require_account_credentials,
     )
 
 
@@ -1726,6 +2832,26 @@ def main() -> None:
             "instance."
         ),
     )
+    parser.add_argument(
+        "--tls-cert",
+        default=os.environ.get("RISK_TLS_CERT", ""),
+        help="Server TLS certificate path.",
+    )
+    parser.add_argument(
+        "--tls-key",
+        default=os.environ.get("RISK_TLS_KEY", ""),
+        help="Server TLS private key path.",
+    )
+    parser.add_argument(
+        "--tls-ca",
+        default=os.environ.get("RISK_TLS_CA", ""),
+        help="CA bundle for mTLS client certificate validation.",
+    )
+    parser.add_argument(
+        "--require-client-cert",
+        action="store_true",
+        help="Require and validate a client certificate using --tls-ca.",
+    )
     args = parser.parse_args()
     if not args.token:
         parser.error(
@@ -1741,9 +2867,15 @@ def main() -> None:
         allow_stateless_evaluate=args.allow_stateless_evaluate,
         allow_stateless_position_size=args.allow_stateless_position_size,
         allow_remote_bind=args.allow_remote_bind,
+        tls_cert_path=args.tls_cert or None,
+        tls_key_path=args.tls_key or None,
+        tls_ca_path=args.tls_ca or None,
+        require_client_cert=args.require_client_cert,
     )
     print(
-        f"FTMO risk API listening on http://{args.host}:{args.port} "
+        f"FTMO risk API listening on "
+        f"{'https' if server.mtls_enabled else 'http'}://"
+        f"{args.host}:{args.port} "
         f"(rule {server.rule_version})"
     )
     try:

@@ -10,12 +10,15 @@ flowchart LR
     Engine --> Rules[账户规则与内部阈值]
     Engine --> News[新闻日历与受影响品种]
     Engine --> Market[长休市与周末日历]
-    Engine --> State[SQLite账户与频率状态]
+    Engine --> State[SQLite账户、日历与资格状态]
+    Adapter --> Credential[账户级凭证校验]
     Engine --> Gate[执行闸门]
     Gate --> MT5
     Gate --> CTR
     Adapter --> Audit[审计日志]
-    Engine --> Monitor[监控看板与告警]
+    State --> Qualification[独立资格计算]
+    Qualification --> Dashboard[资格看板]
+    Engine --> Metrics[Prometheus指标与告警]
 ```
 
 ## 2. 检查顺序
@@ -187,16 +190,67 @@ Evaluation 和 Swing 可以跨周末持仓，但仍受禁止 gap trading 的前 
 - 1-Step 最高结算余额；
 - 最近请求、开仓和修改时间；
 - 风控允许后的开仓频率预留；
-- 平台明确拒绝后释放的预留。
-- 当日内部锁和已观察到的官方违规锁。
+- 平台明确拒绝后释放的预留；
+- 当日内部锁和已观察到的官方违规锁；
+- 新闻和休市日历快照、内容哈希、抓取时间和规则版本；
+- 账户凭证摘要、作用域、有效期、轮换、撤销和最后使用时间；
+- 按阶段与周期隔离的已平仓损益、开仓日和资格历史完整性；
+- 在线备份和恢复结果。
 
 重启 EA/cBot 或 API 不会清空频率。
+
+API 进程持有 `<state>.server.lock`。在线备份使用 SQLite Backup API，可以在服务运行时执行；恢复必须停机，恢复工具会校验锁文件、数据库结构和 `PRAGMA quick_check`，通过后再原子替换目标文件。
 
 Prague 日界线以风控服务器接收账户同步的时间为准。客户端 `as_of` 只用于时钟偏差和快照新鲜度检查；若评估时数据库仍停留在上一 FTMO 日，新增风险会因结算基线不确定而被拒绝。
 
 平台请求 ID 也必须跨重启保持唯一：MT5 使用账户级持久序号与 UTC 秒，cTrader 使用 GUID。服务端仍以 `(account_id, request_id)` 作为幂等边界。
 
-## 9. 断线和异常
+## 9. 凭证边界
+
+管理员令牌与账户凭证分离：
+
+```text
+管理员令牌
+  -> 日历、健康、指标、凭证管理、全账户资格汇总
+
+账户凭证
+  -> 固定 account_id + scopes + not_before + expires_at + revoked_at
+```
+
+账户秘密使用 256 位随机值。SQLite 只保存随机盐和 SHA-256 摘要，不保存明文。轮换在一个事务中创建新凭证并设置旧凭证失效时间，支持短暂重叠，避免计划内轮换中断。
+
+远程部署可由 Python TLS 层直接要求客户端证书，也可以在受控反向代理终止 mTLS。账户凭证仍用于账户绑定和细粒度作用域。
+
+## 10. 独立资格看板
+
+资格模块不参与交易前闸门。每个资格周期由以下键隔离：
+
+```text
+account_id + phase + cycle_id
+```
+
+- Profit Target：当前周期已平仓净损益相对目标金额；
+- Best Day Rule：最盈利 FTMO 日 / 所有正收益 FTMO 日之和；
+- Minimum Trading Days：CE(S)T 日内至少开过一个仓位的日期数量。
+
+已平仓交易不能替代开仓日事件，因为跨日持仓只计开仓日。历史同步器先写交易和开仓日，再提交 `history_start_at` 与 `complete_through`；完整性水位未覆盖最新账户快照时，资格结果强制进入 `uncertain`。
+
+浏览器看板只展示 `/v1/qualification/accounts`，不会把管理员令牌写入 URL 或本地存储。
+
+## 11. 可观测性
+
+`/metrics` 使用固定标签集合，避免账户 ID、品种和请求 ID造成高基数或敏感信息泄露。指标覆盖：
+
+- API 请求、状态码和决定代码；
+- 日历存在性、年龄、同步与恢复；
+- 账户状态分布；
+- 未知执行结果；
+- SQLite 健康；
+- 备份/恢复结果和最后备份年龄。
+
+Prometheus 抓取示例和告警规则放在 `monitoring/`。告警覆盖数据库不可用、日历缺失/过期、未知执行、官方 `BREACH`、备份失败和备份逾期。
+
+## 12. 断线和异常
 
 以下情况必须停止新增风险：
 

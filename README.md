@@ -1,10 +1,10 @@
 # FTMO 自营交易风控系统
 
-这是一个面向 FTMO 账户、MT5 和 cTrader 的可运行 V2 风控实现。
+这是一个面向 FTMO 账户、MT5 和 cTrader 的可运行 V3 风控实现。
 
 本项目是风控参考实现和平台接入模板，不构成 FTMO 官方软件、法律意见或实盘收益保证。上线前必须使用公司批准的数据源、目标账户规格和模拟账户回放验证。
 
-当前版本聚焦六类核心控制：
+当前版本聚焦九类核心能力：
 
 1. 以损定仓：先确定止损和允许亏损，再计算交易量。
 2. 新闻时段：区分 FTMO 账户阶段、Standard/Swing 账户和受影响品种。
@@ -12,6 +12,9 @@
 4. 日亏与最大亏损：按账户规则计算官方底线，并使用更保守的内部停止线。
 5. 周末与长休市：全阶段提前 2 小时禁止开仓，Standard FTMO Account 提前平仓撤单。
 6. 持久化审计：SQLite 保存日界线、结算确认、频率、风控决定幂等记录与平台执行结果。
+7. 日历韧性：新闻和休市快照持久化，重启自动恢复，支持在线备份和停机恢复。
+8. 账户安全：管理员令牌与账户凭证分离，支持作用域、轮换、重叠窗口、过期、撤销和可选 mTLS。
+9. 资格看板：按阶段和周期独立计算 Profit Target、Minimum Trading Days 和 Best Day Rule。
 
 内部日亏锁一旦触发会保持到下一 FTMO 日；观察到官方亏损底线后会持久锁定，权益反弹或重启服务都不会自动恢复新增风险。
 
@@ -23,20 +26,30 @@ config/news-events.example.json
                           新闻事件格式示例
 config/market-closures.example.json
                           长休市/周末收市格式示例
+config/qualification-history.example.json
+                          资格历史批量同步格式示例
 docs/architecture.md      系统架构、状态机和平台接入要求
 docs/api-contract.md      风控 API 请求和响应契约
 docs/compliance-matrix.md 规则覆盖和组织控制边界
 docs/deployment.md        部署与上线检查
 docs/verification.md      自动测试与平台编译结果
+dashboard/qualification.html
+                          浏览器资格看板
+monitoring/               Prometheus 抓取示例和告警规则
 SECURITY.md               密钥、账户数据和漏洞报告规范
 CONTRIBUTING.md           开发、测试和平台验证要求
 LICENSE                   MIT 许可证
 src/risk_engine.py        可独立测试的纯 Python 风控引擎
 src/risk_api.py           本地 HTTP 风控服务
 src/state_store.py        SQLite 账户、日界线和频率状态
+src/qualification.py      独立资格计算
 platform/                 MT5 EA 和 cTrader cBot 接入模板
 scripts/sync_news.py      将人工审核后的新闻映射推送到服务
 scripts/sync_market.py    将审核后的长休市日历推送到服务
+scripts/sync_qualification.py
+                          上传已平仓损益、开仓日和完整性水位
+scripts/backup_state.py   SQLite 在线一致性备份
+scripts/restore_state.py  停机校验恢复
 requirements-dev.txt      Ruff 和 mypy 开发检查版本
 tests/test_risk_engine.py 关键规则测试
 tests/test_risk_api.py    HTTP API 集成测试
@@ -59,7 +72,17 @@ export RISK_AUDIT_PATH='/var/log/ftmo-risk/audit.jsonl'
 python3 -m src.risk_api --config config/ftmo-v2.json
 ```
 
-没有 `RISK_API_TOKEN` 时服务不会启动。生产环境的 `/v1/evaluate` 必须使用 `account_id`；无状态评估仅用于显式开启的测试/回放实例。
+`RISK_API_TOKEN` 是管理员令牌，只用于日历、监控、资格汇总和凭证管理。生产平台不保存管理员令牌；每个账户先签发独立凭证：
+
+```bash
+curl -sS \
+  -H "X-Risk-Token: $RISK_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}' \
+  http://127.0.0.1:8765/v1/admin/accounts/mt5-10001/credentials
+```
+
+响应中的 `secret` 只显示一次，填入 MT5/cTrader 的 `AccountCredential`。生产 `/v1/evaluate` 必须使用 `account_id` 和 `X-Account-Credential`；管理员令牌不能代替账户凭证提交交易评估。
 
 新闻事件必须先经过人工审核和品种映射，再同步：
 
@@ -74,6 +97,36 @@ Standard FTMO Account 还需要同步周末和超过 2 小时的休市时段：
 python3 scripts/sync_market.py \
   --file config/market-closures.example.json
 ```
+
+浏览器资格看板：
+
+```text
+http://127.0.0.1:8765/dashboard/qualification
+```
+
+看板使用当前页面内存中的管理员令牌读取 `/v1/qualification/accounts`，不会把令牌写入 URL 或浏览器存储。资格历史必须按 `phase + cycle_id` 同步已平仓净损益、开仓日事件和完整性水位；缺少完整性确认时只显示“需复核”。
+
+批量同步审核后的资格历史：
+
+```bash
+export RISK_ACCOUNT_CREDENTIAL='one-account-secret'
+python3 scripts/sync_qualification.py \
+  --file config/qualification-history.example.json
+```
+
+在线备份和停机恢复：
+
+```bash
+python3 scripts/backup_state.py \
+  --state runtime/risk-state.db \
+  --output backups/risk-state-2026-08-23.db
+
+python3 scripts/restore_state.py \
+  --source backups/risk-state-2026-08-23.db \
+  --state runtime/risk-state.db
+```
+
+`GET /metrics` 提供 Prometheus 文本指标；示例抓取配置和告警规则位于 `monitoring/`。
 
 ## 使用边界
 
@@ -97,14 +150,16 @@ python3 scripts/sync_market.py \
 - 长休市日历必须来自实际 FTMO/经纪商品种交易时间，示例文件不能直接用于实盘。
 - 所有时间统一使用带时区的 ISO 8601 时间。
 - 规则变更必须增加 `rule_version`，不得静默覆盖历史审计记录。
+- Minimum Trading Days 使用 Prague/CE(S)T 开仓日：当天至少开过一个仓位计 1 天，持仓跨日不重复计数。
+- `ALLOW` 只表示当前交易请求通过风控，不表示账户已经满足 Profit Target、Minimum Trading Days 或 Best Day Rule。
 
 完整上线步骤见 [部署检查](docs/deployment.md)，实际验证结果见 [验证报告](docs/verification.md)。
 
 ## 开源边界
 
 - 仓库只包含源码、示例配置和测试；运行时 SQLite、审计日志、环境文件和 MT5 编译产物不会提交。
-- 不要提交 `RISK_API_TOKEN`、真实账户标识、真实交易记录、经纪商凭据或任何个人数据。
+- 不要提交 `RISK_API_TOKEN`、账户凭证明文、证书私钥、真实账户标识、真实交易记录、经纪商凭据或任何个人数据。
 - 适配器无法替代账户级交易权限或服务器网关；必须确保所有新增风险路径都经过风控。
-- 1-Step Best Day Rule、2-Step 最低交易日和各阶段利润目标属于进度/资格监控，不在当前交易前闸门覆盖范围内。
+- 资格目标由独立看板监控，不会自动改变单笔交易闸门；历史不完整时禁止把看板结果解释为正式通过资格。
 
 安全问题请先阅读 [安全政策](SECURITY.md)，开发流程见 [贡献指南](CONTRIBUTING.md)。

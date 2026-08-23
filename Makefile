@@ -8,6 +8,7 @@ check:
 	python3 -m json.tool config/ftmo-v2.json >/dev/null
 	python3 -m json.tool config/news-events.example.json >/dev/null
 	python3 -m json.tool config/market-closures.example.json >/dev/null
+	python3 -m json.tool config/qualification-history.example.json >/dev/null
 	git diff --check
 
 lint:

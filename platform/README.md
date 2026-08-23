@@ -13,7 +13,7 @@
 文件：[RiskGuardEA.mq5](mt5/RiskGuardEA.mq5)
 
 1. 在 MT5 的 WebRequest 白名单加入风险 API 的完整地址，例如 `http://127.0.0.1:8765`。
-2. 在 EA 参数中填写账户类型、阶段、账户风格、初始资金、当日开始余额和最高结算余额。
+2. 在 EA 参数中填写账户类型、阶段、账户风格、初始资金、结算基线和当前 MT5 账户对应的 `AccountCredential`，不要使用管理员令牌。
 3. 策略调用 `RiskGuardBuy()`、`RiskGuardSell()`、`RiskGuardClose()`、`RiskGuardClosePartial()`、`RiskGuardModifyPosition()` 和 `RiskGuardCancelPending()`，不能直接调用 `CTrade`。
 4. 实盘前在模拟账户测试点值、合约大小、佣金、滑点和交易量步进。
 
@@ -24,7 +24,7 @@
 文件：[RiskGuardBot.cs](ctrader/RiskGuardBot.cs)
 
 1. 将代码复制到 cTrader Automate 的 cBot 项目。
-2. 填写 API 地址和 `RISK_API_TOKEN`。
+2. 填写 API 地址和当前 cTrader 账户对应的 `AccountCredential`，不要使用管理员令牌。
 3. 策略调用 `TryExecuteBuy()`、`TryExecuteSell()`、`TryClose()`、`TryClosePartial()`、`TryModifyPosition()` 和 `TryCancelPendingOrder()`，不能直接调用平台下单函数。
 4. 用当前 cTrader 版本编译后，先做回测，再做小额模拟账户回放。
 
@@ -40,4 +40,5 @@
 - 平台明确拒单回传 `failure`；MT5 的 `TRADE_RETCODE_PLACED`、超时和连接异常不视为最终成功，cTrader 的 `Timeout`、`Disconnected` 和 `TechnicalError` 也保持 `unknown`；
 - 订单结果未知会在适配器本地持久化新增风险锁，必须人工核对账户后再清除；
 - 新闻和休市状态独立处理；一个状态查询失败不能抹掉另一个已确认的平仓或撤单信号；
+- 资格同步器必须分别回传已平仓净损益、开仓日事件和历史完整性水位，不能用平仓日期推算 Minimum Trading Days；
 - 手动订单、其他 EA/cBot 订单要通过账户权限或服务器网关隔离。

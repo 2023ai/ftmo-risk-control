@@ -7,7 +7,7 @@
 CTrade Trade;
 
 input string RiskApiBaseUrl = "http://127.0.0.1:8765";
-input string RiskApiToken = "";
+input string AccountCredential = "";
 input string AccountId = "mt5-account-001";
 input string AccountType = "two_step";
 input string AccountPhase = "evaluation";
@@ -95,7 +95,7 @@ bool PostJson(
    string result_headers;
    string headers =
       "Content-Type: application/json\r\n"
-      "X-Risk-Token: " + RiskApiToken + "\r\n"
+      "X-Account-Credential: " + AccountCredential + "\r\n"
       "X-Request-Id: " + request_id + "\r\n";
 
    int copied = StringToCharArray(
@@ -893,9 +893,9 @@ int OnInit()
       Print("RiskGuard: AccountId is required");
       return INIT_PARAMETERS_INCORRECT;
    }
-   if(StringLen(RiskApiToken) == 0)
+   if(StringLen(AccountCredential) == 0)
    {
-      Print("RiskGuard: RiskApiToken is required");
+      Print("RiskGuard: AccountCredential is required");
       return INIT_PARAMETERS_INCORRECT;
    }
    LoadUnknownExecutionLock();

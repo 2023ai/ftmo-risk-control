@@ -108,7 +108,7 @@ class RiskAPITests(unittest.TestCase):
         status, body = self.request("GET", "/health")
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
-        self.assertEqual(body["rule_version"], "ftmo-v2-2026-08-23")
+        self.assertEqual(body["rule_version"], "ftmo-v3-2026-08-23")
 
     def test_evaluate_allows_order_within_budget(self):
         payload = {
@@ -427,6 +427,17 @@ class SecurityContractTests(unittest.TestCase):
         )
         server.server_close()
 
+    def test_mtls_requires_server_certificate_and_key(self):
+        with self.assertRaises(ValueError):
+            make_server(
+                "127.0.0.1",
+                0,
+                "config/ftmo-v2.json",
+                auth_token="test-token",
+                tls_ca_path="test-ca.pem",
+                require_client_cert=True,
+            )
+
     def test_stateless_position_size_is_disabled_by_default(self):
         server = make_server(
             "127.0.0.1",
@@ -483,7 +494,7 @@ class SecurityContractTests(unittest.TestCase):
                     json.dump(config, target)
                 self.assertEqual(
                     server.config["rule_version"],
-                    "ftmo-v2-2026-08-23",
+                    "ftmo-v3-2026-08-23",
                 )
             finally:
                 server.server_close()
@@ -516,6 +527,7 @@ class StatefulRiskAPITests(unittest.TestCase):
             "config/ftmo-v2.json",
             auth_token="test-token",
             state_path=f"{cls.tempdir.name}/risk.db",
+            require_account_credentials=False,
         )
         cls.thread = threading.Thread(
             target=cls.server.serve_forever,
@@ -1157,6 +1169,347 @@ class StatefulRiskAPITests(unittest.TestCase):
             "internal news buffer",
             body["decision"]["reasons"][0],
         )
+
+
+class CredentialQualificationAPITests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.state_path = f"{self.tempdir.name}/risk.db"
+        self.server = make_server(
+            "127.0.0.1",
+            0,
+            "config/ftmo-v2.json",
+            auth_token="admin-token",
+            state_path=self.state_path,
+        )
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            daemon=True,
+        )
+        self.thread.start()
+        host, port = self.server.server_address
+        self.base_url = f"http://{host}:{port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.tempdir.cleanup()
+
+    def request(
+        self,
+        method,
+        path,
+        payload=None,
+        *,
+        admin=False,
+        credential=None,
+        bearer=False,
+    ):
+        headers = {}
+        data = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(payload).encode("utf-8")
+        if admin:
+            if bearer:
+                headers["Authorization"] = "Bearer admin-token"
+            else:
+                headers["X-Risk-Token"] = "admin-token"
+        if credential is not None:
+            headers["X-Account-Credential"] = credential
+        request = Request(
+            self.base_url + path,
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        with urlopen(request, timeout=2) as response:
+            content_type = response.headers.get("Content-Type", "")
+            content = response.read()
+            if content_type.startswith("application/json"):
+                return response.status, json.loads(content)
+            return response.status, content.decode("utf-8")
+
+    def bootstrap_account(
+        self,
+        account_id="credential-account",
+        *,
+        account_type="two_step",
+        phase="evaluation",
+    ):
+        _, created = self.request(
+            "POST",
+            f"/v1/admin/accounts/{account_id}/credentials",
+            {},
+            admin=True,
+        )
+        credential = created["secret"]
+        now = datetime.now(UTC).isoformat()
+        self.request(
+            "POST",
+            "/v1/account-sync",
+            {
+                "account_id": account_id,
+                "account_type": account_type,
+                "phase": phase,
+                "style": "standard",
+                "initial_capital": "100000",
+                "day_start_balance": "100000",
+                "highest_settled_balance": "100000",
+                "balance": "100000",
+                "equity": "100000",
+                "current_open_risk": "0",
+                "as_of": now,
+            },
+            credential=credential,
+        )
+        for path, values in (
+            ("/v1/news-sync", {"events": []}),
+            ("/v1/market-sync", {"closures": []}),
+        ):
+            self.request(
+                "POST",
+                path,
+                {"fetched_at": datetime.now(UTC).isoformat(), **values},
+                admin=True,
+            )
+        return credential, created["credential"]["credential_id"]
+
+    def test_account_credential_is_bound_to_account_and_scope(self):
+        credential, _ = self.bootstrap_account("bound-account")
+        status, body = self.request(
+            "POST",
+            "/v1/evaluate",
+            {
+                "account_id": "bound-account",
+                "request": _open_request(datetime.now(UTC).isoformat()),
+            },
+            credential=credential,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["decision"]["code"], "ALLOW")
+
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/evaluate",
+                {
+                    "account_id": "different-account",
+                    "request": _open_request(datetime.now(UTC).isoformat()),
+                },
+                credential=credential,
+            )
+        self.assertEqual(context.exception.code, 401)
+        context.exception.close()
+
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/evaluate",
+                {
+                    "account_id": "bound-account",
+                    "request": _open_request(datetime.now(UTC).isoformat()),
+                },
+                admin=True,
+            )
+        self.assertEqual(context.exception.code, 403)
+        context.exception.close()
+
+    def test_account_credential_can_rotate_without_secret_disclosure_later(self):
+        old_secret, credential_id = self.bootstrap_account("rotate-api")
+        _, rotated = self.request(
+            "POST",
+            f"/v1/admin/credentials/{credential_id}/rotate",
+            {"overlap_seconds": 0},
+            admin=True,
+        )
+        new_secret = rotated["secret"]
+        self.assertNotEqual(old_secret, new_secret)
+
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/news-status",
+                {
+                    "account_id": "rotate-api",
+                    "symbol": "EURUSD",
+                    "now": datetime.now(UTC).isoformat(),
+                },
+                credential=old_secret,
+            )
+        self.assertEqual(context.exception.code, 401)
+        context.exception.close()
+
+        status, body = self.request(
+            "POST",
+            "/v1/news-status",
+            {
+                "account_id": "rotate-api",
+                "symbol": "EURUSD",
+                "now": datetime.now(UTC).isoformat(),
+            },
+            credential=new_secret,
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(body["news_data_stale"])
+
+        _, listed = self.request(
+            "GET",
+            "/v1/admin/credentials?account_id=rotate-api",
+            admin=True,
+        )
+        self.assertNotIn("secret", listed["credentials"][0])
+
+    def test_qualification_dashboard_uses_closed_trade_history(self):
+        credential, _ = self.bootstrap_account("qualification-api")
+        for index in range(4):
+            closed_at = datetime(
+                2026,
+                8,
+                19 + index,
+                12,
+                0,
+                tzinfo=UTC,
+            )
+            self.request(
+                "POST",
+                "/v1/closed-trade-sync",
+                {
+                    "account_id": "qualification-api",
+                    "trade_id": f"closed-{index}",
+                    "phase": "evaluation",
+                    "cycle_id": "challenge-1",
+                    "closed_at": closed_at.isoformat(),
+                    "net_profit": "2500",
+                    "symbol": "EURUSD",
+                    "source": "test-history",
+                },
+                credential=credential,
+            )
+            self.request(
+                "POST",
+                "/v1/trading-day-sync",
+                {
+                    "account_id": "qualification-api",
+                    "phase": "evaluation",
+                    "cycle_id": "challenge-1",
+                    "opened_at": closed_at.isoformat(),
+                    "source": "test-history",
+                },
+                credential=credential,
+            )
+        self.request(
+            "POST",
+            "/v1/qualification-history-sync",
+            {
+                "account_id": "qualification-api",
+                "phase": "evaluation",
+                "cycle_id": "challenge-1",
+                "history_start_at": "2026-08-01T00:00:00+00:00",
+                "complete_through": datetime.now(UTC).isoformat(),
+                "source": "test-history",
+            },
+            credential=credential,
+        )
+        status, body = self.request(
+            "GET",
+            "/v1/qualification?account_id=qualification-api",
+            credential=credential,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["profit_target"]["met"])
+        self.assertTrue(body["minimum_trading_days"]["met"])
+        self.assertTrue(body["eligible"])
+
+        _, dashboard = self.request(
+            "GET",
+            "/v1/qualification/accounts",
+            admin=True,
+        )
+        self.assertEqual(dashboard["accounts"][0]["account_id"], "qualification-api")
+
+    def test_calendar_persistence_and_prometheus_metrics(self):
+        credential, _ = self.bootstrap_account("calendar-restore")
+        event_time = datetime.now(UTC) + timedelta(minutes=30)
+        self.request(
+            "POST",
+            "/v1/news-sync",
+            {
+                "fetched_at": datetime.now(UTC).isoformat(),
+                "events": [
+                    {
+                        "event_id": "PERSISTED",
+                        "release_time": event_time.isoformat(),
+                        "affected_symbols": ["EURUSD"],
+                    }
+                ],
+            },
+            admin=True,
+        )
+        self.request(
+            "POST",
+            "/v1/evaluate",
+            {
+                "account_id": "calendar-restore",
+                "request": _open_request(datetime.now(UTC).isoformat()),
+            },
+            credential=credential,
+        )
+        _, metrics = self.request(
+            "GET",
+            "/metrics",
+            admin=True,
+            bearer=True,
+        )
+        self.assertIn("ftmo_risk_database_up 1", metrics)
+        self.assertIn(
+            'ftmo_risk_calendar_present{calendar="news"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'ftmo_risk_decisions_total{code="ALLOW"} 1',
+            metrics,
+        )
+
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = make_server(
+            "127.0.0.1",
+            0,
+            "config/ftmo-v2.json",
+            auth_token="admin-token",
+            state_path=self.state_path,
+        )
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            daemon=True,
+        )
+        self.thread.start()
+        host, port = self.server.server_address
+        self.base_url = f"http://{host}:{port}"
+        self.assertEqual(self.server.news_events[0].event_id, "PERSISTED")
+
+    def test_qualification_dashboard_html_is_available_without_data(self):
+        status, body = self.request(
+            "GET",
+            "/dashboard/qualification",
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("FTMO 资格看板", body)
+        self.assertIn("/v1/qualification/accounts", body)
+
+    def test_metrics_reports_database_down_without_failing_scrape(self):
+        os.unlink(self.state_path)
+        status, body = self.request(
+            "GET",
+            "/metrics",
+            admin=True,
+            bearer=True,
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("ftmo_risk_database_up 0", body)
 
 
 if __name__ == "__main__":
