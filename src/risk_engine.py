@@ -68,6 +68,8 @@ class RuleProfile:
     news_hard_after_minutes: int = 2
     news_internal_before_minutes: int = 10
     news_internal_after_minutes: int = 10
+    news_force_flat_before_minutes: int = 10
+    news_cancel_pending_before_minutes: int = 10
     max_opens_5m: int = 3
     max_opens_1h: int = 10
     max_opens_day: int = 30
@@ -132,6 +134,12 @@ class RuleProfile:
                 news["internal_before_minutes"]
             ),
             news_internal_after_minutes=int(news["internal_after_minutes"]),
+            news_force_flat_before_minutes=int(
+                news["force_flat_before_ftmo_window_minutes"]
+            ),
+            news_cancel_pending_before_minutes=int(
+                news["cancel_pending_before_ftmo_window_minutes"]
+            ),
             max_opens_5m=int(frequency["max_opens_5m"]),
             max_opens_1h=int(frequency["max_opens_1h"]),
             max_opens_day=int(frequency["max_opens_day"]),
@@ -199,6 +207,8 @@ class AccountSnapshot:
     current_open_risk: Decimal = ZERO
     data_age_seconds: int = 0
     data_uncertain: bool = False
+    day_locked: bool = False
+    breach_latched: bool = False
 
 
 @dataclass(frozen=True)
@@ -365,10 +375,14 @@ class RiskEngine:
         return snapshot.highest_settled_balance
 
     def status(self, snapshot: AccountSnapshot) -> str:
+        if snapshot.breach_latched:
+            return "BREACH"
         if snapshot.equity <= self.daily_loss_limit(snapshot):
             return "BREACH"
         if snapshot.equity <= self.max_loss_limit(snapshot):
             return "BREACH"
+        if snapshot.day_locked:
+            return "LOCKED"
         utilization = max(
             self.daily_utilization(snapshot),
             self.max_loss_utilization(snapshot),
@@ -382,20 +396,21 @@ class RiskEngine:
         return "GREEN"
 
     def risk_budget(self, snapshot: AccountSnapshot) -> RiskBudget:
-        daily_allowance = (
-            snapshot.initial_capital * self.profile.official_daily_loss_pct
-        )
-        max_loss_allowance = (
-            snapshot.initial_capital * self.profile.official_max_loss_pct
-        )
         daily_internal_allowance = (
             snapshot.initial_capital * self.profile.internal_daily_stop_pct
         )
         daily_consumed = self.daily_loss(snapshot)
-        daily_buffer = max(ZERO, daily_internal_allowance - daily_consumed)
+        daily_buffer = max(
+            ZERO,
+            daily_internal_allowance
+            - daily_consumed
+            - snapshot.current_open_risk,
+        )
         max_buffer = max(
             ZERO,
-            snapshot.equity - self.internal_max_loss_stop_limit(snapshot),
+            snapshot.equity
+            - self.internal_max_loss_stop_limit(snapshot)
+            - snapshot.current_open_risk,
         )
         open_buffer = max(
             ZERO,
@@ -490,6 +505,10 @@ class RiskEngine:
             )
 
         official_reasons = []
+        if snapshot.breach_latched:
+            official_reasons.append(
+                "an official loss breach was previously observed"
+            )
         if snapshot.equity <= self.daily_loss_limit(snapshot):
             official_reasons.append("equity is below the official daily loss limit")
         if snapshot.equity <= self.max_loss_limit(snapshot):
@@ -539,6 +558,19 @@ class RiskEngine:
         frequency_reason = self._check_frequency(request, frequency)
         if frequency_reason is not None:
             return frequency_reason
+        projected_requests_today = (
+            frequency.requests_on_day(
+                request.requested_at,
+                self.day_timezone,
+            )
+            + 1
+        )
+        warnings = (
+            ("daily server-request warning threshold reached",)
+            if projected_requests_today
+            >= self.profile.warning_requests_day
+            else ()
+        )
 
         budget = self.risk_budget(snapshot)
         if request.is_open:
@@ -593,7 +625,11 @@ class RiskEngine:
                     budget,
                 )
 
-        return Decision(DecisionCode.ALLOW, risk_budget=budget)
+        return Decision(
+            DecisionCode.ALLOW,
+            reasons=warnings,
+            risk_budget=budget,
+        )
 
     def _check_frequency(
         self,
@@ -851,16 +887,20 @@ def validate_config(config: Mapping[str, Any]) -> None:
             "utilization thresholds must satisfy 0 < warning < reduce < lock < 1"
         )
 
-    for field in (
+    for setting_name in (
         "single_trade_risk_pct",
         "max_open_risk_pct",
         "daily_buffer_fraction_per_trade",
         "max_loss_buffer_fraction_per_trade",
     ):
-        value = _config_decimal(internal.get(field), f"internal_controls.{field}")
+        value = _config_decimal(
+            internal.get(setting_name),
+            f"internal_controls.{setting_name}",
+        )
         if not ZERO < value <= Decimal("1"):
             raise ValueError(
-                f"internal_controls.{field} must be greater than 0 and at most 1"
+                f"internal_controls.{setting_name} must be greater than 0 "
+                "and at most 1"
             )
 
     news = config.get("news_controls")
@@ -882,18 +922,61 @@ def validate_config(config: Mapping[str, Any]) -> None:
         news.get("internal_after_minutes"),
         "news_controls.internal_after_minutes",
     )
+    _validate_nonnegative_int(
+        news.get("force_flat_before_ftmo_window_minutes"),
+        "news_controls.force_flat_before_ftmo_window_minutes",
+    )
+    _validate_nonnegative_int(
+        news.get("cancel_pending_before_ftmo_window_minutes"),
+        "news_controls.cancel_pending_before_ftmo_window_minutes",
+    )
+    hard_before = int(news["ftmo_hard_before_minutes"])
+    hard_after = int(news["ftmo_hard_after_minutes"])
+    internal_before = int(news["internal_before_minutes"])
+    internal_after = int(news["internal_after_minutes"])
+    force_flat_before = int(
+        news["force_flat_before_ftmo_window_minutes"]
+    )
+    cancel_pending_before = int(
+        news["cancel_pending_before_ftmo_window_minutes"]
+    )
+    if hard_before > internal_before or hard_after > internal_after:
+        raise ValueError(
+            "FTMO hard news windows cannot exceed the internal news windows"
+        )
+    if not hard_before <= force_flat_before <= internal_before:
+        raise ValueError(
+            "force_flat_before_ftmo_window_minutes must be between the "
+            "hard-before and internal-before windows"
+        )
+    if not hard_before <= cancel_pending_before <= internal_before:
+        raise ValueError(
+            "cancel_pending_before_ftmo_window_minutes must be between the "
+            "hard-before and internal-before windows"
+        )
+    if news.get("restricted_account_phase") != AccountPhase.FTMO_ACCOUNT.value:
+        raise ValueError(
+            "news_controls.restricted_account_phase must be ftmo_account"
+        )
+    if news.get("restricted_account_style") != AccountStyle.STANDARD.value:
+        raise ValueError(
+            "news_controls.restricted_account_style must be standard"
+        )
 
     frequency = config.get("frequency_controls")
     if not isinstance(frequency, Mapping):
         raise ValueError("frequency_controls must be an object")
-    for field in (
+    for setting_name in (
         "max_opens_5m",
         "max_opens_1h",
         "max_opens_day",
         "warning_requests_day",
         "stop_requests_day",
     ):
-        _validate_positive_int(frequency.get(field), f"frequency_controls.{field}")
+        _validate_positive_int(
+            frequency.get(setting_name),
+            f"frequency_controls.{setting_name}",
+        )
     if not (
         int(frequency["max_opens_5m"])
         <= int(frequency["max_opens_1h"])
@@ -917,15 +1000,15 @@ def validate_config(config: Mapping[str, Any]) -> None:
     market_close = config.get("market_close_controls", {})
     if not isinstance(market_close, Mapping):
         raise ValueError("market_close_controls must be an object")
-    for field in (
+    for setting_name in (
         "force_flat_before_minutes",
         "gap_open_block_before_minutes",
         "restricted_break_min_minutes",
         "max_schedule_age_seconds",
     ):
         _validate_nonnegative_int(
-            market_close.get(field),
-            f"market_close_controls.{field}",
+            market_close.get(setting_name),
+            f"market_close_controls.{setting_name}",
         )
     if int(market_close["force_flat_before_minutes"]) > int(
         market_close["gap_open_block_before_minutes"]

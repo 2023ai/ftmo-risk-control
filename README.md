@@ -4,7 +4,7 @@
 
 本项目是风控参考实现和平台接入模板，不构成 FTMO 官方软件、法律意见或实盘收益保证。上线前必须使用公司批准的数据源、目标账户规格和模拟账户回放验证。
 
-当前版本聚焦四类核心控制：
+当前版本聚焦六类核心控制：
 
 1. 以损定仓：先确定止损和允许亏损，再计算交易量。
 2. 新闻时段：区分 FTMO 账户阶段、Standard/Swing 账户和受影响品种。
@@ -12,6 +12,8 @@
 4. 日亏与最大亏损：按账户规则计算官方底线，并使用更保守的内部停止线。
 5. 周末与长休市：全阶段提前 2 小时禁止开仓，Standard FTMO Account 提前平仓撤单。
 6. 持久化审计：SQLite 保存日界线、结算确认、频率、风控决定幂等记录与平台执行结果。
+
+内部日亏锁一旦触发会保持到下一 FTMO 日；观察到官方亏损底线后会持久锁定，权益反弹或重启服务都不会自动恢复新增风险。
 
 ## 目录
 
@@ -35,6 +37,7 @@ src/state_store.py        SQLite 账户、日界线和频率状态
 platform/                 MT5 EA 和 cTrader cBot 接入模板
 scripts/sync_news.py      将人工审核后的新闻映射推送到服务
 scripts/sync_market.py    将审核后的长休市日历推送到服务
+requirements-dev.txt      Ruff 和 mypy 开发检查版本
 tests/test_risk_engine.py 关键规则测试
 tests/test_risk_api.py    HTTP API 集成测试
 tests/test_state_store.py SQLite 重启恢复测试
@@ -43,7 +46,9 @@ tests/test_state_store.py SQLite 重启恢复测试
 ## 运行测试
 
 ```bash
+python3 -m pip install -r requirements-dev.txt
 python3 -W error::ResourceWarning -m unittest discover -s tests -v
+make lint
 ```
 
 ## 启动本地风控服务
@@ -86,6 +91,8 @@ python3 scripts/sync_market.py \
 
 - 每个账户必须单独配置：账户类型、阶段、Standard/Swing、初始资金和日界线。
 - 日亏计算使用 FTMO 的 CE(S)T 日界线；系统实现使用 `Europe/Prague` 时区。
+- 日界线由风控服务器接收时间决定；平台时间仅用于 ±30 秒时钟健康检查。
+- 已有持仓按当前可平仓报价到止损计算剩余权益风险，挂单按目标入场价到止损计算。
 - 新闻数据必须保存来源、发布时间、影响品种和规则版本。
 - 长休市日历必须来自实际 FTMO/经纪商品种交易时间，示例文件不能直接用于实盘。
 - 所有时间统一使用带时区的 ISO 8601 时间。
@@ -98,5 +105,6 @@ python3 scripts/sync_market.py \
 - 仓库只包含源码、示例配置和测试；运行时 SQLite、审计日志、环境文件和 MT5 编译产物不会提交。
 - 不要提交 `RISK_API_TOKEN`、真实账户标识、真实交易记录、经纪商凭据或任何个人数据。
 - 适配器无法替代账户级交易权限或服务器网关；必须确保所有新增风险路径都经过风控。
+- 1-Step Best Day Rule、2-Step 最低交易日和各阶段利润目标属于进度/资格监控，不在当前交易前闸门覆盖范围内。
 
 安全问题请先阅读 [安全政策](SECURITY.md)，开发流程见 [贡献指南](CONTRIBUTING.md)。

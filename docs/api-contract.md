@@ -20,7 +20,7 @@ X-Risk-Token: <same-token>
 {
   "ok": true,
   "service": "ftmo-risk-api",
-  "rule_version": "ftmo-v2-2026-08-22",
+  "rule_version": "ftmo-v2-2026-08-23",
   "news_data_age_seconds": 0,
   "market_data_age_seconds": 0,
   "persistent_state": true
@@ -46,7 +46,7 @@ X-Risk-Token: <same-token>
 }
 ```
 
-同步成功后，`/v1/evaluate` 可以省略 `news_events`，服务会使用最近一次缓存。生产评估只使用服务端缓存，客户端不能覆盖事件列表或新鲜度。
+同步成功后，`/v1/evaluate` 可以省略 `news_events`，服务会使用最近一次缓存。生产评估只使用服务端缓存，客户端不能覆盖事件列表或新鲜度。事件 ID 必须唯一；相同 `fetched_at` 只能重放相同内容，不能用冲突内容覆盖缓存。
 
 ## `POST /v1/market-sync`
 
@@ -67,7 +67,7 @@ X-Risk-Token: <same-token>
 }
 ```
 
-同步脚本会在上传时把 `fetched_at` 替换成当前 UTC 时间。未来超过 30 秒的时间戳会被拒绝。
+同步脚本会在上传时把 `fetched_at` 替换成当前 UTC 时间。未来超过 30 秒的时间戳会被拒绝。休市 ID 必须唯一；相同 `fetched_at` 的冲突内容也会被拒绝。
 
 ## `POST /v1/market-status`
 
@@ -80,6 +80,8 @@ X-Risk-Token: <same-token>
   "now": "2026-08-28T21:50:00+00:00"
 }
 ```
+
+`now` 必须与风控服务器 UTC 时间相差不超过 30 秒；超出范围会返回 `400`。实际休市窗口使用风控服务器接收时间判定，客户端时间不能移动规则窗口。
 
 所有阶段在长休市前 120 分钟得到 `open_blocked=true`。Standard FTMO Account 在前 10 分钟额外得到 `force_flat=true` 和 `cancel_pending=true`。
 
@@ -111,6 +113,8 @@ X-Risk-Token: <same-token>
 }
 ```
 
+`now` 必须与风控服务器 UTC 时间相差不超过 30 秒。实际新闻窗口使用风控服务器接收时间判定；平台机器仍应启用可靠的系统时钟同步。
+
 - `T-10` 到 `T-2`：`force_flat=true`、`cancel_pending=true`。
 - `T-2` 到 `T+2`：`hard_window=true`，守护程序不得再主动发送开仓、平仓或修改指令；若仍有持仓则触发紧急告警。
 - 新闻数据缺失或超过 60 秒：`open_blocked=true` 和 `emergency_alert=true`。
@@ -137,6 +141,10 @@ X-Risk-Token: <same-token>
 
 使用 `account_id` 的 `/v1/evaluate` 请求不再上传账户规则、快照或频率；服务读取已同步账户和 SQLite 频率状态。
 
+`as_of` 必须与服务器时间相差不超过 30 秒，用于检查平台时钟和计算快照年龄。Prague 日界线切换以 API 服务器接收请求的时间为准；客户端不能用偏移时间提前或延后重置日亏基线。`current_open_risk` 对已有持仓按当前可平仓报价到止损的剩余权益风险计算，对挂单按目标入场价到止损计算。
+
+响应快照中的 `day_locked` 由服务维护，触发后持续到下一 FTMO 日；`breach_latched` 在观察到官方亏损底线后持续保留，不接受客户端覆盖。平台同步请求不应发送这两个字段。
+
 ## `POST /v1/settlement-sync`
 
 日界线同步器在已核对 FTMO 日结算余额后调用：
@@ -152,6 +160,8 @@ X-Risk-Token: <same-token>
 ```
 
 如果账户跨过 Prague 日界线时没有已确认的结算记录，服务会使用最后一次余额作为临时估计，同时将账户标记为 `data_uncertain=true`，禁止新增风险；平仓、减仓和取消挂单仍可执行。补交确认后才恢复新增风险。
+
+同一账户和 FTMO 日的已确认结算记录不能被更旧时间戳覆盖；相同时间戳但余额或来源不同也会被拒绝。正式确认记录可以覆盖系统在缺失结算时生成的未确认推断记录。
 
 ## `POST /v1/evaluate`
 
@@ -212,7 +222,7 @@ X-Risk-Token: <same-token>
 ```json
 {
   "ok": true,
-  "rule_version": "ftmo-v2-2026-08-22",
+  "rule_version": "ftmo-v2-2026-08-23",
   "decision": {
     "code": "REJECT_NEWS",
     "allowed": false,
@@ -232,13 +242,15 @@ X-Risk-Token: <same-token>
 }
 ```
 
-平台端只有在 `decision.allowed == true` 时才提交新增风险。`REJECT_*` 必须记录 `code` 和 `reasons`。
+平台端只有在 `decision.allowed == true` 时才提交新增风险。`REJECT_*` 必须记录 `code` 和 `reasons`。带 `account_id` 的生产评估使用风控服务器接收时间执行新闻、休市和频率判断；客户端 `requested_at` 只用于时钟健康检查和请求身份。
+
+当日服务器请求达到 `warning_requests_day` 时，允许的决定会在 `reasons` 中返回预警；达到 `stop_requests_day` 后返回 `REJECT_FREQUENCY`。计算新交易预算时，现有持仓和挂单的 `current_open_risk` 会同时从日亏缓冲、最大亏损缓冲和总开放风险上限中扣除。
 
 每个 POST 响应包含 `request_id`。平台端应把这个 ID 写入本地日志，并在发生平台订单结果未知、超时或人工复核时使用它关联风控决定。带 `account_id` 的评估必须使用持久化状态；无状态 `/v1/evaluate` 默认关闭，仅可由测试/回放服务器显式开启。
 
 ## `POST /v1/execution-result`
 
-平台执行后回传结果。明确失败的开仓会释放评估时保留的频率名额；超时或结果未知时使用 `outcome: "unknown"`，保留名额并人工复核。相同的评估或执行 `request_id` 重试会返回第一次保存的结果；同一 ID 复用不同内容会被拒绝。
+平台执行后回传结果。明确失败的开仓会释放开仓频率名额，明确失败的修改会释放修改冷却预留；超时、仅确认已受理或结果未知时使用 `outcome: "unknown"`，保留预留并人工复核。相同的评估或执行 `request_id` 重试会返回第一次保存的结果；同一 ID 复用不同内容会被拒绝。
 
 ```json
 {
@@ -255,8 +267,12 @@ X-Risk-Token: <same-token>
 
 旧客户端仍可发送 `success: true/false`；新客户端应使用 `outcome: "success" | "failure" | "unknown"`。
 
+`occurred_at` 可以保留平台实际执行时间，便于断线后补报，但不能比服务器时间提前超过 30 秒。执行活动和保留释放使用服务器接收时间写入，客户端时间不能移动频率保留或清理窗口。
+
 
 ## `POST /v1/position-size`
+
+该接口使用客户端提供的无状态快照，生产服务默认禁用，只用于显式开启的测试或回放实例。生产交易量必须由持久化账户状态下的 `/v1/evaluate` 最终确认，不能把本接口响应直接当作下单许可。
 
 请求字段：
 
@@ -287,7 +303,7 @@ X-Risk-Token: <same-token>
 ```json
 {
   "ok": true,
-  "rule_version": "ftmo-v2-2026-08-22",
+  "rule_version": "ftmo-v2-2026-08-23",
   "position_size": {
     "volume": "2.50",
     "expected_loss": "250.00",

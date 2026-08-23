@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -56,6 +58,7 @@ class RiskAPITests(unittest.TestCase):
             "config/ftmo-v2.json",
             auth_token="test-token",
             allow_stateless_evaluate=True,
+            allow_stateless_position_size=True,
         )
         cls.thread = threading.Thread(
             target=cls.server.serve_forever,
@@ -105,7 +108,7 @@ class RiskAPITests(unittest.TestCase):
         status, body = self.request("GET", "/health")
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
-        self.assertEqual(body["rule_version"], "ftmo-v2-2026-08-22")
+        self.assertEqual(body["rule_version"], "ftmo-v2-2026-08-23")
 
     def test_evaluate_allows_order_within_budget(self):
         payload = {
@@ -356,6 +359,44 @@ class RiskAPITests(unittest.TestCase):
             )
         self.assertEqual(context.exception.code, 400)
 
+    def test_equal_calendar_timestamp_cannot_change_content(self):
+        with self.server.news_lock:
+            fetched_at = self.server.news_fetched_at
+        self.assertIsNotNone(fetched_at)
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/news-sync",
+                {
+                    "fetched_at": fetched_at.isoformat(),
+                    "events": [
+                        {
+                            "event_id": "CONFLICT",
+                            "release_time": datetime.now(UTC).isoformat(),
+                            "affected_symbols": ["EURUSD"],
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(context.exception.code, 400)
+
+    def test_duplicate_calendar_ids_are_rejected(self):
+        event = {
+            "event_id": "DUPLICATE",
+            "release_time": datetime.now(UTC).isoformat(),
+            "affected_symbols": ["EURUSD"],
+        }
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/news-sync",
+                {
+                    "fetched_at": datetime.now(UTC).isoformat(),
+                    "events": [event, event],
+                },
+            )
+        self.assertEqual(context.exception.code, 400)
+
 
 class SecurityContractTests(unittest.TestCase):
     def test_remote_bind_without_token_is_rejected(self):
@@ -366,6 +407,103 @@ class SecurityContractTests(unittest.TestCase):
                 "config/ftmo-v2.json",
                 auth_token="",
             )
+
+    def test_remote_bind_requires_explicit_opt_in_even_with_token(self):
+        with self.assertRaises(ValueError):
+            make_server(
+                "0.0.0.0",
+                0,
+                "config/ftmo-v2.json",
+                auth_token="test-token",
+            )
+
+    def test_remote_bind_can_be_explicitly_enabled(self):
+        server = make_server(
+            "0.0.0.0",
+            0,
+            "config/ftmo-v2.json",
+            auth_token="test-token",
+            allow_remote_bind=True,
+        )
+        server.server_close()
+
+    def test_stateless_position_size_is_disabled_by_default(self):
+        server = make_server(
+            "127.0.0.1",
+            0,
+            "config/ftmo-v2.json",
+            auth_token="test-token",
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        host, port = server.server_address
+        payload = {
+            "account_type": "two_step",
+            "phase": "evaluation",
+            "style": "standard",
+            "snapshot": _snapshot(),
+            "loss_per_volume_unit": "100",
+            "volume_step": "0.01",
+            "min_volume": "0.01",
+        }
+        request = Request(
+            f"http://{host}:{port}/v1/position-size",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Risk-Token": "test-token",
+            },
+            method="POST",
+        )
+        try:
+            with self.assertRaises(HTTPError) as context:
+                urlopen(request, timeout=2)
+            self.assertEqual(context.exception.code, 403)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_server_pins_validated_config_at_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "config.json")
+            with open("config/ftmo-v2.json", encoding="utf-8") as source:
+                config = json.load(source)
+            with open(config_path, "w", encoding="utf-8") as target:
+                json.dump(config, target)
+            server = make_server(
+                "127.0.0.1",
+                0,
+                config_path,
+                auth_token="test-token",
+            )
+            try:
+                config["rule_version"] = "changed-without-restart"
+                with open(config_path, "w", encoding="utf-8") as target:
+                    json.dump(config, target)
+                self.assertEqual(
+                    server.config["rule_version"],
+                    "ftmo-v2-2026-08-23",
+                )
+            finally:
+                server.server_close()
+
+    def test_audit_file_permissions_are_owner_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = make_server(
+                "127.0.0.1",
+                0,
+                "config/ftmo-v2.json",
+                auth_token="test-token",
+            )
+            audit_path = os.path.join(directory, "audit.jsonl")
+            server.audit_path = audit_path
+            try:
+                server.write_audit({"ok": True})
+                mode = stat.S_IMODE(os.stat(audit_path).st_mode)
+                self.assertEqual(mode, 0o600)
+            finally:
+                server.server_close()
 
 
 class StatefulRiskAPITests(unittest.TestCase):
@@ -460,6 +598,61 @@ class StatefulRiskAPITests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["decision"]["code"], "ALLOW")
         self.assertEqual(body["request_id"], "stateful-r1")
+
+    def test_observed_daily_lock_persists_after_equity_recovers(self):
+        account_id = "stateful-daily-lock"
+        now = datetime.now(UTC)
+        base_payload = {
+            "account_id": account_id,
+            "account_type": "two_step",
+            "phase": "evaluation",
+            "style": "standard",
+            "initial_capital": "100000",
+            "day_start_balance": "100000",
+            "highest_settled_balance": "100000",
+            "balance": "100000",
+            "current_open_risk": "0",
+        }
+        _, locked = self.request(
+            "/v1/account-sync",
+            {
+                **base_payload,
+                "equity": "95900",
+                "as_of": now.isoformat(),
+            },
+        )
+        self.assertTrue(locked["snapshot"]["day_locked"])
+
+        _, recovered = self.request(
+            "/v1/account-sync",
+            {
+                **base_payload,
+                "equity": "100000",
+                "as_of": datetime.now(UTC).isoformat(),
+            },
+        )
+        self.assertTrue(recovered["snapshot"]["day_locked"])
+        sync_time = datetime.now(UTC).isoformat()
+        self.request(
+            "/v1/news-sync",
+            {"fetched_at": sync_time, "events": []},
+        )
+        self.request(
+            "/v1/market-sync",
+            {"fetched_at": sync_time, "closures": []},
+        )
+        _, decision = self.request(
+            "/v1/evaluate",
+            {
+                "account_id": account_id,
+                "request": _open_request(datetime.now(UTC).isoformat()),
+            },
+            request_id="daily-lock-r1",
+        )
+        self.assertEqual(
+            decision["decision"]["code"],
+            "REJECT_INTERNAL_LOCK",
+        )
 
     def test_failed_execution_releases_frequency_reservation(self):
         account_id = "stateful-release"
@@ -616,6 +809,54 @@ class StatefulRiskAPITests(unittest.TestCase):
             1,
         )
 
+    def test_failed_modify_releases_cooldown_reservation(self):
+        account_id = "stateful-modify-release"
+        self.sync_account(account_id)
+        request_id = "modify-release-r1"
+        now = datetime.now(UTC)
+        _, decision = self.request(
+            "/v1/evaluate",
+            {
+                "account_id": account_id,
+                "request": {
+                    "symbol": "EURUSD",
+                    "action": "modify",
+                    "requested_at": now.isoformat(),
+                    "stop_loss": "1.0800",
+                    "additional_risk": "100",
+                    "is_risk_increasing": True,
+                },
+            },
+            request_id=request_id,
+        )
+        self.assertEqual(decision["decision"]["code"], "ALLOW")
+        self.assertIn(
+            "EURUSD",
+            self.server.state_store.frequency(
+                account_id
+            ).last_modify_by_symbol,
+        )
+
+        _, result = self.request(
+            "/v1/execution-result",
+            {
+                "account_id": account_id,
+                "request_id": request_id,
+                "outcome": "failure",
+                "action": "modify",
+                "symbol": "EURUSD",
+                "occurred_at": datetime.now(UTC).isoformat(),
+                "platform_status": "rejected",
+            },
+        )
+        self.assertTrue(result["reservation_released"])
+        self.assertNotIn(
+            "EURUSD",
+            self.server.state_store.frequency(
+                account_id
+            ).last_modify_by_symbol,
+        )
+
     def test_execution_retry_with_new_timestamp_replays_first_result(self):
         account_id = "stateful-execution-idempotent"
         self.sync_account(account_id)
@@ -653,6 +894,35 @@ class StatefulRiskAPITests(unittest.TestCase):
         )
         self.assertEqual(first, second)
 
+    def test_execution_result_rejects_future_client_clock(self):
+        account_id = "stateful-execution-clock"
+        self.sync_account(account_id)
+        request_id = "execution-clock-r1"
+        self.request(
+            "/v1/evaluate",
+            {
+                "account_id": account_id,
+                "request": _open_request(datetime.now(UTC).isoformat()),
+            },
+            request_id=request_id,
+        )
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "/v1/execution-result",
+                {
+                    "account_id": account_id,
+                    "request_id": request_id,
+                    "outcome": "success",
+                    "action": "open",
+                    "symbol": "EURUSD",
+                    "occurred_at": (
+                        datetime.now(UTC) + timedelta(minutes=2)
+                    ).isoformat(),
+                    "platform_status": "filled",
+                },
+            )
+        self.assertEqual(context.exception.code, 400)
+
     def test_settlement_sync_clears_uncertain_day_state(self):
         account_id = "stateful-settlement"
         now = datetime.now(UTC)
@@ -667,6 +937,7 @@ class StatefulRiskAPITests(unittest.TestCase):
             equity=Decimal("100000"),
             current_open_risk=Decimal("0"),
             as_of=previous,
+            received_at=previous,
             bootstrap_day_start_balance=Decimal("100000"),
             bootstrap_highest_settled_balance=Decimal("100000"),
         )
@@ -762,6 +1033,23 @@ class StatefulRiskAPITests(unittest.TestCase):
         self.assertTrue(body["emergency_alert"])
         self.assertFalse(body["force_flat"])
 
+    def test_status_endpoints_reject_stale_client_clock(self):
+        account_id = "stateful-status-clock"
+        self.sync_account(account_id, phase="ftmo_account")
+        stale_now = (datetime.now(UTC) - timedelta(minutes=2)).isoformat()
+        for path in ("/v1/news-status", "/v1/market-status"):
+            with self.subTest(path=path):
+                with self.assertRaises(HTTPError) as context:
+                    self.request(
+                        path,
+                        {
+                            "account_id": account_id,
+                            "symbol": "EURUSD",
+                            "now": stale_now,
+                        },
+                    )
+                self.assertEqual(context.exception.code, 400)
+
     def test_market_status_force_flats_before_long_close(self):
         account_id = "stateful-market-close"
         self.sync_account(account_id, phase="ftmo_account")
@@ -833,6 +1121,41 @@ class StatefulRiskAPITests(unittest.TestCase):
         self.assertEqual(
             body["decision"]["code"],
             "REJECT_MARKET_CLOSE",
+        )
+
+    def test_stateful_evaluation_uses_server_time_for_news_window(self):
+        account_id = "stateful-server-time"
+        self.sync_account(account_id, phase="ftmo_account")
+        now = datetime.now(UTC)
+        self.request(
+            "/v1/news-sync",
+            {
+                "fetched_at": now.isoformat(),
+                "events": [
+                    {
+                        "event_id": "SERVER-TIME",
+                        "release_time": (
+                            now + timedelta(minutes=2, seconds=15)
+                        ).isoformat(),
+                        "affected_symbols": ["EURUSD"],
+                    }
+                ],
+            },
+        )
+        _, body = self.request(
+            "/v1/evaluate",
+            {
+                "account_id": account_id,
+                "request": _open_request(
+                    (now + timedelta(seconds=29)).isoformat()
+                ),
+            },
+            request_id="server-time-r1",
+        )
+        self.assertEqual(body["decision"]["code"], "REJECT_NEWS")
+        self.assertIn(
+            "internal news buffer",
+            body["decision"]["reasons"][0],
         )
 
 

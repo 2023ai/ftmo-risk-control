@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -18,6 +19,8 @@ from .risk_engine import (
     AccountStyle,
     AccountType,
     FrequencyState,
+    RiskEngine,
+    RuleProfile,
     ftmo_day_key,
 )
 
@@ -42,13 +45,48 @@ class StateStore:
         self.day_timezone = day_timezone
         self._lock = threading.RLock()
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self._secure_database_file()
         self._initialize()
+
+    def _secure_database_file(self) -> None:
+        if self.path == ":memory:":
+            return
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(self.path, flags, 0o600)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            else:
+                os.chmod(self.path, 0o600)
+        finally:
+            os.close(descriptor)
+
+    def _secure_database_sidecars(self) -> None:
+        if self.path == ":memory:":
+            return
+        for candidate in (self.path, self.path + "-wal", self.path + "-shm"):
+            if not os.path.exists(candidate):
+                continue
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(candidate, flags)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(descriptor, 0o600)
+                else:
+                    os.chmod(candidate, 0o600)
+            finally:
+                os.close(descriptor)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
+        self._secure_database_sidecars()
         return connection
 
     @contextmanager
@@ -77,7 +115,9 @@ class StateStore:
                     current_open_risk TEXT NOT NULL,
                     as_of TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    data_uncertain INTEGER NOT NULL DEFAULT 0
+                    data_uncertain INTEGER NOT NULL DEFAULT 0,
+                    day_locked INTEGER NOT NULL DEFAULT 0,
+                    breach_latched INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS activity (
@@ -143,6 +183,16 @@ class StateStore:
                     "ALTER TABLE accounts ADD COLUMN data_uncertain "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            if "day_locked" not in columns:
+                connection.execute(
+                    "ALTER TABLE accounts ADD COLUMN day_locked "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "breach_latched" not in columns:
+                connection.execute(
+                    "ALTER TABLE accounts ADD COLUMN breach_latched "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             connection.commit()
 
     def sync_account(
@@ -157,19 +207,30 @@ class StateStore:
         equity: Decimal,
         current_open_risk: Decimal,
         as_of: datetime,
+        received_at: datetime | None = None,
+        profile: RuleProfile | None = None,
         bootstrap_day_start_balance: Decimal | None = None,
         bootstrap_highest_settled_balance: Decimal | None = None,
     ) -> StoredAccount:
         if as_of.tzinfo is None:
             raise ValueError("as_of must be timezone-aware")
+        received_at = received_at or datetime.now(timezone.utc)
+        if received_at.tzinfo is None:
+            raise ValueError("received_at must be timezone-aware")
         if initial_capital <= 0:
             raise ValueError("initial_capital must be positive")
         if current_open_risk < 0:
             raise ValueError("current_open_risk cannot be negative")
         if account_type == AccountType.ONE_STEP and style == AccountStyle.SWING:
             raise ValueError("Swing style is only available for 2-Step accounts")
-        current_day = ftmo_day_key(as_of, self.day_timezone)
-        updated_at = datetime.now(timezone.utc)
+        if profile is not None and (
+            profile.account_type != account_type
+            or profile.phase != phase
+            or profile.style != style
+        ):
+            raise ValueError("profile does not match the synchronized account")
+        current_day = ftmo_day_key(received_at, self.day_timezone)
+        updated_at = received_at.astimezone(timezone.utc)
 
         with self._lock, self._connection() as connection:
             row = connection.execute(
@@ -189,6 +250,8 @@ class StateStore:
                 day_start_balance = bootstrap_day_start_balance
                 highest_settled_balance = bootstrap_highest_settled_balance
                 data_uncertain = False
+                day_locked = False
+                breach_latched = False
                 if day_start_balance <= 0:
                     raise ValueError("day_start_balance must be positive")
                 if highest_settled_balance < initial_capital:
@@ -224,6 +287,8 @@ class StateStore:
                     row["highest_settled_balance"]
                 )
                 data_uncertain = bool(row["data_uncertain"])
+                day_locked = bool(row["day_locked"])
+                breach_latched = bool(row["breach_latched"])
 
                 settlement = connection.execute(
                     """
@@ -243,6 +308,7 @@ class StateStore:
                         settled_balance = Decimal(row["balance"])
                         data_uncertain = True
                     day_start_balance = settled_balance
+                    day_locked = False
                     if account_type == AccountType.ONE_STEP:
                         highest_settled_balance = max(
                             highest_settled_balance,
@@ -264,7 +330,7 @@ class StateStore:
                             account_id,
                             current_day,
                             str(settled_balance),
-                            as_of.isoformat(),
+                            received_at.isoformat(),
                             (
                                 "confirmed_schedule"
                                 if not data_uncertain
@@ -284,14 +350,34 @@ class StateStore:
                         )
                     data_uncertain = False
 
+            if profile is not None:
+                observed_snapshot = AccountSnapshot(
+                    initial_capital=initial_capital,
+                    day_start_balance=day_start_balance,
+                    highest_settled_balance=highest_settled_balance,
+                    balance=balance,
+                    equity=equity,
+                    current_open_risk=current_open_risk,
+                    as_of=as_of,
+                    data_uncertain=data_uncertain,
+                )
+                observed_status = RiskEngine(
+                    profile,
+                    day_timezone=self.day_timezone,
+                ).status(observed_snapshot)
+                if observed_status == "BREACH":
+                    breach_latched = True
+                elif observed_status == "LOCKED":
+                    day_locked = True
+
             connection.execute(
                 """
                 INSERT INTO accounts (
                     account_id, account_type, phase, style, initial_capital,
                     ftmo_day, day_start_balance, highest_settled_balance,
                     balance, equity, current_open_risk, as_of, updated_at,
-                    data_uncertain
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    data_uncertain, day_locked, breach_latched
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id) DO UPDATE SET
                     phase = excluded.phase,
                     style = excluded.style,
@@ -303,7 +389,9 @@ class StateStore:
                     current_open_risk = excluded.current_open_risk,
                     as_of = excluded.as_of,
                     updated_at = excluded.updated_at,
-                    data_uncertain = excluded.data_uncertain
+                    data_uncertain = excluded.data_uncertain,
+                    day_locked = excluded.day_locked,
+                    breach_latched = excluded.breach_latched
                 """,
                 (
                     account_id,
@@ -320,6 +408,8 @@ class StateStore:
                     as_of.isoformat(),
                     updated_at.isoformat(),
                     int(data_uncertain),
+                    int(day_locked),
+                    int(breach_latched),
                 ),
             )
             connection.commit()
@@ -357,6 +447,8 @@ class StateStore:
                 as_of=as_of,
                 data_age_seconds=age,
                 data_uncertain=bool(row["data_uncertain"]),
+                day_locked=bool(row["day_locked"]),
+                breach_latched=bool(row["breach_latched"]),
             ),
         )
 
@@ -432,10 +524,12 @@ class StateStore:
                 detail,
             ),
         )
-        cutoff = (occurred_at_utc - timedelta(days=3)).isoformat()
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=3)
+        ).isoformat()
         connection.execute(
-            "DELETE FROM activity WHERE occurred_at < ?",
-            (cutoff,),
+            "DELETE FROM activity WHERE account_id = ? AND occurred_at < ?",
+            (account_id, cutoff),
         )
 
     def evaluate_and_reserve(
@@ -476,6 +570,17 @@ class StateStore:
             if row is None:
                 raise KeyError(f"unknown account_id: {account_id}")
             account = self._stored_account_from_row(row, now=now)
+            if account.ftmo_day != ftmo_day_key(
+                occurred_at,
+                self.day_timezone,
+            ):
+                account = replace(
+                    account,
+                    snapshot=replace(
+                        account.snapshot,
+                        data_uncertain=True,
+                    ),
+                )
             frequency = self._frequency_from_connection(
                 connection,
                 account_id,
@@ -592,14 +697,19 @@ class StateStore:
                     "execution result cannot be recorded for a rejected request"
                 )
 
-            reservation_released = outcome == "failure" and action == "open"
-            if reservation_released:
+            reservation_kind = (
+                action
+                if outcome == "failure" and action in {"open", "modify"}
+                else None
+            )
+            reservation_released = reservation_kind is not None
+            if reservation_kind is not None:
                 connection.execute(
                     """
                     DELETE FROM activity
-                    WHERE account_id = ? AND kind = 'open' AND request_id = ?
+                    WHERE account_id = ? AND kind = ? AND request_id = ?
                     """,
-                    (account_id, request_id),
+                    (account_id, reservation_kind, request_id),
                 )
             response = {
                 "ok": True,
@@ -715,6 +825,30 @@ class StateStore:
             ).fetchone()
             if row is None:
                 raise KeyError(f"unknown account_id: {account_id}")
+            existing = connection.execute(
+                """
+                SELECT settled_balance, settled_at, source, confirmed
+                FROM daily_settlements
+                WHERE account_id = ? AND ftmo_day = ?
+                """,
+                (account_id, ftmo_day),
+            ).fetchone()
+            if existing is not None and existing["confirmed"]:
+                existing_at = datetime.fromisoformat(existing["settled_at"])
+                if settled_at < existing_at:
+                    raise ValueError(
+                        "confirmed settlement cannot be replaced by an older record"
+                    )
+                if (
+                    settled_at == existing_at
+                    and (
+                        Decimal(existing["settled_balance"]) != settled_balance
+                        or existing["source"] != source
+                    )
+                ):
+                    raise ValueError(
+                        "confirmed settlement timestamp already has different content"
+                    )
             connection.execute(
                 """
                 INSERT INTO daily_settlements (

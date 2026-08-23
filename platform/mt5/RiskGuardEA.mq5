@@ -20,7 +20,6 @@ input int RiskApiTimeoutMs = 3000;
 input int NewsGuardIntervalSeconds = 5;
 input ulong MagicNumber = 26082201;
 
-int RequestSequence = 0;
 bool UnknownExecutionLock = false;
 
 string UnknownLockName()
@@ -56,10 +55,23 @@ string IsoUtc(datetime value)
 
 string NextRequestId(string action)
 {
-   RequestSequence++;
-   return AccountId + "-" + action + "-" +
+   string counter_name =
+      "FTMO.RG.RequestSequence." +
+      StringFormat(
+         "%I64d.%I64u",
+         AccountInfoInteger(ACCOUNT_LOGIN),
+         MagicNumber);
+   double current = GlobalVariableCheck(counter_name)
+      ? GlobalVariableGet(counter_name)
+      : 0.0;
+   double next = current + 1.0;
+   if(GlobalVariableSet(counter_name, next) == 0)
+   {
+      next = (double)GetTickCount64();
+   }
+   return "mt5-" + action + "-" +
       IntegerToString((int)TimeGMT()) + "-" +
-      IntegerToString(RequestSequence);
+      StringFormat("%I64u", (ulong)next);
 }
 
 string UlongText(ulong value)
@@ -136,7 +148,6 @@ double CurrentOpenRisk()
 
       string symbol = PositionGetString(POSITION_SYMBOL);
       double volume = PositionGetDouble(POSITION_VOLUME);
-      double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
       double stop_loss = PositionGetDouble(POSITION_SL);
       if(stop_loss <= 0.0)
       {
@@ -149,13 +160,22 @@ double CurrentOpenRisk()
          position_type == POSITION_TYPE_BUY
          ? ORDER_TYPE_BUY
          : ORDER_TYPE_SELL;
+      MqlTick tick;
+      if(!SymbolInfoTick(symbol, tick))
+      {
+         return InitialCapital;
+      }
+      double current_price =
+         position_type == POSITION_TYPE_BUY
+         ? tick.bid
+         : tick.ask;
       double profit = 0.0;
 
       if(!OrderCalcProfit(
             order_type,
             symbol,
             volume,
-            open_price,
+            current_price,
             stop_loss,
             profit))
       {
@@ -366,23 +386,42 @@ void ReportExecution(
 bool TradeRetcodeSuccessful(uint retcode)
 {
    return retcode == TRADE_RETCODE_DONE ||
-      retcode == TRADE_RETCODE_DONE_PARTIAL ||
-      retcode == TRADE_RETCODE_PLACED;
+      retcode == TRADE_RETCODE_DONE_PARTIAL;
 }
 
 bool TradeRetcodeDefinitelyFailed(uint retcode)
 {
-   return retcode == TRADE_RETCODE_INVALID ||
+   return retcode == TRADE_RETCODE_REQUOTE ||
+      retcode == TRADE_RETCODE_REJECT ||
+      retcode == TRADE_RETCODE_CANCEL ||
+      retcode == TRADE_RETCODE_INVALID ||
       retcode == TRADE_RETCODE_INVALID_VOLUME ||
       retcode == TRADE_RETCODE_INVALID_PRICE ||
       retcode == TRADE_RETCODE_INVALID_STOPS ||
       retcode == TRADE_RETCODE_TRADE_DISABLED ||
       retcode == TRADE_RETCODE_MARKET_CLOSED ||
       retcode == TRADE_RETCODE_NO_MONEY ||
+      retcode == TRADE_RETCODE_PRICE_CHANGED ||
+      retcode == TRADE_RETCODE_PRICE_OFF ||
+      retcode == TRADE_RETCODE_INVALID_EXPIRATION ||
+      retcode == TRADE_RETCODE_TOO_MANY_REQUESTS ||
+      retcode == TRADE_RETCODE_NO_CHANGES ||
+      retcode == TRADE_RETCODE_SERVER_DISABLES_AT ||
+      retcode == TRADE_RETCODE_CLIENT_DISABLES_AT ||
+      retcode == TRADE_RETCODE_LOCKED ||
+      retcode == TRADE_RETCODE_FROZEN ||
       retcode == TRADE_RETCODE_LIMIT_ORDERS ||
       retcode == TRADE_RETCODE_LIMIT_VOLUME ||
       retcode == TRADE_RETCODE_INVALID_ORDER ||
-      retcode == TRADE_RETCODE_INVALID_FILL;
+      retcode == TRADE_RETCODE_INVALID_FILL ||
+      retcode == TRADE_RETCODE_INVALID_CLOSE_VOLUME ||
+      retcode == TRADE_RETCODE_LIMIT_POSITIONS ||
+      retcode == TRADE_RETCODE_REJECT_CANCEL ||
+      retcode == TRADE_RETCODE_LONG_ONLY ||
+      retcode == TRADE_RETCODE_SHORT_ONLY ||
+      retcode == TRADE_RETCODE_CLOSE_ONLY ||
+      retcode == TRADE_RETCODE_FIFO_CLOSE ||
+      retcode == TRADE_RETCODE_HEDGE_PROHIBITED;
 }
 
 string TradeOutcome(bool submitted, uint retcode)
@@ -790,22 +829,24 @@ void RunNewsGuard()
       string symbol = PositionGetString(POSITION_SYMBOL);
       string news_response;
       string market_response;
-      if(!GuardStatus("/v1/news-status", symbol, news_response) ||
-         !GuardStatus("/v1/market-status", symbol, market_response))
-      {
-         continue;
-      }
-      if(JsonTrue(news_response, "force_flat") ||
-         JsonTrue(market_response, "force_flat"))
+      bool news_ok =
+         GuardStatus("/v1/news-status", symbol, news_response);
+      bool market_ok =
+         GuardStatus("/v1/market-status", symbol, market_response);
+      bool force_flat =
+         (news_ok && JsonTrue(news_response, "force_flat")) ||
+         (market_ok && JsonTrue(market_response, "force_flat"));
+      if(force_flat)
       {
          RiskGuardClose(ticket);
       }
-      else if(JsonTrue(news_response, "emergency_alert") ||
-         JsonTrue(market_response, "emergency_alert"))
+      else if(!news_ok || !market_ok ||
+         (news_ok && JsonTrue(news_response, "emergency_alert")) ||
+         (market_ok && JsonTrue(market_response, "emergency_alert")))
       {
          Alert(
-            "FTMO RiskGuard emergency: position remains during a hard, "
-            "unknown-news, or long market-close window: ",
+            "FTMO RiskGuard emergency: position status is unresolved or "
+            "restricted: ",
             symbol);
       }
    }
@@ -820,13 +861,14 @@ void RunNewsGuard()
       string symbol = OrderGetString(ORDER_SYMBOL);
       string news_response;
       string market_response;
-      if(!GuardStatus("/v1/news-status", symbol, news_response) ||
-         !GuardStatus("/v1/market-status", symbol, market_response))
-      {
-         continue;
-      }
-      if(JsonTrue(news_response, "cancel_pending") ||
-         JsonTrue(market_response, "cancel_pending"))
+      bool news_ok =
+         GuardStatus("/v1/news-status", symbol, news_response);
+      bool market_ok =
+         GuardStatus("/v1/market-status", symbol, market_response);
+      bool cancel_pending =
+         (news_ok && JsonTrue(news_response, "cancel_pending")) ||
+         (market_ok && JsonTrue(market_response, "cancel_pending"));
+      if(cancel_pending)
       {
          if(!RiskGuardCancelPending(ticket))
          {
@@ -834,6 +876,12 @@ void RunNewsGuard()
                "RiskGuard: unable to cancel pending order %I64u",
                ticket);
          }
+      }
+      else if(!news_ok || !market_ok)
+      {
+         PrintFormat(
+            "RiskGuard: pending order status unresolved ticket=%I64u",
+            ticket);
       }
    }
 }

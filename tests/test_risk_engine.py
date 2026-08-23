@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -32,6 +33,8 @@ def snapshot(
     open_risk: str = "0",
     age: int = 0,
     uncertain: bool = False,
+    day_locked: bool = False,
+    breach_latched: bool = False,
 ) -> AccountSnapshot:
     return AccountSnapshot(
         initial_capital=Decimal("100000"),
@@ -43,6 +46,8 @@ def snapshot(
         current_open_risk=Decimal(open_risk),
         data_age_seconds=age,
         data_uncertain=uncertain,
+        day_locked=day_locked,
+        breach_latched=breach_latched,
     )
 
 
@@ -121,6 +126,24 @@ class RiskEngineTests(unittest.TestCase):
         )
         self.assertEqual(decision.code, DecisionCode.ALLOW)
 
+    def test_latched_official_breach_rejects_after_equity_recovers(self):
+        engine = RiskEngine(RuleProfile.two_step_default())
+        decision = engine.evaluate(
+            snapshot(breach_latched=True),
+            open_request(when=self.now),
+            self.frequency,
+        )
+        self.assertEqual(decision.code, DecisionCode.REJECT_OFFICIAL_BREACH)
+
+    def test_daily_lock_rejects_after_equity_recovers(self):
+        engine = RiskEngine(RuleProfile.two_step_default())
+        decision = engine.evaluate(
+            snapshot(day_locked=True),
+            open_request(when=self.now),
+            self.frequency,
+        )
+        self.assertEqual(decision.code, DecisionCode.REJECT_INTERNAL_LOCK)
+
     def test_no_stop_loss_is_rejected(self):
         engine = RiskEngine(RuleProfile.two_step_default())
         request = open_request(when=self.now)
@@ -152,6 +175,17 @@ class RiskEngineTests(unittest.TestCase):
         engine = RiskEngine(RuleProfile.two_step_default())
         budget = engine.risk_budget(snapshot(equity="98000"))
         self.assertEqual(budget.total_budget, Decimal("250"))
+
+    def test_existing_open_risk_reduces_daily_and_max_buffers(self):
+        engine = RiskEngine(RuleProfile.one_step_default())
+        budget = engine.risk_budget(
+            snapshot(
+                equity="98500",
+                open_risk="800",
+            )
+        )
+        self.assertEqual(budget.daily_buffer_cap, Decimal("20.00"))
+        self.assertEqual(budget.total_budget, Decimal("10.000"))
 
     def test_internal_lock_rejects_new_risk(self):
         engine = RiskEngine(RuleProfile.two_step_default())
@@ -306,6 +340,25 @@ class RiskEngineTests(unittest.TestCase):
             self.frequency,
         )
         self.assertEqual(decision.code, DecisionCode.REJECT_FREQUENCY)
+
+    def test_request_warning_threshold_is_reported_on_allowed_request(self):
+        profile = replace(
+            RuleProfile.two_step_default(),
+            warning_requests_day=2,
+            stop_requests_day=3,
+        )
+        engine = RiskEngine(profile)
+        self.frequency.request_times = [self.now - timedelta(minutes=1)]
+        decision = engine.evaluate(
+            snapshot(),
+            open_request(when=self.now),
+            self.frequency,
+        )
+        self.assertEqual(decision.code, DecisionCode.ALLOW)
+        self.assertIn(
+            "daily server-request warning threshold reached",
+            decision.reasons,
+        )
 
     def test_daily_frequency_uses_prague_calendar_day(self):
         engine = RiskEngine(RuleProfile.two_step_default())

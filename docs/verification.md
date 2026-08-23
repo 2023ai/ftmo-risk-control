@@ -1,15 +1,17 @@
 # 验证报告
 
-验证日期：2026-08-22。
+验证日期：2026-08-23。
 
 ## 自动测试
 
 ```text
-68 tests passed
+90 tests passed
 ResourceWarning treated as error
 Python source compilation passed
 JSON configuration validation passed
 git diff --check passed
+Ruff passed
+mypy passed
 ```
 
 测试覆盖：
@@ -23,6 +25,11 @@ git diff --check passed
 - HTTP 认证、非法输入和执行结果审计。
 - 亏损线触及或快照过期时仍允许风险降低动作。
 - 请求幂等、未知执行结果保留预留、日结算确认和风险增加型修改。
+- 守护端时钟偏差、远程监听显式授权、配置启动快照和敏感文件权限。
+- 明确失败的修改释放冷却预留，无状态仓位计算默认关闭。
+- 当前报价到止损的开放风险扣减、服务器日界线权威和请求量预警。
+- 执行时间偏差、未来活动清理隔离、重复日历 ID 和同时间戳内容冲突。
+- 日内 `LOCKED` 跨权益反弹持续到下一 FTMO 日，官方 `BREACH` 持久锁定。
 
 ## MT5
 
@@ -37,13 +44,14 @@ Target: X64 Regular
 
 ## cTrader
 
-使用 FTMO Platform cTrader `5.9.140` 的 Automate Build：
+使用 FTMO Platform cTrader `5.9.140`、cTrader.Automate `1.0.19` 构建：
 
 ```text
-构建成功
+0 errors
+0 warnings
 ```
 
-验证项目名为 `FTMORiskGuardValidation`。只执行了源码构建，没有启动 cBot、没有发送订单。
+只执行了源码构建，没有启动 cBot、没有发送订单。
 
 ## 未执行
 
@@ -64,5 +72,5 @@ market sync: accepted
 account sync: accepted
 evaluation decision: ALLOW
 audit request_id: smoke-evaluate
-audit rule_version: ftmo-v2-2026-08-22
+audit rule_version: ftmo-v2-2026-08-23
 ```

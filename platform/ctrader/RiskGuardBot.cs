@@ -46,7 +46,6 @@ namespace FtmoRiskControl
         [Parameter("Label", DefaultValue = "FTMO-RISK")]
         public string Label { get; set; }
 
-        private int _requestSequence;
         private bool _unknownExecutionLock;
 
         private string UnknownExecutionLockKey
@@ -121,16 +120,7 @@ namespace FtmoRiskControl
 
         private string NextRequestId(string action)
         {
-            _requestSequence++;
-            var unixTime = new DateTimeOffset(
-                Server.TimeInUtc).ToUnixTimeSeconds();
-            return string.Format(
-                CultureInfo.InvariantCulture,
-                "{0}-{1}-{2}-{3}",
-                AccountId,
-                action,
-                unixTime,
-                _requestSequence);
+            return action + "-" + Guid.NewGuid().ToString("N");
         }
 
         private string SendRiskRequest(
@@ -183,8 +173,11 @@ namespace FtmoRiskControl
                 if (symbol == null)
                     return InitialCapital;
 
+                var currentPrice = position.TradeType == TradeType.Buy
+                    ? symbol.Bid
+                    : symbol.Ask;
                 var stopPips = Math.Abs(
-                    position.EntryPrice - position.StopLoss.Value)
+                    currentPrice - position.StopLoss.Value)
                     / symbol.PipSize;
                 total += Math.Max(
                     0,
@@ -306,6 +299,22 @@ namespace FtmoRiskControl
             }
         }
 
+        private static string TradeOutcome(TradeResult result)
+        {
+            if (result == null)
+                return "unknown";
+            if (result.IsSuccessful)
+                return "success";
+            if (!result.Error.HasValue
+                || result.Error.Value == ErrorCode.Timeout
+                || result.Error.Value == ErrorCode.Disconnected
+                || result.Error.Value == ErrorCode.TechnicalError)
+            {
+                return "unknown";
+            }
+            return "failure";
+        }
+
         public TradeResult TryExecuteMarket(
             TradeType tradeType,
             double volumeInUnits,
@@ -387,7 +396,7 @@ namespace FtmoRiskControl
                 requestId,
                 "open",
                 SymbolName,
-                result.IsSuccessful ? "success" : "unknown",
+                TradeOutcome(result),
                 result.Error.ToString(),
                 result.Position == null
                     ? string.Empty
@@ -458,7 +467,7 @@ namespace FtmoRiskControl
                 requestId,
                 "close",
                 position.SymbolName,
-                result.IsSuccessful ? "success" : "unknown",
+                TradeOutcome(result),
                 result.Error.ToString(),
                 position.Id.ToString(CultureInfo.InvariantCulture));
             return result;
@@ -471,10 +480,15 @@ namespace FtmoRiskControl
             if (position == null || volumeInUnits <= 0)
                 return null;
 
-            var normalizedVolume = Symbol.NormalizeVolumeInUnits(
+            var positionSymbol = Symbols.GetSymbol(position.SymbolName);
+            if (positionSymbol == null)
+                return null;
+
+            var normalizedVolume = positionSymbol.NormalizeVolumeInUnits(
                 volumeInUnits,
                 RoundingMode.Down);
-            if (normalizedVolume < Symbol.VolumeInUnitsMin)
+            if (normalizedVolume < positionSymbol.VolumeInUnitsMin
+                || normalizedVolume > position.VolumeInUnits)
                 return null;
 
             var requestId = NextRequestId("close-partial");
@@ -510,7 +524,7 @@ namespace FtmoRiskControl
                 requestId,
                 "close",
                 position.SymbolName,
-                result.IsSuccessful ? "success" : "unknown",
+                TradeOutcome(result),
                 result.Error.ToString(),
                 position.Id.ToString(CultureInfo.InvariantCulture));
             return result;
@@ -600,7 +614,7 @@ namespace FtmoRiskControl
                 requestId,
                 "modify",
                 position.SymbolName,
-                result.IsSuccessful ? "success" : "unknown",
+                TradeOutcome(result),
                 result.Error.ToString(),
                 position.Id.ToString(CultureInfo.InvariantCulture));
             return result;
@@ -643,7 +657,7 @@ namespace FtmoRiskControl
                 requestId,
                 "cancel",
                 order.SymbolName,
-                result.IsSuccessful ? "success" : "unknown",
+                TradeOutcome(result),
                 result.Error.ToString(),
                 order.Id.ToString(CultureInfo.InvariantCulture));
             return result;
@@ -699,20 +713,23 @@ namespace FtmoRiskControl
                 var marketStatus = GuardStatus(
                     "/v1/market-status",
                     position.SymbolName);
-                if (!newsStatus.HasValue || !marketStatus.HasValue)
-                    continue;
-                if (Flag(newsStatus.Value, "force_flat")
-                    || Flag(marketStatus.Value, "force_flat"))
+                var forceFlat =
+                    (newsStatus.HasValue
+                        && Flag(newsStatus.Value, "force_flat"))
+                    || (marketStatus.HasValue
+                        && Flag(marketStatus.Value, "force_flat"));
+                if (forceFlat)
                 {
                     TryClose(position);
                 }
-                else if (Flag(newsStatus.Value, "emergency_alert")
+                else if (!newsStatus.HasValue
+                    || !marketStatus.HasValue
+                    || Flag(newsStatus.Value, "emergency_alert")
                     || Flag(marketStatus.Value, "emergency_alert"))
                 {
                     Notifications.ShowPopup(
                         "FTMO RiskGuard",
-                        "Position remains during a hard, unknown-news, "
-                            + "or long market-close window: "
+                        "Position status is unresolved or restricted: "
                             + position.SymbolName,
                         PopupNotificationState.Error);
                 }
@@ -730,15 +747,21 @@ namespace FtmoRiskControl
                 var marketStatus = GuardStatus(
                     "/v1/market-status",
                     order.SymbolName);
-                if (!newsStatus.HasValue
-                    || !marketStatus.HasValue
-                    || (!Flag(newsStatus.Value, "cancel_pending")
-                        && !Flag(marketStatus.Value, "cancel_pending")))
+                var cancelPending =
+                    (newsStatus.HasValue
+                        && Flag(newsStatus.Value, "cancel_pending"))
+                    || (marketStatus.HasValue
+                        && Flag(marketStatus.Value, "cancel_pending"));
+                if (cancelPending)
                 {
-                    continue;
+                    TryCancelPendingOrder(order);
                 }
-
-                TryCancelPendingOrder(order);
+                else if (!newsStatus.HasValue || !marketStatus.HasValue)
+                {
+                    Print(
+                        "RiskGuard: pending order status unresolved id={0}",
+                        order.Id);
+                }
             }
         }
     }

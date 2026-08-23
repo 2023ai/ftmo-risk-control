@@ -1,3 +1,5 @@
+import os
+import stat
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -8,6 +10,7 @@ from src.risk_engine import (
     AccountPhase,
     AccountStyle,
     AccountType,
+    RuleProfile,
     ftmo_day_key,
 )
 from src.state_store import StateStore
@@ -22,6 +25,10 @@ class StateStoreTests(unittest.TestCase):
         self.path = Path(self.tempdir.name) / "risk.db"
         self.store = StateStore(self.path)
         self.now = datetime.now(UTC)
+
+    def test_database_permissions_are_owner_only(self):
+        mode = stat.S_IMODE(os.stat(self.path).st_mode)
+        self.assertEqual(mode, 0o600)
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -41,6 +48,8 @@ class StateStoreTests(unittest.TestCase):
             "bootstrap_highest_settled_balance": Decimal("100000"),
         }
         values.update(overrides)
+        if "received_at" not in overrides:
+            values["received_at"] = values["as_of"]
         return self.store.sync_account(**values)
 
     def test_first_sync_requires_verified_baselines(self):
@@ -128,6 +137,105 @@ class StateStoreTests(unittest.TestCase):
         )
         self.assertTrue(account.snapshot.data_uncertain)
 
+    def test_rollover_uses_server_received_day(self):
+        before_rollover = datetime(2026, 8, 22, 21, 59, 59, tzinfo=UTC)
+        after_rollover = before_rollover + timedelta(seconds=2)
+        self.sync(
+            as_of=before_rollover,
+            received_at=before_rollover,
+        )
+        account = self.sync(
+            balance=Decimal("101000"),
+            equity=Decimal("101000"),
+            as_of=before_rollover,
+            received_at=after_rollover,
+            bootstrap_day_start_balance=None,
+            bootstrap_highest_settled_balance=None,
+        )
+        self.assertEqual(account.ftmo_day, ftmo_day_key(after_rollover))
+        self.assertTrue(account.snapshot.data_uncertain)
+
+    def test_daily_lock_persists_until_next_ftmo_day(self):
+        profile = RuleProfile.two_step_default()
+        account = self.sync(
+            account_type=AccountType.TWO_STEP,
+            equity=Decimal("95900"),
+            profile=profile,
+        )
+        self.assertTrue(account.snapshot.day_locked)
+
+        recovered_at = self.now + timedelta(seconds=1)
+        account = self.sync(
+            account_type=AccountType.TWO_STEP,
+            equity=Decimal("100000"),
+            as_of=recovered_at,
+            received_at=recovered_at,
+            profile=profile,
+            bootstrap_day_start_balance=None,
+            bootstrap_highest_settled_balance=None,
+        )
+        self.assertTrue(account.snapshot.day_locked)
+
+        next_day = self.now + timedelta(days=1)
+        account = self.sync(
+            account_type=AccountType.TWO_STEP,
+            equity=Decimal("100000"),
+            as_of=next_day,
+            received_at=next_day,
+            profile=profile,
+            bootstrap_day_start_balance=None,
+            bootstrap_highest_settled_balance=None,
+        )
+        self.assertFalse(account.snapshot.day_locked)
+
+    def test_official_breach_latch_survives_equity_recovery(self):
+        profile = RuleProfile.two_step_default()
+        account = self.sync(
+            account_type=AccountType.TWO_STEP,
+            equity=Decimal("94900"),
+            profile=profile,
+        )
+        self.assertTrue(account.snapshot.breach_latched)
+
+        recovered_at = self.now + timedelta(seconds=1)
+        account = self.sync(
+            account_type=AccountType.TWO_STEP,
+            equity=Decimal("100000"),
+            as_of=recovered_at,
+            received_at=recovered_at,
+            profile=profile,
+            bootstrap_day_start_balance=None,
+            bootstrap_highest_settled_balance=None,
+        )
+        self.assertTrue(account.snapshot.breach_latched)
+
+    def test_confirmed_settlement_rejects_older_or_conflicting_record(self):
+        self.sync()
+        ftmo_day = ftmo_day_key(self.now)
+        self.store.confirm_settlement(
+            account_id="mt5-10001",
+            ftmo_day=ftmo_day,
+            settled_balance=Decimal("100500"),
+            settled_at=self.now,
+            source="approved-source",
+        )
+        with self.assertRaises(ValueError):
+            self.store.confirm_settlement(
+                account_id="mt5-10001",
+                ftmo_day=ftmo_day,
+                settled_balance=Decimal("100400"),
+                settled_at=self.now - timedelta(seconds=1),
+                source="approved-source",
+            )
+        with self.assertRaises(ValueError):
+            self.store.confirm_settlement(
+                account_id="mt5-10001",
+                ftmo_day=ftmo_day,
+                settled_balance=Decimal("100400"),
+                settled_at=self.now,
+                source="approved-source",
+            )
+
     def test_frequency_survives_restart(self):
         self.sync()
         self.store.record_activity(
@@ -147,6 +255,29 @@ class StateStoreTests(unittest.TestCase):
         frequency = StateStore(self.path).frequency("mt5-10001")
         self.assertEqual(len(frequency.request_times), 1)
         self.assertEqual(len(frequency.open_times), 1)
+
+    def test_future_activity_cannot_prune_other_account_frequency(self):
+        self.sync()
+        self.sync(
+            account_id="ctrader-20002",
+            account_type=AccountType.TWO_STEP,
+        )
+        self.store.record_activity(
+            account_id="ctrader-20002",
+            kind="request",
+            symbol="EURUSD",
+            occurred_at=self.now,
+            request_id="other-current",
+        )
+        self.store.record_activity(
+            account_id="mt5-10001",
+            kind="execution",
+            symbol="EURUSD",
+            occurred_at=self.now + timedelta(days=10),
+            request_id="future-event",
+        )
+        frequency = self.store.frequency("ctrader-20002")
+        self.assertEqual(len(frequency.request_times), 1)
 
     def test_style_cannot_change_after_bootstrap(self):
         self.sync()

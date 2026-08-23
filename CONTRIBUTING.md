@@ -14,8 +14,10 @@
 ## 提交前检查
 
 ```bash
+python3 -m pip install -r requirements-dev.txt
 make test
 make check
+make lint
 ```
 
 如果修改 MT5 或 cTrader 适配器，还必须在对应平台编译源码，并说明编译版本和结果。不要连接真实 FTMO 账户或发送真实订单作为 CI 验证步骤。

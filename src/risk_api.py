@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import socket
@@ -19,6 +20,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from enum import EnumMeta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,6 +45,10 @@ from .risk_engine import (
     validate_config,
 )
 from .state_store import StateStore, StoredAccount
+
+
+LOGGER = logging.getLogger(__name__)
+ConfigSource = str | Path | Mapping[str, Any]
 
 
 class RequestError(ValueError):
@@ -84,11 +90,34 @@ def _timestamp(value: Any, field: str) -> datetime:
     return parsed
 
 
-def _enum(enum_type: type, value: Any, field: str):
+def _validate_clock_skew(
+    timestamp: datetime,
+    field: str,
+    max_skew_seconds: int = 30,
+    reference_time: datetime | None = None,
+) -> None:
+    reference_time = reference_time or datetime.now(timezone.utc)
+    skew = abs(
+        (
+            reference_time.astimezone(timezone.utc)
+            - timestamp.astimezone(timezone.utc)
+        ).total_seconds()
+    )
+    if skew > max_skew_seconds:
+        raise RequestError(
+            f"{field} differs from server time by more than "
+            f"{max_skew_seconds} seconds"
+        )
+
+
+def _enum(enum_type: EnumMeta, value: Any, field: str) -> Any:
     try:
         return enum_type(value)
     except (TypeError, ValueError) as exc:
-        allowed = ", ".join(item.value for item in enum_type)
+        members: Mapping[str, Any] = enum_type.__members__
+        allowed = ", ".join(
+            str(item.value) for item in members.values()
+        )
         raise RequestError(f"{field} must be one of: {allowed}") from exc
 
 
@@ -133,6 +162,8 @@ def _snapshot(raw: Mapping[str, Any]) -> AccountSnapshot:
         ),
         data_age_seconds=parsed_age,
         data_uncertain=bool(raw.get("data_uncertain", False)),
+        day_locked=bool(raw.get("day_locked", False)),
+        breach_latched=bool(raw.get("breach_latched", False)),
     )
     if snapshot.initial_capital <= 0:
         raise RequestError("initial_capital must be positive")
@@ -146,6 +177,10 @@ def _snapshot(raw: Mapping[str, Any]) -> AccountSnapshot:
         raise RequestError("data_age_seconds cannot be negative")
     if not isinstance(raw.get("data_uncertain", False), bool):
         raise RequestError("data_uncertain must be a JSON boolean")
+    if not isinstance(raw.get("day_locked", False), bool):
+        raise RequestError("day_locked must be a JSON boolean")
+    if not isinstance(raw.get("breach_latched", False), bool):
+        raise RequestError("breach_latched must be a JSON boolean")
     return snapshot
 
 
@@ -275,12 +310,16 @@ def _news_events(raw: list[Mapping[str, Any]] | None) -> list[NewsEvent]:
     if any(not isinstance(item, Mapping) for item in raw):
         raise RequestError("each news event must be a JSON object")
     events = []
+    event_ids: set[str] = set()
     for item in raw:
         event_id = str(_required(item, "event_id")).strip()
         if not 1 <= len(event_id) <= 128:
             raise RequestError(
                 "news event_id must contain 1 to 128 characters"
             )
+        if event_id in event_ids:
+            raise RequestError(f"duplicate news event_id: {event_id}")
+        event_ids.add(event_id)
         affected_symbols = item.get("affected_symbols", [])
         if (
             not isinstance(affected_symbols, list)
@@ -305,7 +344,13 @@ def _news_events(raw: list[Mapping[str, Any]] | None) -> list[NewsEvent]:
                 source=str(item.get("source", "ftmo-calendar")),
             )
         )
-    return events
+    return sorted(
+        events,
+        key=lambda event: (
+            event.release_time.astimezone(timezone.utc),
+            event.event_id,
+        ),
+    )
 
 
 def _market_closures(
@@ -318,12 +363,18 @@ def _market_closures(
     if any(not isinstance(item, Mapping) for item in raw):
         raise RequestError("each market closure must be a JSON object")
     closures = []
+    closure_ids: set[str] = set()
     for item in raw or []:
         closure_id = str(_required(item, "closure_id")).strip()
         if not 1 <= len(closure_id) <= 128:
             raise RequestError(
                 "market closure_id must contain 1 to 128 characters"
             )
+        if closure_id in closure_ids:
+            raise RequestError(
+                f"duplicate market closure_id: {closure_id}"
+            )
+        closure_ids.add(closure_id)
         affected_symbols = item.get("affected_symbols", [])
         if (
             not isinstance(affected_symbols, list)
@@ -357,11 +408,17 @@ def _market_closures(
                 ),
             )
         )
-    return closures
+    return sorted(
+        closures,
+        key=lambda closure: (
+            closure.start_time.astimezone(timezone.utc),
+            closure.closure_id,
+        ),
+    )
 
 
 def _profile(
-    config_path: str | Path,
+    config_source: ConfigSource,
     raw: Mapping[str, Any],
 ) -> tuple[RuleProfile, str]:
     account_type = _enum(
@@ -371,12 +428,18 @@ def _profile(
     )
     phase = _enum(AccountPhase, _required(raw, "phase"), "phase")
     style = _enum(AccountStyle, _required(raw, "style"), "style")
-    with Path(config_path).open("r", encoding="utf-8") as handle:
-        config = json.load(handle)
+    config = _load_config(config_source)
     return (
         RuleProfile.from_config(config, account_type, phase, style),
         str(config.get("rule_version", "unknown")),
     )
+
+
+def _load_config(config_source: ConfigSource) -> Mapping[str, Any]:
+    if isinstance(config_source, Mapping):
+        return config_source
+    with Path(config_source).open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def _account_id(value: Any) -> str:
@@ -420,6 +483,8 @@ def _stored_snapshot(account: StoredAccount) -> dict[str, Any]:
             "current_open_risk": snapshot.current_open_risk,
             "data_age_seconds": snapshot.data_age_seconds,
             "data_uncertain": snapshot.data_uncertain,
+            "day_locked": snapshot.day_locked,
+            "breach_latched": snapshot.breach_latched,
         }
     )
 
@@ -450,16 +515,16 @@ def _is_loopback_host(host: str) -> bool:
 def account_sync_payload(
     payload: Mapping[str, Any],
     state_store: StateStore,
+    config_source: ConfigSource,
 ) -> dict[str, Any]:
     account_id = _account_id(_required(payload, "account_id"))
     as_of = _timestamp(_required(payload, "as_of"), "as_of")
-    clock_skew = abs(
-        (
-            datetime.now(timezone.utc) - as_of.astimezone(timezone.utc)
-        ).total_seconds()
+    received_at = datetime.now(timezone.utc)
+    _validate_clock_skew(
+        as_of,
+        "as_of",
+        reference_time=received_at,
     )
-    if clock_skew > 30:
-        raise RequestError("as_of differs from server time by more than 30 seconds")
     initial_capital = _decimal(
         _required(payload, "initial_capital"),
         "initial_capital",
@@ -475,20 +540,33 @@ def account_sync_payload(
     if current_open_risk < 0:
         raise RequestError("current_open_risk cannot be negative")
 
+    account_type = _enum(
+        AccountType,
+        _required(payload, "account_type"),
+        "account_type",
+    )
+    phase = _enum(AccountPhase, _required(payload, "phase"), "phase")
+    style = _enum(AccountStyle, _required(payload, "style"), "style")
+    profile, _ = _profile(
+        config_source,
+        {
+            "account_type": account_type.value,
+            "phase": phase.value,
+            "style": style.value,
+        },
+    )
     account = state_store.sync_account(
         account_id=account_id,
-        account_type=_enum(
-            AccountType,
-            _required(payload, "account_type"),
-            "account_type",
-        ),
-        phase=_enum(AccountPhase, _required(payload, "phase"), "phase"),
-        style=_enum(AccountStyle, _required(payload, "style"), "style"),
+        account_type=account_type,
+        phase=phase,
+        style=style,
         initial_capital=initial_capital,
         balance=balance,
         equity=equity,
         current_open_risk=current_open_risk,
         as_of=as_of,
+        received_at=received_at,
+        profile=profile,
         bootstrap_day_start_balance=(
             _decimal(payload["day_start_balance"], "day_start_balance")
             if payload.get("day_start_balance") is not None
@@ -556,7 +634,7 @@ def settlement_sync_payload(
 
 def evaluate_stored_payload(
     payload: Mapping[str, Any],
-    config_path: str | Path,
+    config_source: ConfigSource,
     state_store: StateStore,
     request_id: str,
     default_news_events: list[NewsEvent],
@@ -566,16 +644,8 @@ def evaluate_stored_payload(
 ) -> dict[str, Any]:
     account_id = _account_id(_required(payload, "account_id"))
     request = _trade_request(_required(payload, "request"))
-    clock_skew = abs(
-        (
-            datetime.now(timezone.utc)
-            - request.requested_at.astimezone(timezone.utc)
-        ).total_seconds()
-    )
-    if clock_skew > 30:
-        raise RequestError(
-            "request.requested_at differs from server time by more than 30 seconds"
-        )
+    _validate_clock_skew(request.requested_at, "request.requested_at")
+    received_at = datetime.now(timezone.utc)
     request_hash = _canonical_hash(
         {
             "account_id": account_id,
@@ -588,12 +658,15 @@ def evaluate_stored_payload(
         frequency: FrequencyState,
     ) -> Mapping[str, Any]:
         merged = dict(payload)
+        server_request = dict(payload["request"])
+        server_request["requested_at"] = received_at.isoformat()
         merged.update(
             {
                 "account_type": account.account_type.value,
                 "phase": account.phase.value,
                 "style": account.style.value,
                 "snapshot": _stored_snapshot(account),
+                "request": server_request,
                 "frequency": {
                     "open_times": [
                         item.isoformat() for item in frequency.open_times
@@ -620,7 +693,7 @@ def evaluate_stored_payload(
             merged.pop(key, None)
         response = evaluate_payload(
             merged,
-            config_path,
+            config_source,
             default_news_events=default_news_events,
             default_news_age_seconds=default_news_age_seconds,
             default_market_closures=default_market_closures,
@@ -636,7 +709,7 @@ def evaluate_stored_payload(
         request_hash=request_hash,
         action=request.action.value,
         symbol=request.symbol,
-        occurred_at=request.requested_at,
+        occurred_at=received_at,
         evaluator=evaluator,
     )
 
@@ -674,6 +747,13 @@ def execution_result_payload(
         _required(payload, "occurred_at"),
         "occurred_at",
     )
+    received_at = datetime.now(timezone.utc)
+    if occurred_at.astimezone(timezone.utc) > (
+        received_at + timedelta(seconds=30)
+    ):
+        raise RequestError(
+            "occurred_at is more than 30 seconds in the future"
+        )
     platform_status = str(payload.get("platform_status", ""))
     platform_order_id = str(payload.get("platform_order_id", ""))
     detail = json.dumps(
@@ -701,7 +781,7 @@ def execution_result_payload(
         request_hash=_canonical_hash(execution_identity),
         action=action.value,
         symbol=symbol,
-        occurred_at=occurred_at,
+        occurred_at=received_at,
         outcome=outcome,
         detail=detail,
     )
@@ -712,14 +792,16 @@ def news_status_payload(
     state_store: StateStore,
     news_events: list[NewsEvent],
     news_age_seconds: int | None,
-    config_path: str | Path,
+    config_source: ConfigSource,
 ) -> dict[str, Any]:
     account_id = _account_id(_required(payload, "account_id"))
     symbol = str(_required(payload, "symbol")).upper()
-    now = _timestamp(_required(payload, "now"), "now")
+    client_now = _timestamp(_required(payload, "now"), "now")
+    _validate_clock_skew(client_now, "now")
+    now = datetime.now(timezone.utc)
     account = state_store.get_account(account_id)
     profile, rule_version = _profile(
-        config_path,
+        config_source,
         {
             "account_type": account.account_type.value,
             "phase": account.phase.value,
@@ -763,6 +845,12 @@ def news_status_payload(
         )
         hard_before = timedelta(minutes=profile.news_hard_before_minutes)
         hard_after = timedelta(minutes=profile.news_hard_after_minutes)
+        force_flat_before = timedelta(
+            minutes=profile.news_force_flat_before_minutes
+        )
+        cancel_pending_before = timedelta(
+            minutes=profile.news_cancel_pending_before_minutes
+        )
 
         if -internal_after <= delta <= internal_before:
             open_blocked = True
@@ -771,9 +859,13 @@ def news_status_payload(
             hard_window = True
         if (
             is_restricted_account
-            and hard_before < delta <= internal_before
+            and hard_before < delta <= force_flat_before
         ):
             force_flat = True
+        if (
+            is_restricted_account
+            and hard_before < delta <= cancel_pending_before
+        ):
             cancel_pending = True
 
     return {
@@ -796,14 +888,16 @@ def market_status_payload(
     state_store: StateStore,
     closures: list[MarketClosure],
     market_age_seconds: int | None,
-    config_path: str | Path,
+    config_source: ConfigSource,
 ) -> dict[str, Any]:
     account_id = _account_id(_required(payload, "account_id"))
     symbol = str(_required(payload, "symbol")).upper()
-    now = _timestamp(_required(payload, "now"), "now")
+    client_now = _timestamp(_required(payload, "now"), "now")
+    _validate_clock_skew(client_now, "now")
+    now = datetime.now(timezone.utc)
     account = state_store.get_account(account_id)
     profile, rule_version = _profile(
-        config_path,
+        config_source,
         {
             "account_type": account.account_type.value,
             "phase": account.phase.value,
@@ -814,8 +908,7 @@ def market_status_payload(
         profile.phase == AccountPhase.FTMO_ACCOUNT
         and profile.style == AccountStyle.STANDARD
     )
-    with Path(config_path).open("r", encoding="utf-8") as handle:
-        config = json.load(handle)
+    config = _load_config(config_source)
     max_age = int(
         config.get("market_close_controls", {}).get(
             "max_schedule_age_seconds",
@@ -906,14 +999,14 @@ def _jsonable(value: Any) -> Any:
 
 def evaluate_payload(
     payload: Mapping[str, Any],
-    config_path: str | Path,
+    config_source: ConfigSource,
     default_news_events: list[NewsEvent] | None = None,
     default_news_age_seconds: int | None = None,
     default_market_closures: list[MarketClosure] | None = None,
     default_market_age_seconds: int | None = None,
     day_timezone: str = "Europe/Prague",
 ) -> dict[str, Any]:
-    profile, rule_version = _profile(config_path, payload)
+    profile, rule_version = _profile(config_source, payload)
     snapshot = _snapshot(_required(payload, "snapshot"))
     request = _trade_request(_required(payload, "request"))
     frequency = _frequency(payload.get("frequency"))
@@ -935,8 +1028,7 @@ def evaluate_payload(
         "market_data_age_seconds",
         default_market_age_seconds,
     )
-    with Path(config_path).open("r", encoding="utf-8") as handle:
-        config = json.load(handle)
+    config = _load_config(config_source)
     max_market_age = int(
         config.get("market_close_controls", {}).get(
             "max_schedule_age_seconds",
@@ -1008,9 +1100,9 @@ def evaluate_payload(
 
 def position_size_payload(
     payload: Mapping[str, Any],
-    config_path: str | Path,
+    config_source: ConfigSource,
 ) -> dict[str, Any]:
-    profile, rule_version = _profile(config_path, payload)
+    profile, rule_version = _profile(config_source, payload)
     snapshot = _snapshot(_required(payload, "snapshot"))
     engine = RiskEngine(profile)
     account_status = engine.status(snapshot)
@@ -1210,7 +1302,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                         )
                     body = evaluate_stored_payload(
                         payload,
-                        self.risk_server.config_path,
+                        self.risk_server.config,
                         self.risk_server.state_store,
                         request_id,
                         cached_events,
@@ -1233,7 +1325,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                         sanitized.pop(key, None)
                     body = evaluate_payload(
                         sanitized,
-                        self.risk_server.config_path,
+                        self.risk_server.config,
                         default_news_events=cached_events,
                         default_news_age_seconds=cached_news_age,
                         default_market_closures=cached_closures,
@@ -1241,9 +1333,13 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                         day_timezone=self.risk_server.day_timezone,
                     )
             elif self.path == "/v1/position-size":
+                if not self.risk_server.allow_stateless_position_size:
+                    raise EndpointDisabledError(
+                        "stateless /v1/position-size is disabled on this server"
+                    )
                 body = position_size_payload(
                     payload,
-                    self.risk_server.config_path,
+                    self.risk_server.config,
                 )
             elif self.path == "/v1/account-sync":
                 if self.risk_server.state_store is None:
@@ -1253,6 +1349,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                 body = account_sync_payload(
                     payload,
                     self.risk_server.state_store,
+                    self.risk_server.config,
                 )
             elif self.path == "/v1/settlement-sync":
                 if self.risk_server.state_store is None:
@@ -1285,7 +1382,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     self.risk_server.state_store,
                     cached_events,
                     cached_news_age,
-                    self.risk_server.config_path,
+                    self.risk_server.config,
                 )
             elif self.path == "/v1/market-status":
                 if self.risk_server.state_store is None:
@@ -1304,7 +1401,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     self.risk_server.state_store,
                     cached_closures,
                     cached_market_age,
-                    self.risk_server.config_path,
+                    self.risk_server.config,
                 )
             elif self.path == "/v1/news-sync":
                 events = _news_events(_required(payload, "events"))
@@ -1322,15 +1419,28 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     )
                 age = max(0, int(age_seconds))
                 with self.risk_server.news_lock:
-                    if (
-                        self.risk_server.news_fetched_at is not None
-                        and fetched_at.astimezone(timezone.utc)
-                        < self.risk_server.news_fetched_at.astimezone(
+                    incoming_at = fetched_at.astimezone(timezone.utc)
+                    cached_at = (
+                        self.risk_server.news_fetched_at.astimezone(
                             timezone.utc
                         )
+                        if self.risk_server.news_fetched_at is not None
+                        else None
+                    )
+                    if (
+                        cached_at is not None
+                        and incoming_at < cached_at
                     ):
                         raise RequestError(
                             "news calendar update is older than the cached update"
+                        )
+                    if (
+                        cached_at is not None
+                        and incoming_at == cached_at
+                        and events != self.risk_server.news_events
+                    ):
+                        raise RequestError(
+                            "news calendar timestamp already has different content"
                         )
                     self.risk_server.news_events = events
                     self.risk_server.news_fetched_at = fetched_at
@@ -1357,15 +1467,28 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     )
                 age = max(0, int(age_seconds))
                 with self.risk_server.market_lock:
-                    if (
-                        self.risk_server.market_fetched_at is not None
-                        and fetched_at.astimezone(timezone.utc)
-                        < self.risk_server.market_fetched_at.astimezone(
+                    incoming_at = fetched_at.astimezone(timezone.utc)
+                    cached_at = (
+                        self.risk_server.market_fetched_at.astimezone(
                             timezone.utc
                         )
+                        if self.risk_server.market_fetched_at is not None
+                        else None
+                    )
+                    if (
+                        cached_at is not None
+                        and incoming_at < cached_at
                     ):
                         raise RequestError(
                             "market calendar update is older than the cached update"
+                        )
+                    if (
+                        cached_at is not None
+                        and incoming_at == cached_at
+                        and closures != self.risk_server.market_closures
+                    ):
+                        raise RequestError(
+                            "market calendar timestamp already has different content"
                         )
                     self.risk_server.market_closures = closures
                     self.risk_server.market_fetched_at = fetched_at
@@ -1392,6 +1515,11 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, body)
         except Exception:
             # Do not leak stack traces or local paths to a platform adapter.
+            LOGGER.exception(
+                "Unhandled risk service error request_id=%s endpoint=%s",
+                request_id,
+                self.path,
+            )
             body = {
                 "ok": False,
                 "error": "internal risk service error",
@@ -1418,6 +1546,8 @@ class RiskHTTPServer(ThreadingHTTPServer):
         max_body_bytes: int = 1_000_000,
         state_path: str | Path | None = None,
         allow_stateless_evaluate: bool = False,
+        allow_stateless_position_size: bool = False,
+        allow_remote_bind: bool = False,
         read_timeout_seconds: float = 5.0,
     ):
         self.config_path = str(config_path)
@@ -1426,12 +1556,17 @@ class RiskHTTPServer(ThreadingHTTPServer):
         if max_body_bytes <= 0:
             raise ValueError("max_body_bytes must be positive")
         self.allow_stateless_evaluate = allow_stateless_evaluate
+        self.allow_stateless_position_size = allow_stateless_position_size
         self.read_timeout_seconds = read_timeout_seconds
         if read_timeout_seconds <= 0:
             raise ValueError("read_timeout_seconds must be positive")
-        self.require_auth = bool(auth_token) or not _is_loopback_host(
-            server_address[0]
-        )
+        loopback_bind = _is_loopback_host(server_address[0])
+        if not loopback_bind and not allow_remote_bind:
+            raise ValueError(
+                "non-loopback bind requires explicit allow_remote_bind=True; "
+                "prefer a loopback listener behind an authenticated TLS proxy"
+            )
+        self.require_auth = bool(auth_token) or not loopback_bind
         if self.require_auth and not auth_token:
             raise ValueError(
                 "auth_token is required when the API is not bound to loopback"
@@ -1447,9 +1582,9 @@ class RiskHTTPServer(ThreadingHTTPServer):
         self.market_closures: list[MarketClosure] = []
         self.market_fetched_at: datetime | None = None
         self.audit_path = os.environ.get("RISK_AUDIT_PATH", "")
-        with Path(config_path).open("r", encoding="utf-8") as handle:
-            config = json.load(handle)
+        config = dict(_load_config(config_path))
         validate_config(config)
+        self.config = config
         self.rule_version = str(config["rule_version"])
         self.day_timezone = str(
             config.get("ftmo_day_timezone", "Europe/Prague")
@@ -1498,7 +1633,15 @@ class RiskHTTPServer(ThreadingHTTPServer):
             separators=(",", ":"),
         )
         with self.audit_lock:
-            with path.open("a", encoding="utf-8") as handle:
+            flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, flags, 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            else:
+                os.chmod(path, 0o600)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
 
     def allow_request(self, client: str) -> bool:
@@ -1528,6 +1671,8 @@ def make_server(
     auth_token: str = "",
     state_path: str | Path | None = None,
     allow_stateless_evaluate: bool = False,
+    allow_stateless_position_size: bool = False,
+    allow_remote_bind: bool = False,
     read_timeout_seconds: float = 5.0,
 ) -> RiskHTTPServer:
     return RiskHTTPServer(
@@ -1536,6 +1681,8 @@ def make_server(
         auth_token=auth_token,
         state_path=state_path,
         allow_stateless_evaluate=allow_stateless_evaluate,
+        allow_stateless_position_size=allow_stateless_position_size,
+        allow_remote_bind=allow_remote_bind,
         read_timeout_seconds=read_timeout_seconds,
     )
 
@@ -1558,6 +1705,27 @@ def main() -> None:
         default=os.environ.get("RISK_STATE_PATH", "runtime/risk-state.db"),
         help="SQLite path for account and frequency state.",
     )
+    parser.add_argument(
+        "--allow-remote-bind",
+        action="store_true",
+        help=(
+            "Allow a non-loopback listener. Use only behind an authenticated "
+            "TLS proxy or equivalent private transport."
+        ),
+    )
+    parser.add_argument(
+        "--allow-stateless-evaluate",
+        action="store_true",
+        help="Enable stateless evaluation for an isolated test/replay instance.",
+    )
+    parser.add_argument(
+        "--allow-stateless-position-size",
+        action="store_true",
+        help=(
+            "Enable stateless position sizing for an isolated test/replay "
+            "instance."
+        ),
+    )
     args = parser.parse_args()
     if not args.token:
         parser.error(
@@ -1570,6 +1738,9 @@ def main() -> None:
         args.config,
         args.token,
         state_path=args.state,
+        allow_stateless_evaluate=args.allow_stateless_evaluate,
+        allow_stateless_position_size=args.allow_stateless_position_size,
+        allow_remote_bind=args.allow_remote_bind,
     )
     print(
         f"FTMO risk API listening on http://{args.host}:{args.port} "
