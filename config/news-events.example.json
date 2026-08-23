@@ -1,0 +1,12 @@
+{
+  "fetched_at": "2026-08-22T12:00:00+00:00",
+  "events": [
+    {
+      "event_id": "NFP-2026-08-22",
+      "release_time": "2026-08-22T12:30:00+00:00",
+      "affected_symbols": ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"],
+      "importance": "high",
+      "source": "company-news-mapper"
+    }
+  ]
+}

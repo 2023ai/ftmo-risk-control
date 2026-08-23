@@ -1,0 +1,54 @@
+{
+  "rule_version": "ftmo-v2-2026-08-22",
+  "ftmo_day_timezone": "Europe/Prague",
+  "accounts": {
+    "one_step": {
+      "daily_loss_pct": "0.03",
+      "max_loss_pct": "0.10",
+      "max_loss_mode": "eod_trailing"
+    },
+    "two_step": {
+      "daily_loss_pct": "0.05",
+      "max_loss_pct": "0.10",
+      "max_loss_mode": "static"
+    }
+  },
+  "internal_controls": {
+    "daily_stop_pct": {
+      "one_step": "0.024",
+      "two_step": "0.040"
+    },
+    "max_loss_stop_pct": "0.080",
+    "warning_utilization_pct": "0.50",
+    "reduce_size_utilization_pct": "0.70",
+    "lock_utilization_pct": "0.80",
+    "single_trade_risk_pct": "0.0025",
+    "max_open_risk_pct": "0.010",
+    "daily_buffer_fraction_per_trade": "0.20",
+    "max_loss_buffer_fraction_per_trade": "0.10"
+  },
+  "news_controls": {
+    "ftmo_hard_before_minutes": 2,
+    "ftmo_hard_after_minutes": 2,
+    "internal_before_minutes": 10,
+    "internal_after_minutes": 10,
+    "force_flat_before_ftmo_window_minutes": 10,
+    "cancel_pending_before_ftmo_window_minutes": 10,
+    "restricted_account_phase": "ftmo_account",
+    "restricted_account_style": "standard"
+  },
+  "frequency_controls": {
+    "max_opens_5m": 3,
+    "max_opens_1h": 10,
+    "max_opens_day": 30,
+    "warning_requests_day": 500,
+    "stop_requests_day": 1000,
+    "min_modify_interval_seconds": 10
+  },
+  "market_close_controls": {
+    "force_flat_before_minutes": 10,
+    "gap_open_block_before_minutes": 120,
+    "restricted_break_min_minutes": 120,
+    "max_schedule_age_seconds": 3600
+  }
+}
