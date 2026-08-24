@@ -29,6 +29,30 @@ from .risk_engine import (
 )
 
 
+ACCOUNT_CREDENTIAL_SCOPES = frozenset(
+    {
+        "account:sync",
+        "account:settlement",
+        "trade:evaluate",
+        "trade:execution",
+        "calendar:read",
+        "qualification:read",
+        "qualification:write",
+    }
+)
+
+# The default is deliberately limited to the platform adapter's runtime work.
+# Settlement and qualification imports must use separately issued credentials.
+PLATFORM_CREDENTIAL_SCOPES = frozenset(
+    {
+        "account:sync",
+        "trade:evaluate",
+        "trade:execution",
+        "calendar:read",
+    }
+)
+
+
 @dataclass(frozen=True)
 class StoredAccount:
     account_id: str
@@ -70,6 +94,19 @@ class StateStore:
         self.path = str(path)
         self.day_timezone = day_timezone
         self._lock = threading.RLock()
+        self._memory_connection: sqlite3.Connection | None = None
+        self._memory_uri: str | None = None
+        if self.path == ":memory:":
+            self._memory_uri = (
+                f"file:ftmo-risk-{id(self)}?mode=memory&cache=shared"
+            )
+            self._memory_connection = sqlite3.connect(
+                self._memory_uri,
+                uri=True,
+                timeout=5,
+                check_same_thread=False,
+            )
+            self._memory_connection.row_factory = sqlite3.Row
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._secure_database_file()
         self._initialize()
@@ -108,9 +145,18 @@ class StateStore:
                 os.close(descriptor)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
+        if self._memory_uri is not None and self._memory_connection is None:
+            raise RuntimeError("state store is closed")
+        if self._memory_connection is not None:
+            connection = self._memory_connection
+        else:
+            connection = sqlite3.connect(self.path, timeout=5)
+            connection.row_factory = sqlite3.Row
+        connection.execute(
+            "PRAGMA journal_mode=MEMORY"
+            if self._memory_connection is not None
+            else "PRAGMA journal_mode=WAL"
+        )
         connection.execute("PRAGMA foreign_keys=ON")
         self._secure_database_sidecars()
         return connection
@@ -120,8 +166,21 @@ class StateStore:
         connection = self._connect()
         try:
             yield connection
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
         finally:
-            connection.close()
+            if connection.in_transaction:
+                connection.rollback()
+            if self._memory_connection is None:
+                connection.close()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._memory_connection is not None:
+                self._memory_connection.close()
+                self._memory_connection = None
 
     def _initialize(self) -> None:
         with self._lock, self._connection() as connection:
@@ -139,6 +198,8 @@ class StateStore:
                     balance TEXT NOT NULL,
                     equity TEXT NOT NULL,
                     current_open_risk TEXT NOT NULL,
+                    open_positions_count INTEGER,
+                    pending_orders_count INTEGER,
                     as_of TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     data_uncertain INTEGER NOT NULL DEFAULT 0,
@@ -300,6 +361,16 @@ class StateStore:
                     "ALTER TABLE accounts ADD COLUMN breach_latched "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            if "open_positions_count" not in columns:
+                connection.execute(
+                    "ALTER TABLE accounts ADD COLUMN open_positions_count "
+                    "INTEGER"
+                )
+            if "pending_orders_count" not in columns:
+                connection.execute(
+                    "ALTER TABLE accounts ADD COLUMN pending_orders_count "
+                    "INTEGER"
+                )
             execution_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -387,6 +458,10 @@ class StateStore:
             raise ValueError("calendar_type must be news or market")
         if fetched_at.tzinfo is None:
             raise ValueError("fetched_at must be timezone-aware")
+        if not isinstance(payload, list):
+            raise ValueError("calendar payload must be a list")
+        if not rule_version.strip():
+            raise ValueError("rule_version must be non-empty")
         payload_json = json.dumps(
             payload,
             ensure_ascii=True,
@@ -415,7 +490,10 @@ class StateStore:
                     )
                 if (
                     fetched_at_utc == existing_at
-                    and existing["content_hash"] != content_hash
+                    and (
+                        existing["content_hash"] != content_hash
+                        or existing["rule_version"] != rule_version
+                    )
                 ):
                     raise ValueError(
                         f"{calendar_type} calendar timestamp already has "
@@ -496,6 +574,8 @@ class StateStore:
         digest = self._credential_digest(secret, salt)
         created_at = now.astimezone(timezone.utc)
         scopes_tuple = tuple(sorted(set(scopes)))
+        if any(scope not in ACCOUNT_CREDENTIAL_SCOPES for scope in scopes_tuple):
+            raise ValueError("credential scopes contain an unsupported scope")
         with self._lock, self._connection() as connection:
             connection.execute(
                 """
@@ -551,7 +631,15 @@ class StateStore:
             ).fetchone()
             if row is None:
                 return None
-            record = self._credential_record_from_row(row)
+            try:
+                record = self._credential_record_from_row(row)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if any(
+                item not in ACCOUNT_CREDENTIAL_SCOPES
+                for item in record.scopes
+            ):
+                return None
             valid = (
                 record.not_before.astimezone(timezone.utc) <= now
                 and record.expires_at.astimezone(timezone.utc) > now
@@ -559,10 +647,7 @@ class StateStore:
                     record.revoked_at is None
                     or record.revoked_at.astimezone(timezone.utc) > now
                 )
-                and (
-                    scope in record.scopes
-                    or "admin:*" in record.scopes
-                )
+                and scope in record.scopes
             )
             digest = self._credential_digest(
                 secret,
@@ -623,6 +708,11 @@ class StateStore:
             selected_scopes = tuple(
                 scopes or tuple(json.loads(row["scopes_json"]))
             )
+            if any(
+                scope not in ACCOUNT_CREDENTIAL_SCOPES
+                for scope in selected_scopes
+            ):
+                raise ValueError("credential scopes contain an unsupported scope")
             old_revoked_at = now + timedelta(seconds=overlap_seconds)
             connection.execute(
                 """
@@ -719,6 +809,57 @@ class StateStore:
                 ).fetchall()
         return [self._credential_record_from_row(row) for row in rows]
 
+    def credential_metrics(
+        self,
+        *,
+        now: datetime | None = None,
+        expiring_within_seconds: int = 86400,
+    ) -> dict[str, int]:
+        if expiring_within_seconds < 0:
+            raise ValueError("expiring_within_seconds cannot be negative")
+        now_utc = (now or datetime.now(timezone.utc)).astimezone(
+            timezone.utc
+        )
+        horizon = now_utc + timedelta(seconds=expiring_within_seconds)
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT not_before, expires_at, revoked_at
+                FROM account_credentials
+                """
+            ).fetchall()
+        counts = {
+            "active": 0,
+            "expired": 0,
+            "expiring_soon": 0,
+            "not_yet_active": 0,
+        }
+        for row in rows:
+            revoked_at = (
+                datetime.fromisoformat(row["revoked_at"])
+                if row["revoked_at"]
+                else None
+            )
+            if revoked_at is not None and revoked_at.astimezone(
+                timezone.utc
+            ) <= now_utc:
+                continue
+            not_before = datetime.fromisoformat(row["not_before"]).astimezone(
+                timezone.utc
+            )
+            expires_at = datetime.fromisoformat(row["expires_at"]).astimezone(
+                timezone.utc
+            )
+            if not_before > now_utc:
+                counts["not_yet_active"] += 1
+            elif expires_at <= now_utc:
+                counts["expired"] += 1
+            else:
+                counts["active"] += 1
+                if expires_at <= horizon:
+                    counts["expiring_soon"] += 1
+        return counts
+
     def record_closed_trade(
         self,
         *,
@@ -737,8 +878,16 @@ class StateStore:
             raise ValueError("closed_at must be timezone-aware")
         if not trade_id:
             raise ValueError("trade_id must be non-empty")
+        if not cycle_id:
+            raise ValueError("cycle_id must be non-empty")
         if not source.strip():
             raise ValueError("source must be non-empty")
+        if not ftmo_day:
+            raise ValueError("ftmo_day must be non-empty")
+        if ftmo_day_key(closed_at, self.day_timezone) != ftmo_day:
+            raise ValueError("ftmo_day does not match closed_at")
+        if not net_profit.is_finite():
+            raise ValueError("net_profit must be finite")
         payload = {
             "account_id": account_id,
             "trade_id": trade_id,
@@ -754,11 +903,20 @@ class StateStore:
         with self._lock, self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             account = connection.execute(
-                "SELECT 1 FROM accounts WHERE account_id = ?",
+                "SELECT phase FROM accounts WHERE account_id = ?",
                 (account_id,),
             ).fetchone()
             if account is None:
                 raise KeyError(f"unknown account_id: {account_id}")
+            phase_order = {
+                AccountPhase.EVALUATION.value: 0,
+                AccountPhase.VERIFICATION.value: 1,
+                AccountPhase.FTMO_ACCOUNT.value: 2,
+            }
+            if phase_order[phase.value] > phase_order[account["phase"]]:
+                raise ValueError(
+                    "closed trade phase cannot be ahead of account phase"
+                )
             existing = connection.execute(
                 """
                 SELECT closed_at, ftmo_day, net_profit, symbol, source,
@@ -876,6 +1034,8 @@ class StateStore:
             raise ValueError(
                 "complete_through cannot be before history_start_at"
             )
+        if not source.strip():
+            raise ValueError("source must be non-empty")
         now = datetime.now(timezone.utc)
         start_utc = history_start_at.astimezone(timezone.utc)
         complete_utc = complete_through.astimezone(timezone.utc)
@@ -964,15 +1124,32 @@ class StateStore:
     ) -> dict[str, Any]:
         if opened_at.tzinfo is None:
             raise ValueError("opened_at must be timezone-aware")
+        if not cycle_id:
+            raise ValueError("cycle_id must be non-empty")
+        if not ftmo_day:
+            raise ValueError("ftmo_day must be non-empty")
+        if ftmo_day_key(opened_at, self.day_timezone) != ftmo_day:
+            raise ValueError("ftmo_day does not match opened_at")
+        if not source.strip():
+            raise ValueError("source must be non-empty")
         opened_at_utc = opened_at.astimezone(timezone.utc)
         with self._lock, self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             account = connection.execute(
-                "SELECT 1 FROM accounts WHERE account_id = ?",
+                "SELECT phase FROM accounts WHERE account_id = ?",
                 (account_id,),
             ).fetchone()
             if account is None:
                 raise KeyError(f"unknown account_id: {account_id}")
+            phase_order = {
+                AccountPhase.EVALUATION.value: 0,
+                AccountPhase.VERIFICATION.value: 1,
+                AccountPhase.FTMO_ACCOUNT.value: 2,
+            }
+            if phase_order[phase.value] > phase_order[account["phase"]]:
+                raise ValueError(
+                    "trading-day phase cannot be ahead of account phase"
+                )
             existing = connection.execute(
                 """
                 SELECT first_opened_at, source, request_id
@@ -1102,20 +1279,38 @@ class StateStore:
                 "accounts",
                 "calendar_snapshots",
                 "account_credentials",
+                "activity",
+                "daily_settlements",
+                "decisions",
+                "executions",
+                "closed_trades",
+                "qualification_history_status",
+                "qualification_trading_days",
+                "backup_runs",
             }
             return bool(row and row[0] == 1 and required <= tables)
         except (OSError, sqlite3.DatabaseError):
             return False
 
-    def unknown_execution_count(self) -> int:
+    def unknown_execution_count(self, account_id: str | None = None) -> int:
         with self._lock, self._connection() as connection:
-            row = connection.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM executions
-                WHERE outcome = 'unknown'
-                """
-            ).fetchone()
+            if account_id is None:
+                row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM executions
+                    WHERE outcome = 'unknown'
+                    """
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM executions
+                    WHERE account_id = ? AND outcome = 'unknown'
+                    """,
+                    (account_id,),
+                ).fetchone()
         return int(row["count"]) if row is not None else 0
 
     def record_backup_event(
@@ -1150,7 +1345,16 @@ class StateStore:
                 GROUP BY operation, success
                 """
             ).fetchall()
-            latest = connection.execute(
+            latest_success = connection.execute(
+                """
+                SELECT created_at, success
+                FROM backup_runs
+                WHERE operation = 'backup' AND success = 1
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            latest_attempt = connection.execute(
                 """
                 SELECT created_at, success
                 FROM backup_runs
@@ -1173,10 +1377,19 @@ class StateStore:
             if key in counts:
                 counts[key] = int(row["count"])
         counts["last_backup_at"] = (
-            latest["created_at"] if latest is not None else None
+            latest_success["created_at"]
+            if latest_success is not None
+            else None
         )
         counts["last_backup_success"] = (
-            bool(latest["success"]) if latest is not None else None
+            bool(latest_attempt["success"])
+            if latest_attempt is not None
+            else None
+        )
+        counts["last_backup_attempt_at"] = (
+            latest_attempt["created_at"]
+            if latest_attempt is not None
+            else None
         )
         return counts
 
@@ -1237,6 +1450,8 @@ class StateStore:
         balance: Decimal,
         equity: Decimal,
         current_open_risk: Decimal,
+        open_positions_count: int | None = None,
+        pending_orders_count: int | None = None,
         as_of: datetime,
         received_at: datetime | None = None,
         profile: RuleProfile | None = None,
@@ -1250,8 +1465,29 @@ class StateStore:
             raise ValueError("received_at must be timezone-aware")
         if initial_capital <= 0:
             raise ValueError("initial_capital must be positive")
+        for decimal_value, field_name in (
+            (initial_capital, "initial_capital"),
+            (balance, "balance"),
+            (equity, "equity"),
+            (current_open_risk, "current_open_risk"),
+        ):
+            if (
+                not isinstance(decimal_value, Decimal)
+                or not decimal_value.is_finite()
+            ):
+                raise ValueError(f"{field_name} must be a finite decimal")
         if current_open_risk < 0:
             raise ValueError("current_open_risk cannot be negative")
+        for inventory_value, field_name in (
+            (open_positions_count, "open_positions_count"),
+            (pending_orders_count, "pending_orders_count"),
+        ):
+            if inventory_value is not None and (
+                isinstance(inventory_value, bool)
+                or not isinstance(inventory_value, int)
+                or inventory_value < 0
+            ):
+                raise ValueError(f"{field_name} must be non-negative")
         if account_type == AccountType.ONE_STEP and style == AccountStyle.SWING:
             raise ValueError("Swing style is only available for 2-Step accounts")
         if (
@@ -1285,6 +1521,15 @@ class StateStore:
                     )
                 day_start_balance = bootstrap_day_start_balance
                 highest_settled_balance = bootstrap_highest_settled_balance
+                if (
+                    not isinstance(day_start_balance, Decimal)
+                    or not day_start_balance.is_finite()
+                    or not isinstance(highest_settled_balance, Decimal)
+                    or not highest_settled_balance.is_finite()
+                ):
+                    raise ValueError(
+                        "bootstrap balances must be finite decimals"
+                    )
                 data_uncertain = False
                 day_locked = False
                 breach_latched = False
@@ -1293,6 +1538,11 @@ class StateStore:
                 if highest_settled_balance < initial_capital:
                     raise ValueError(
                         "highest_settled_balance cannot be below initial_capital"
+                    )
+                if highest_settled_balance < day_start_balance:
+                    raise ValueError(
+                        "highest_settled_balance cannot be below "
+                        "day_start_balance"
                     )
             else:
                 if row["account_type"] != account_type.value:
@@ -1304,13 +1554,34 @@ class StateStore:
                 if row["style"] != style.value:
                     raise ValueError("style cannot change after bootstrap")
                 stored_as_of = datetime.fromisoformat(row["as_of"])
+                as_of_utc = as_of.astimezone(timezone.utc)
+                stored_as_of_utc = stored_as_of.astimezone(timezone.utc)
                 if (
-                    as_of.astimezone(timezone.utc)
-                    < stored_as_of.astimezone(timezone.utc)
+                    as_of_utc < stored_as_of_utc
                 ):
                     raise ValueError(
                         "account sync timestamp cannot move backwards"
                     )
+                if as_of_utc == stored_as_of_utc:
+                    stored_inventory = (
+                        row["open_positions_count"],
+                        row["pending_orders_count"],
+                    )
+                    incoming_inventory = (
+                        open_positions_count,
+                        pending_orders_count,
+                    )
+                    if (
+                        Decimal(row["balance"]) != balance
+                        or Decimal(row["equity"]) != equity
+                        or Decimal(row["current_open_risk"])
+                        != current_open_risk
+                        or stored_inventory != incoming_inventory
+                    ):
+                        raise ValueError(
+                            "account sync timestamp already has different "
+                            "snapshot content"
+                        )
                 phase_order = {
                     AccountPhase.EVALUATION.value: 0,
                     AccountPhase.VERIFICATION.value: 1,
@@ -1396,6 +1667,8 @@ class StateStore:
                     current_open_risk=current_open_risk,
                     as_of=as_of,
                     data_uncertain=data_uncertain,
+                    open_positions_count=open_positions_count,
+                    pending_orders_count=pending_orders_count,
                 )
                 observed_status = RiskEngine(
                     profile,
@@ -1411,9 +1684,11 @@ class StateStore:
                 INSERT INTO accounts (
                     account_id, account_type, phase, style, initial_capital,
                     ftmo_day, day_start_balance, highest_settled_balance,
-                    balance, equity, current_open_risk, as_of, updated_at,
+                    balance, equity, current_open_risk, open_positions_count,
+                    pending_orders_count,
+                    as_of, updated_at,
                     data_uncertain, day_locked, breach_latched
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id) DO UPDATE SET
                     phase = excluded.phase,
                     style = excluded.style,
@@ -1423,6 +1698,8 @@ class StateStore:
                     balance = excluded.balance,
                     equity = excluded.equity,
                     current_open_risk = excluded.current_open_risk,
+                    open_positions_count = excluded.open_positions_count,
+                    pending_orders_count = excluded.pending_orders_count,
                     as_of = excluded.as_of,
                     updated_at = excluded.updated_at,
                     data_uncertain = excluded.data_uncertain,
@@ -1441,6 +1718,8 @@ class StateStore:
                     str(balance),
                     str(equity),
                     str(current_open_risk),
+                    open_positions_count,
+                    pending_orders_count,
                     as_of.isoformat(),
                     updated_at.isoformat(),
                     int(data_uncertain),
@@ -1485,6 +1764,16 @@ class StateStore:
                 data_uncertain=bool(row["data_uncertain"]),
                 day_locked=bool(row["day_locked"]),
                 breach_latched=bool(row["breach_latched"]),
+                open_positions_count=(
+                    int(row["open_positions_count"])
+                    if row["open_positions_count"] is not None
+                    else None
+                ),
+                pending_orders_count=(
+                    int(row["pending_orders_count"])
+                    if row["pending_orders_count"] is not None
+                    else None
+                ),
             ),
         )
 
@@ -1544,6 +1833,10 @@ class StateStore:
         request_id: str,
         detail: str,
     ) -> None:
+        if kind not in {"request", "open", "modify", "execution"}:
+            raise ValueError("unsupported activity kind")
+        if occurred_at.tzinfo is None:
+            raise ValueError("activity timestamp must be timezone-aware")
         occurred_at_utc = occurred_at.astimezone(timezone.utc)
         connection.execute(
             """
@@ -1578,6 +1871,7 @@ class StateStore:
         symbol: str,
         occurred_at: datetime,
         evaluator: Callable[[StoredAccount, FrequencyState], Mapping[str, Any]],
+        block_on_unknown_execution: bool = False,
     ) -> dict[str, Any]:
         """Evaluate and reserve frequency state atomically for one request."""
 
@@ -1623,6 +1917,30 @@ class StateStore:
                 occurred_at,
             )
             response = dict(evaluator(account, frequency))
+            unknown_count = 0
+            if block_on_unknown_execution:
+                unknown_row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM executions
+                    WHERE account_id = ? AND outcome = 'unknown'
+                    """,
+                    (account_id,),
+                ).fetchone()
+                unknown_count = (
+                    int(unknown_row["count"])
+                    if unknown_row is not None
+                    else 0
+                )
+                decision = response.get("decision")
+                if unknown_count > 0 and isinstance(decision, dict):
+                    decision["code"] = "REJECT_UNKNOWN_EXECUTION"
+                    decision["allowed"] = False
+                    decision["reasons"] = [
+                        "an execution outcome is unresolved; reconcile "
+                        "the platform order before adding risk",
+                    ]
+                    response["unknown_execution_count"] = unknown_count
             response_json = json.dumps(
                 response,
                 ensure_ascii=True,
@@ -1698,19 +2016,34 @@ class StateStore:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 """
-                SELECT request_hash, response_json
+                SELECT request_hash, response_json, action, symbol, outcome
                 FROM executions
                 WHERE account_id = ? AND request_id = ?
                 """,
                 (account_id, request_id),
             ).fetchone()
+            resolving_unknown = False
             if existing is not None:
-                if existing["request_hash"] != request_hash:
+                if (
+                    existing["action"] != action
+                    or existing["symbol"] != symbol.upper()
+                ):
+                    raise ValueError(
+                        "execution request_id has already been used for a "
+                        "different action or symbol"
+                    )
+                if existing["outcome"] == "unknown" and outcome in {
+                    "success",
+                    "failure",
+                }:
+                    resolving_unknown = True
+                elif existing["request_hash"] != request_hash:
                     raise ValueError(
                         "execution request_id has already been used with "
                         "different content"
                     )
-                return json.loads(existing["response_json"])
+                else:
+                    return json.loads(existing["response_json"])
 
             decision = connection.execute(
                 """
@@ -1754,6 +2087,7 @@ class StateStore:
                 "execution_recorded": True,
                 "outcome": outcome,
                 "reservation_released": reservation_released,
+                "resolved_unknown": resolving_unknown,
             }
             response_json = json.dumps(
                 response,
@@ -1761,24 +2095,51 @@ class StateStore:
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            connection.execute(
-                """
-                INSERT INTO executions (
-                    account_id, request_id, request_hash, action, symbol,
-                    outcome, response_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    account_id,
-                    request_id,
-                    request_hash,
-                    action,
-                    symbol.upper(),
-                    outcome,
-                    response_json,
-                    datetime.now(timezone.utc).isoformat(),
-                ),
-            )
+            if resolving_unknown:
+                connection.execute(
+                    """
+                    UPDATE executions
+                    SET request_hash = ?, outcome = ?, response_json = ?,
+                        created_at = ?
+                    WHERE account_id = ? AND request_id = ?
+                    """,
+                    (
+                        request_hash,
+                        outcome,
+                        response_json,
+                        datetime.now(timezone.utc).isoformat(),
+                        account_id,
+                        request_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE activity
+                    SET detail = ?
+                    WHERE account_id = ? AND kind = 'execution'
+                      AND request_id = ?
+                    """,
+                    (detail, account_id, request_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO executions (
+                        account_id, request_id, request_hash, action, symbol,
+                        outcome, response_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        request_id,
+                        request_hash,
+                        action,
+                        symbol.upper(),
+                        outcome,
+                        response_json,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
             self._insert_activity_connection(
                 connection,
                 account_id=account_id,
@@ -1847,6 +2208,11 @@ class StateStore:
         settled_at: datetime,
         source: str,
     ) -> StoredAccount:
+        if (
+            not isinstance(settled_balance, Decimal)
+            or not settled_balance.is_finite()
+        ):
+            raise ValueError("settled_balance must be a finite decimal")
         if settled_balance <= 0:
             raise ValueError("settled_balance must be positive")
         if settled_at.tzinfo is None:
@@ -1855,6 +2221,8 @@ class StateStore:
             raise ValueError("ftmo_day is required")
         if not source.strip():
             raise ValueError("source must be non-empty")
+        if ftmo_day_key(settled_at, self.day_timezone) != ftmo_day:
+            raise ValueError("ftmo_day does not match settled_at")
 
         with self._lock, self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")

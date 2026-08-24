@@ -168,7 +168,14 @@
     const errorBox = document.getElementById("error");
 
     function text(value) {
-      return value === null || value === undefined ? "不适用" : String(value);
+      const raw = value === null || value === undefined ? "不适用" : String(value);
+      return raw.replace(/[&<>"']/g, (character) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+      })[character]);
     }
 
     function statusLabel(status) {
@@ -181,9 +188,15 @@
       return values[status] || [status, "not-applicable"];
     }
 
-    function objective(value, suffix) {
+    function profitTarget(value) {
       if (!value.applicable) return "不适用";
-      return value.met ? "已完成" : `${text(value.progress_pct)}${suffix}`;
+      if (value.met) return "已完成";
+      if (value.open_positions_count === null) return "仓位库存未确认";
+      if (value.pending_orders_count === null) return "挂单库存未确认";
+      if (!value.balance_target_met) return "余额未达标";
+      if (!value.all_positions_closed) return "仍有持仓";
+      if (!value.all_pending_orders_cancelled) return "仍有挂单";
+      return `${text(value.progress_pct)}%`;
     }
 
     function render(accounts) {
@@ -211,11 +224,11 @@
             <td>${text(account.phase)}</td>
             <td>${text(account.history.cycle_id)}</td>
             <td>${text(account.profit_target.net_profit)}</td>
-            <td>${objective(account.profit_target, "%")}</td>
-            <td>${days.applicable ? `${days.completed} / ${days.required}` : "不适用"}</td>
-            <td>${best.applicable ? `${best.ratio} / ${best.limit_ratio}` : "不适用"}</td>
+            <td>${profitTarget(account.profit_target)}</td>
+            <td>${days.applicable ? `${text(days.completed)} / ${text(days.required)}` : "不适用"}</td>
+            <td>${best.applicable ? `${text(best.ratio)} / ${text(best.limit_ratio)}` : "不适用"}</td>
             <td>${account.history.complete && !account.data_uncertain ? "完整" : "需复核"}</td>
-            <td><span class="status ${status[1]}">${status[0]}</span></td>
+            <td><span class="status ${status[1]}">${text(status[0])}</span></td>
           </tr>`;
       }).join("");
     }

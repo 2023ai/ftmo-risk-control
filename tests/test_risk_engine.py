@@ -160,6 +160,17 @@ class RiskEngineTests(unittest.TestCase):
         )
         self.assertEqual(decision.code, DecisionCode.REJECT_RISK)
 
+    def test_negative_volume_is_rejected_before_frequency_or_risk_budget(self):
+        engine = RiskEngine(RuleProfile.two_step_default())
+        request = TradeRequest(
+            **{
+                **open_request(when=self.now).__dict__,
+                "volume": Decimal("-1"),
+            }
+        )
+        decision = engine.evaluate(snapshot(), request, self.frequency)
+        self.assertEqual(decision.code, DecisionCode.REJECT_RISK)
+
     def test_position_size_rounds_down_to_volume_step(self):
         engine = RiskEngine(RuleProfile.two_step_default())
         sized = engine.size_position(
@@ -170,6 +181,18 @@ class RiskEngineTests(unittest.TestCase):
         )
         self.assertEqual(sized.volume, Decimal("2.50"))
         self.assertLessEqual(sized.expected_loss, sized.risk_budget)
+
+    def test_position_size_reserves_estimated_costs(self):
+        engine = RiskEngine(RuleProfile.two_step_default())
+        sized = engine.size_position(
+            snapshot(),
+            loss_per_volume_unit=Decimal("100"),
+            volume_step=Decimal("0.01"),
+            min_volume=Decimal("0.01"),
+            estimated_costs=Decimal("50"),
+        )
+        self.assertEqual(sized.volume, Decimal("2.00"))
+        self.assertEqual(sized.expected_loss, Decimal("250"))
 
     def test_risk_budget_shrinks_when_daily_loss_increases(self):
         engine = RiskEngine(RuleProfile.two_step_default())

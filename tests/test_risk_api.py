@@ -7,16 +7,19 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from http import HTTPStatus
 
-from src.risk_api import make_server
+from src.risk_api import RequestError, evaluate_payload, make_server
 from src.risk_engine import (
     AccountPhase,
     AccountStyle,
     AccountType,
     ftmo_day_key,
 )
+from src.state_store import StateStore
 
 
 UTC = timezone.utc
@@ -32,6 +35,8 @@ def _snapshot(equity="100000"):
         "as_of": "2026-08-22T12:00:00+00:00",
         "current_open_risk": "0",
         "data_age_seconds": 0,
+        "open_positions_count": 0,
+        "pending_orders_count": 0,
     }
 
 
@@ -108,7 +113,9 @@ class RiskAPITests(unittest.TestCase):
         status, body = self.request("GET", "/health")
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
-        self.assertEqual(body["rule_version"], "ftmo-v3-2026-08-23")
+        self.assertEqual(body["rule_version"], "ftmo-v4-2026-08-23")
+        self.assertFalse(body["database_up"])
+        self.assertIsNone(body["unknown_execution_records"])
 
     def test_evaluate_allows_order_within_budget(self):
         payload = {
@@ -234,6 +241,28 @@ class RiskAPITests(unittest.TestCase):
             Decimal("250"),
         )
 
+    def test_position_size_reserves_estimated_costs(self):
+        payload = {
+            "account_type": "two_step",
+            "phase": "evaluation",
+            "style": "standard",
+            "snapshot": _snapshot(),
+            "loss_per_volume_unit": "100",
+            "estimated_costs": "50",
+            "volume_step": "0.01",
+            "min_volume": "0.01",
+        }
+        status, body = self.request("POST", "/v1/position-size", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            Decimal(body["position_size"]["volume"]),
+            Decimal("2.00"),
+        )
+        self.assertEqual(
+            Decimal(body["position_size"]["expected_loss"]),
+            Decimal("250"),
+        )
+
     def test_position_size_returns_zero_when_account_is_locked(self):
         payload = {
             "account_type": "two_step",
@@ -279,6 +308,19 @@ class RiskAPITests(unittest.TestCase):
             self.request("POST", "/v1/evaluate", payload)
         self.assertEqual(context.exception.code, 400)
 
+    def test_invalid_calendar_age_is_bad_request(self):
+        payload = {
+            "account_type": "two_step",
+            "phase": "evaluation",
+            "style": "standard",
+            "snapshot": _snapshot(),
+            "request": _open_request(),
+            "news_data_age_seconds": "0",
+            "market_data_age_seconds": 0,
+        }
+        with self.assertRaises(RequestError):
+            evaluate_payload(payload, "config/ftmo-v2.json")
+
     def test_open_cannot_be_marked_as_risk_reducing(self):
         payload = {
             "account_type": "two_step",
@@ -288,6 +330,21 @@ class RiskAPITests(unittest.TestCase):
             "request": {
                 **_open_request(),
                 "is_risk_increasing": False,
+            },
+        }
+        with self.assertRaises(HTTPError) as context:
+            self.request("POST", "/v1/evaluate", payload)
+        self.assertEqual(context.exception.code, 400)
+
+    def test_negative_trade_volume_is_bad_request(self):
+        payload = {
+            "account_type": "two_step",
+            "phase": "evaluation",
+            "style": "standard",
+            "snapshot": _snapshot(),
+            "request": {
+                **_open_request(),
+                "volume": "-1",
             },
         }
         with self.assertRaises(HTTPError) as context:
@@ -397,6 +454,24 @@ class RiskAPITests(unittest.TestCase):
             )
         self.assertEqual(context.exception.code, 400)
 
+    def test_duplicate_json_keys_are_rejected(self):
+        request = Request(
+            self.base_url + "/v1/news-sync",
+            data=(
+                b'{"fetched_at":"2026-08-22T12:00:00+00:00",'
+                b'"events":[],"events":[]}'
+            ),
+            headers={
+                "Content-Type": "application/json",
+                "X-Risk-Token": "test-token",
+            },
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as context:
+            urlopen(request, timeout=2)
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
+
 
 class SecurityContractTests(unittest.TestCase):
     def test_remote_bind_without_token_is_rejected(self):
@@ -494,7 +569,7 @@ class SecurityContractTests(unittest.TestCase):
                     json.dump(config, target)
                 self.assertEqual(
                     server.config["rule_version"],
-                    "ftmo-v3-2026-08-23",
+                    "ftmo-v4-2026-08-23",
                 )
             finally:
                 server.server_close()
@@ -515,6 +590,51 @@ class SecurityContractTests(unittest.TestCase):
                 self.assertEqual(mode, 0o600)
             finally:
                 server.server_close()
+
+    def test_existing_state_lock_is_checked_before_opening_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "risk.db")
+            server = make_server(
+                "127.0.0.1",
+                0,
+                "config/ftmo-v2.json",
+                auth_token="test-token",
+                state_path=state_path,
+            )
+            try:
+                with patch(
+                    "src.risk_api.StateStore",
+                    side_effect=AssertionError("state store must not open"),
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "already owned by server process",
+                    ):
+                        make_server(
+                            "127.0.0.1",
+                            0,
+                            "config/ftmo-v2.json",
+                            auth_token="test-token",
+                            state_path=state_path,
+                        )
+            finally:
+                server.server_close()
+
+    def test_unsafe_state_lock_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "risk.db")
+            os.mkdir(state_path + ".server.lock")
+            with self.assertRaisesRegex(
+                ValueError,
+                "lock must be a regular file",
+            ):
+                make_server(
+                    "127.0.0.1",
+                    0,
+                    "config/ftmo-v2.json",
+                    auth_token="test-token",
+                    state_path=state_path,
+                )
 
 
 class StatefulRiskAPITests(unittest.TestCase):
@@ -579,6 +699,8 @@ class StatefulRiskAPITests(unittest.TestCase):
                 "balance": "100000",
                 "equity": "100000",
                 "current_open_risk": "0",
+                "open_positions_count": 0,
+                "pending_orders_count": 0,
                 "as_of": datetime.now(UTC).isoformat(),
             },
         )
@@ -821,6 +943,78 @@ class StatefulRiskAPITests(unittest.TestCase):
             1,
         )
 
+    def test_unknown_execution_is_a_server_side_risk_lock_and_can_resolve(self):
+        account_id = "stateful-server-unknown-lock"
+        self.sync_account(account_id)
+        first_request_id = "server-unknown-open-r1"
+        self.request(
+            "/v1/evaluate",
+            {
+                "account_id": account_id,
+                "request": _open_request(datetime.now(UTC).isoformat()),
+            },
+            request_id=first_request_id,
+        )
+        self.request(
+            "/v1/execution-result",
+            {
+                "account_id": account_id,
+                "request_id": first_request_id,
+                "outcome": "unknown",
+                "action": "open",
+                "symbol": "EURUSD",
+                "occurred_at": datetime.now(UTC).isoformat(),
+                "platform_status": "timeout",
+            },
+        )
+
+        _, blocked = self.request(
+            "/v1/evaluate",
+            {
+                "account_id": account_id,
+                "request": _open_request(datetime.now(UTC).isoformat()),
+            },
+            request_id="server-unknown-open-r2",
+        )
+        self.assertEqual(
+            blocked["decision"]["code"],
+            "REJECT_UNKNOWN_EXECUTION",
+        )
+
+        _, reducing = self.request(
+            "/v1/evaluate",
+            {
+                "account_id": account_id,
+                "request": {
+                    "symbol": "EURUSD",
+                    "action": "close",
+                    "requested_at": datetime.now(UTC).isoformat(),
+                    "is_risk_increasing": False,
+                },
+            },
+            request_id="server-unknown-close-r1",
+        )
+        self.assertEqual(reducing["decision"]["code"], "ALLOW")
+
+        _, resolved = self.request(
+            "/v1/execution-result",
+            {
+                "account_id": account_id,
+                "request_id": first_request_id,
+                "outcome": "failure",
+                "action": "open",
+                "symbol": "EURUSD",
+                "occurred_at": datetime.now(UTC).isoformat(),
+                "platform_status": "rejected",
+            },
+        )
+        self.assertTrue(resolved["resolved_unknown"])
+        self.assertTrue(resolved["reservation_released"])
+        self.assertEqual(
+            self.server.state_store.unknown_execution_count(account_id),
+            0,
+        )
+
     def test_failed_modify_releases_cooldown_reservation(self):
         account_id = "stateful-modify-release"
         self.sync_account(account_id)
@@ -1044,6 +1238,25 @@ class StatefulRiskAPITests(unittest.TestCase):
         self.assertTrue(body["hard_window"])
         self.assertTrue(body["emergency_alert"])
         self.assertFalse(body["force_flat"])
+        self.assertTrue(body["cancel_pending"])
+
+    def test_stale_news_status_cancels_pending_orders(self):
+        account_id = "stateful-stale-news"
+        self.sync_account(account_id, phase="ftmo_account")
+        with self.server.news_lock:
+            self.server.news_fetched_at = datetime.now(UTC) - timedelta(
+                seconds=61
+            )
+        _, body = self.request(
+            "/v1/news-status",
+            {
+                "account_id": account_id,
+                "symbol": "EURUSD",
+                "now": datetime.now(UTC).isoformat(),
+            },
+        )
+        self.assertTrue(body["news_data_stale"])
+        self.assertTrue(body["cancel_pending"])
 
     def test_status_endpoints_reject_stale_client_clock(self):
         account_id = "stateful-status-clock"
@@ -1095,6 +1308,39 @@ class StatefulRiskAPITests(unittest.TestCase):
         self.assertTrue(body["force_flat"])
         self.assertTrue(body["cancel_pending"])
         self.assertFalse(body["closure_active"])
+
+    def test_active_market_closure_cancels_pending_orders(self):
+        account_id = "stateful-active-market-close"
+        self.sync_account(account_id, phase="evaluation")
+        now = datetime.now(UTC)
+        self.request(
+            "/v1/market-sync",
+            {
+                "fetched_at": now.isoformat(),
+                "closures": [
+                    {
+                        "closure_id": "active-break",
+                        "start_time": (
+                            now - timedelta(minutes=1)
+                        ).isoformat(),
+                        "end_time": (
+                            now + timedelta(hours=3)
+                        ).isoformat(),
+                        "affected_symbols": ["EURUSD"],
+                    }
+                ],
+            },
+        )
+        _, body = self.request(
+            "/v1/market-status",
+            {
+                "account_id": account_id,
+                "symbol": "EURUSD",
+                "now": now.isoformat(),
+            },
+        )
+        self.assertTrue(body["closure_active"])
+        self.assertTrue(body["cancel_pending"])
 
     def test_stateful_evaluation_rejects_market_close_window(self):
         account_id = "stateful-market-evaluate"
@@ -1237,14 +1483,11 @@ class CredentialQualificationAPITests(unittest.TestCase):
         *,
         account_type="two_step",
         phase="evaluation",
+        balance="100000",
+        open_positions_count=0,
+        pending_orders_count=0,
+        scopes=None,
     ):
-        _, created = self.request(
-            "POST",
-            f"/v1/admin/accounts/{account_id}/credentials",
-            {},
-            admin=True,
-        )
-        credential = created["secret"]
         now = datetime.now(UTC).isoformat()
         self.request(
             "POST",
@@ -1257,13 +1500,22 @@ class CredentialQualificationAPITests(unittest.TestCase):
                 "initial_capital": "100000",
                 "day_start_balance": "100000",
                 "highest_settled_balance": "100000",
-                "balance": "100000",
+                "balance": balance,
                 "equity": "100000",
                 "current_open_risk": "0",
+                "open_positions_count": open_positions_count,
+                "pending_orders_count": pending_orders_count,
                 "as_of": now,
             },
-            credential=credential,
+            admin=True,
         )
+        _, created = self.request(
+            "POST",
+            f"/v1/admin/accounts/{account_id}/credentials",
+            {"scopes": scopes} if scopes is not None else {},
+            admin=True,
+        )
+        credential = created["secret"]
         for path, values in (
             ("/v1/news-sync", {"events": []}),
             ("/v1/market-sync", {"closures": []}),
@@ -1316,6 +1568,69 @@ class CredentialQualificationAPITests(unittest.TestCase):
         self.assertEqual(context.exception.code, 403)
         context.exception.close()
 
+    def test_unprovisioned_account_cannot_receive_platform_credential(self):
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/admin/accounts/unprovisioned/credentials",
+                {},
+                admin=True,
+            )
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
+
+    def test_orphaned_credential_cannot_bootstrap_an_account(self):
+        now = datetime.now(UTC)
+        _, credential = self.server.state_store.create_account_credential(
+            account_id="orphaned-account",
+            scopes=("account:sync",),
+            not_before=now,
+            expires_at=now + timedelta(hours=1),
+            now=now,
+        )
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/account-sync",
+                {
+                    "account_id": "orphaned-account",
+                    "account_type": "two_step",
+                    "phase": "evaluation",
+                    "style": "standard",
+                    "initial_capital": "100000",
+                    "day_start_balance": "100000",
+                    "highest_settled_balance": "100000",
+                    "balance": "100000",
+                    "equity": "100000",
+                    "current_open_risk": "0",
+                    "open_positions_count": 0,
+                    "pending_orders_count": 0,
+                    "as_of": now.isoformat(),
+                },
+                credential=credential,
+            )
+        self.assertEqual(context.exception.code, 403)
+        context.exception.close()
+
+    def test_default_platform_credential_has_no_settlement_scope(self):
+        credential, _ = self.bootstrap_account("least-privilege")
+        now = datetime.now(UTC)
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/settlement-sync",
+                {
+                    "account_id": "least-privilege",
+                    "ftmo_day": ftmo_day_key(now),
+                    "settled_balance": "100000",
+                    "settled_at": now.isoformat(),
+                    "source": "unauthorized-platform",
+                },
+                credential=credential,
+            )
+        self.assertEqual(context.exception.code, 401)
+        context.exception.close()
+
     def test_account_credential_can_rotate_without_secret_disclosure_later(self):
         old_secret, credential_id = self.bootstrap_account("rotate-api")
         _, rotated = self.request(
@@ -1361,8 +1676,101 @@ class CredentialQualificationAPITests(unittest.TestCase):
         )
         self.assertNotIn("secret", listed["credentials"][0])
 
+    def test_settlement_endpoint_accepts_account_settlement_scope(self):
+        now = datetime.now(UTC)
+        self.request(
+            "POST",
+            "/v1/account-sync",
+            {
+                "account_id": "settlement-scope",
+                "account_type": "two_step",
+                "phase": "evaluation",
+                "style": "standard",
+                "initial_capital": "100000",
+                "day_start_balance": "100000",
+                "highest_settled_balance": "100000",
+                "balance": "100000",
+                "equity": "100000",
+                "current_open_risk": "0",
+                "open_positions_count": 0,
+                "as_of": now.isoformat(),
+            },
+            admin=True,
+        )
+        _, created = self.request(
+            "POST",
+            "/v1/admin/accounts/settlement-scope/credentials",
+            {"scopes": ["account:settlement"]},
+            admin=True,
+        )
+        credential = created["secret"]
+        status, body = self.request(
+            "POST",
+            "/v1/settlement-sync",
+            {
+                "account_id": "settlement-scope",
+                "ftmo_day": ftmo_day_key(now),
+                "settled_balance": "100000",
+                "settled_at": now.isoformat(),
+                "source": "test-settlement",
+            },
+            credential=credential,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["ftmo_day"], ftmo_day_key(now))
+
+    def test_calendar_from_old_rule_version_is_not_restored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "risk.db")
+            now = datetime.now(UTC)
+            StateStore(state_path).save_calendar_snapshot(
+                calendar_type="news",
+                fetched_at=now,
+                payload=[],
+                rule_version="old-rule",
+            )
+            config_path = os.path.join(directory, "config.json")
+            with open("config/ftmo-v2.json", encoding="utf-8") as source:
+                config = json.load(source)
+            config["rule_version"] = "new-rule"
+            with open(config_path, "w", encoding="utf-8") as target:
+                json.dump(config, target)
+            server = make_server(
+                "127.0.0.1",
+                0,
+                config_path,
+                auth_token="admin-token",
+                state_path=state_path,
+            )
+            try:
+                self.assertEqual(server.news_events, [])
+                health = server.calendar_health("news")
+                self.assertFalse(health["present"])
+                self.assertFalse(health["rule_version_match"])
+                self.assertIn(
+                    'calendar="news",result="rule_mismatch"',
+                    server.metrics_text(),
+                )
+            finally:
+                server.server_close()
+
+    def test_prometheus_endpoint_labels_are_escaped(self):
+        self.server.observe_response(
+            "GET",
+            '/bad"quote',
+            HTTPStatus.OK,
+            {},
+        )
+        metrics = self.server.metrics_text()
+        self.assertIn('endpoint="/bad\\"quote"', metrics)
+
     def test_qualification_dashboard_uses_closed_trade_history(self):
-        credential, _ = self.bootstrap_account("qualification-api")
+        credential, _ = self.bootstrap_account(
+            "qualification-api",
+            balance="110000",
+            open_positions_count=0,
+            scopes=["qualification:read", "qualification:write"],
+        )
         for index in range(4):
             closed_at = datetime(
                 2026,
@@ -1468,9 +1876,52 @@ class CredentialQualificationAPITests(unittest.TestCase):
             metrics,
         )
         self.assertIn(
+            'ftmo_risk_calendar_stale{calendar="news"} 0',
+            metrics,
+        )
+        self.assertIn(
             'ftmo_risk_decisions_total{code="ALLOW"} 1',
             metrics,
         )
+
+        self.request(
+            "POST",
+            "/v1/account-sync",
+            {
+                "account_id": "metrics-account",
+                "account_type": "two_step",
+                "phase": "evaluation",
+                "style": "standard",
+                "initial_capital": "100000",
+                "day_start_balance": "100000",
+                "highest_settled_balance": "100000",
+                "balance": "100000",
+                "equity": "100000",
+                "current_open_risk": "0",
+                "open_positions_count": 0,
+                "pending_orders_count": 0,
+                "as_of": datetime.now(UTC).isoformat(),
+            },
+            admin=True,
+        )
+        _, credential = self.request(
+            "POST",
+            "/v1/admin/accounts/metrics-account/credentials",
+            {
+                "expires_at": (
+                    datetime.now(UTC) + timedelta(hours=1)
+                ).isoformat()
+            },
+            admin=True,
+        )
+        self.assertTrue(credential["secret"])
+        _, metrics = self.request(
+            "GET",
+            "/metrics",
+            admin=True,
+            bearer=True,
+        )
+        self.assertIn("ftmo_risk_credentials_expiring_soon 1", metrics)
 
         self.server.shutdown()
         self.server.server_close()

@@ -14,7 +14,7 @@ X-Account-Credential: <one-account-secret>
 ```
 
 - 管理员令牌：日历同步、健康检查、Prometheus、资格汇总和凭证管理。
-- 账户凭证：绑定一个 `account_id` 和作用域，用于账户同步、交易评估、执行回报、守护状态和资格历史。
+- 账户凭证：绑定一个 `account_id` 和作用域。平台运行凭证只用于账户同步、交易评估、执行回报和守护状态；结算确认、资格读写必须使用单独签发的最小权限凭证。
 - 管理员令牌默认不能调用带 `account_id` 的 `/v1/evaluate`，防止平台误配共享高权限令牌。
 - Prometheus 可以使用 `Authorization: Bearer <administrator-token>`。
 
@@ -26,20 +26,23 @@ X-Account-Credential: <one-account-secret>
 {
   "ok": true,
   "service": "ftmo-risk-api",
-  "rule_version": "ftmo-v3-2026-08-23",
+  "rule_version": "ftmo-v4-2026-08-23",
   "news_data_age_seconds": 0,
   "market_data_age_seconds": 0,
   "persistent_state": true,
+  "database_up": true,
+  "unknown_execution_records": 0,
   "account_credentials_required": true,
-  "mtls_enabled": false
+  "mtls_enabled": false,
+  "mtls_client_certificate_required": false
 }
 ```
 
-新闻和休市字段还包含最近持久化时间、年龄和是否已经从 SQLite 恢复。
+新闻和休市字段还包含最近持久化时间、年龄、配置阈值、是否过期和规则版本。规则版本不匹配的持久化快照不会被加载。
 
 ## `POST /v1/news-sync`
 
-新闻同步器将已经映射到交易品种的事件推送到本地服务。服务按 `fetched_at` 计算数据年龄；Standard FTMO Account 的新增风险请求在新闻数据缺失或超过 60 秒时会被拒绝。
+新闻同步器将已经映射到交易品种的事件推送到本地服务。服务按 `fetched_at` 计算数据年龄；新增风险请求在新闻数据缺失或超过配置的 `news_controls.max_calendar_age_seconds`（默认 60 秒）时会被拒绝。
 
 ```json
 {
@@ -127,11 +130,11 @@ X-Account-Credential: <one-account-secret>
 
 - `T-10` 到 `T-2`：`force_flat=true`、`cancel_pending=true`。
 - `T-2` 到 `T+2`：`hard_window=true`，守护程序不得再主动发送开仓、平仓或修改指令；若仍有持仓则触发紧急告警。
-- 新闻数据缺失或超过 60 秒：`open_blocked=true` 和 `emergency_alert=true`。
+- 新闻数据缺失或超过配置年龄：`open_blocked=true`、`cancel_pending=true` 和 `emergency_alert=true`；平台应撤销可能增加风险的挂单。
 
 ## `POST /v1/account-sync`
 
-平台每次评估前同步最新账户状态。第一次同步必须提供经过核对的 `day_start_balance` 和 `highest_settled_balance`；之后由 SQLite 状态层按 Prague 日界线维护。
+平台每次评估前同步最新账户状态。第一次同步必须由管理员令牌完成，并提供经过核对的 `day_start_balance` 和 `highest_settled_balance`；这一步建立不可由平台凭证改写的账户类型、阶段、风格和初始资金基线。之后由 SQLite 状态层按 Prague 日界线维护，平台凭证只能同步已登记账户。
 
 ```json
 {
@@ -145,13 +148,15 @@ X-Account-Credential: <one-account-secret>
   "balance": "100000",
   "equity": "99800",
   "current_open_risk": "100",
+  "open_positions_count": 0,
+  "pending_orders_count": 0,
   "as_of": "2026-08-22T12:00:00+00:00"
 }
 ```
 
 使用 `account_id` 的 `/v1/evaluate` 请求不再上传账户规则、快照或频率；服务读取已同步账户和 SQLite 频率状态。
 
-`as_of` 必须与服务器时间相差不超过 30 秒，用于检查平台时钟和计算快照年龄。Prague 日界线切换以 API 服务器接收请求的时间为准；客户端不能用偏移时间提前或延后重置日亏基线。`current_open_risk` 对已有持仓按当前可平仓报价到止损的剩余权益风险计算，对挂单按目标入场价到止损计算。
+`as_of` 必须与服务器时间相差不超过 30 秒，用于检查平台时钟和计算快照年龄；同一时间戳不得上传冲突快照，适配器应提供毫秒级或单调递增时间戳。Prague 日界线切换以 API 服务器接收请求的时间为准；客户端不能用偏移时间提前或延后重置日亏基线。`current_open_risk` 对已有持仓按当前可平仓报价到止损的剩余权益风险计算，对挂单按目标入场价到止损计算。`open_positions_count` 和 `pending_orders_count` 分别是账户级持仓与挂单库存；任一缺失时资格看板不会把 Profit Target 判定为正式完成。
 
 响应快照中的 `day_locked` 由服务维护，触发后持续到下一 FTMO 日；`breach_latched` 在观察到官方亏损底线后持续保留，不接受客户端覆盖。平台同步请求不应发送这两个字段。
 
@@ -232,7 +237,7 @@ X-Account-Credential: <one-account-secret>
 ```json
 {
   "ok": true,
-  "rule_version": "ftmo-v3-2026-08-23",
+  "rule_version": "ftmo-v4-2026-08-23",
   "decision": {
     "code": "REJECT_NEWS",
     "allowed": false,
@@ -252,15 +257,15 @@ X-Account-Credential: <one-account-secret>
 }
 ```
 
-平台端只有在 `decision.allowed == true` 时才提交新增风险。`REJECT_*` 必须记录 `code` 和 `reasons`。带 `account_id` 的生产评估使用风控服务器接收时间执行新闻、休市和频率判断；客户端 `requested_at` 只用于时钟健康检查和请求身份。
+平台端只有在 `decision.allowed == true` 时才提交新增风险。`REJECT_*` 必须记录 `code` 和 `reasons`；存在未解决执行结果时返回 `REJECT_UNKNOWN_EXECUTION`。带 `account_id` 的生产评估使用风控服务器接收时间执行新闻、休市和频率判断；客户端 `requested_at` 只用于时钟健康检查和请求身份。
 
-当日服务器请求达到 `warning_requests_day` 时，允许的决定会在 `reasons` 中返回预警；达到 `stop_requests_day` 后返回 `REJECT_FREQUENCY`。计算新交易预算时，现有持仓和挂单的 `current_open_risk` 会同时从日亏缓冲、最大亏损缓冲和总开放风险上限中扣除。
+当日服务器请求达到 `warning_requests_day` 时，允许的决定会在 `reasons` 中返回预警；达到 `stop_requests_day` 后返回 `REJECT_FREQUENCY`。计算新交易预算时，现有持仓和挂单的 `current_open_risk` 会同时从日亏缓冲、最大亏损缓冲和总开放风险上限中扣除。`/v1/position-size` 的可选 `estimated_costs` 会先从预算中预留，再向下取整交易量。
 
-每个 POST 响应包含 `request_id`。平台端应把这个 ID 写入本地日志，并在发生平台订单结果未知、超时或人工复核时使用它关联风控决定。带 `account_id` 的评估必须使用持久化状态；无状态 `/v1/evaluate` 默认关闭，仅可由测试/回放服务器显式开启。
+每个 POST 响应包含 `request_id`。平台端应把这个 ID 写入本地日志，并在发生平台订单结果未知、超时或人工复核时使用它关联风控决定。审计 JSONL 还记录管理员或账户凭证的非秘密主体 ID。带 `account_id` 的评估必须使用持久化状态；无状态 `/v1/evaluate` 默认关闭，仅可由测试/回放服务器显式开启。
 
 ## `POST /v1/execution-result`
 
-平台执行后回传结果。明确失败的开仓会释放开仓频率名额，明确失败的修改会释放修改冷却预留；超时、仅确认已受理或结果未知时使用 `outcome: "unknown"`，保留预留并人工复核。相同的评估或执行 `request_id` 重试会返回第一次保存的结果；同一 ID 复用不同内容会被拒绝。
+平台执行后回传结果。明确失败的开仓会释放开仓频率名额，明确失败的修改会释放修改冷却预留；超时、仅确认已受理或结果未知时使用 `outcome: "unknown"`，保留预留并在服务器端锁住该账户的新增风险。关闭、减仓和撤单仍可评估。平台最终核对到结果后，可用相同 `request_id` 和相同动作/品种补报 `success` 或 `failure` 解除未知状态；补报 `failure` 会释放相应预留。相同最终结果重试返回保存结果；同一 ID 复用不同动作或品种会被拒绝。
 
 ```json
 {
@@ -290,7 +295,7 @@ POST /v1/admin/credentials/{credential_id}/revoke
 GET  /v1/admin/credentials?account_id={account_id}
 ```
 
-创建请求可以指定 `not_before`、`expires_at` 和 `scopes`；省略时使用配置中的默认 TTL 和账户标准作用域。创建和轮换响应中的 `secret` 只返回一次，数据库只保存随机盐和摘要。
+只能为已由管理员首次同步登记的账户创建凭证。创建请求可以指定 `not_before`、`expires_at` 和 `scopes`；省略时使用配置中的默认 TTL 和平台最小作用域：`account:sync`、`trade:evaluate`、`trade:execution`、`calendar:read`。允许的账户作用域还包括 `account:settlement`、`qualification:read` 和 `qualification:write`，但必须按结算/资格同步器的实际用途显式签发。创建和轮换响应中的 `secret` 只返回一次，数据库只保存随机盐和摘要。
 
 ```json
 {
@@ -299,14 +304,12 @@ GET  /v1/admin/credentials?account_id={account_id}
     "account:sync",
     "trade:evaluate",
     "trade:execution",
-    "calendar:read",
-    "qualification:read",
-    "qualification:write"
+    "calendar:read"
   ]
 }
 ```
 
-轮换可设置 `overlap_seconds`，旧凭证在重叠窗口结束后自动失效；设为 `0` 立即失效。凭证同时校验 `account_id`、作用域、`not_before`、`expires_at` 和 `revoked_at`，不能跨账户使用。列表接口从不返回明文秘密或摘要。
+例如，日结算同步器应显式请求 `{"scopes":["account:settlement"]}`；资格导入器应使用 `qualification:write`，账户级资格读取则使用 `qualification:read`。轮换可设置 `overlap_seconds`，旧凭证在重叠窗口结束后自动失效；设为 `0` 立即失效。凭证同时校验 `account_id`、作用域、`not_before`、`expires_at` 和 `revoked_at`，不能跨账户使用。列表接口从不返回明文秘密或摘要。
 
 ## 资格历史同步
 
@@ -329,7 +332,7 @@ GET  /v1/admin/credentials?account_id={account_id}
 }
 ```
 
-`trade_id` 在账户内幂等；相同 ID 的冲突内容会被拒绝。Best Day 和 Profit Target 使用当前阶段、当前周期的已平仓净损益。
+`trade_id` 在账户内幂等；相同 ID 的冲突内容会被拒绝。Best Day 使用当前阶段、当前周期的已平仓净损益；Profit Target 还必须满足账户余额达到目标、`open_positions_count == 0`、`pending_orders_count == 0`，且账户快照在资格专用新鲜度阈值内。库存未知或快照过期时返回 `uncertain`。
 
 ### `POST /v1/trading-day-sync`
 
@@ -390,9 +393,9 @@ GET /dashboard/qualification
 
 - HTTP 请求和状态码；
 - 风控决定代码；
-- 新闻/休市日历是否存在、年龄、同步和恢复结果；
+- 新闻/休市日历是否存在、年龄、配置感知的过期状态、同步和恢复结果；
 - `GREEN/AMBER/RED/LOCKED/BREACH` 账户数量；
-- 未知执行结果数量；
+- 未知执行结果、资格快照过期、账户不确定状态和即将过期凭证数量；
 - SQLite 健康状态；
 - 备份/恢复结果和最后备份年龄。
 
@@ -432,7 +435,7 @@ GET /dashboard/qualification
 ```json
 {
   "ok": true,
-  "rule_version": "ftmo-v3-2026-08-23",
+  "rule_version": "ftmo-v4-2026-08-23",
   "position_size": {
     "volume": "2.50",
     "expected_loss": "250.00",
@@ -448,5 +451,5 @@ GET /dashboard/qualification
 - 金额和数量使用字符串传输，避免浮点误差。
 - `loss_per_volume_unit` 必须已经由 MT5/cTrader 按平台合约规格、报价货币、佣金和滑点换算完成。
 - 新闻事件的 `affected_symbols` 必须由公司新闻映射表生成，不应只根据货币代码猜测。
-- 所有新增风险请求必须有不超过 60 秒的新鲜新闻数据和不超过 1 小时的市场休市日历。
+- 所有新增风险请求必须有不超过当前配置阈值的新鲜新闻数据和市场休市日历。
 - 没有日历或日历过期时，服务返回 `REJECT_DATA_STALE`。

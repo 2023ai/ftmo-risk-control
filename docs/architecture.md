@@ -184,7 +184,7 @@ Evaluation 和 Swing 可以跨周末持仓，但仍受禁止 gap trading 的前 
 
 ## 8. 持久化
 
-平台每次评估前调用 `/v1/account-sync`。SQLite 保存：
+管理员先调用 `/v1/account-sync` 登记并固定账户类型、阶段、风格、初始资金和经过核对的日界线基线；平台凭证只能同步已登记账户。平台每次评估前调用同一接口更新动态快照。SQLite 保存：
 
 - Prague 日界线和当日开始余额；
 - 1-Step 最高结算余额；
@@ -199,7 +199,7 @@ Evaluation 和 Swing 可以跨周末持仓，但仍受禁止 gap trading 的前 
 
 重启 EA/cBot 或 API 不会清空频率。
 
-API 进程持有 `<state>.server.lock`。在线备份使用 SQLite Backup API，可以在服务运行时执行；恢复必须停机，恢复工具会校验锁文件、数据库结构和 `PRAGMA quick_check`，通过后再原子替换目标文件。
+API 进程会在打开 SQLite 前取得 `<state>.server.lock`，并拒绝不安全的锁文件。在线备份使用 SQLite Backup API，可以在服务运行时执行；恢复必须停机，恢复工具会校验锁文件、数据库结构和 `PRAGMA quick_check`，通过后再原子替换目标文件。
 
 Prague 日界线以风控服务器接收账户同步的时间为准。客户端 `as_of` 只用于时钟偏差和快照新鲜度检查；若评估时数据库仍停留在上一 FTMO 日，新增风险会因结算基线不确定而被拒绝。
 
@@ -217,7 +217,7 @@ Prague 日界线以风控服务器接收账户同步的时间为准。客户端 
   -> 固定 account_id + scopes + not_before + expires_at + revoked_at
 ```
 
-账户秘密使用 256 位随机值。SQLite 只保存随机盐和 SHA-256 摘要，不保存明文。轮换在一个事务中创建新凭证并设置旧凭证失效时间，支持短暂重叠，避免计划内轮换中断。
+账户秘密使用 256 位随机值。SQLite 只保存随机盐和 SHA-256 摘要，不保存明文。默认平台凭证仅含账户同步、交易评估、执行回报和日历读取；结算、资格读取和资格写入必须使用独立的显式作用域。轮换在一个事务中创建新凭证并设置旧凭证失效时间，支持短暂重叠，避免计划内轮换中断。
 
 远程部署可由 Python TLS 层直接要求客户端证书，也可以在受控反向代理终止 mTLS。账户凭证仍用于账户绑定和细粒度作用域。
 
@@ -229,11 +229,11 @@ Prague 日界线以风控服务器接收账户同步的时间为准。客户端 
 account_id + phase + cycle_id
 ```
 
-- Profit Target：当前周期已平仓净损益相对目标金额；
+- Profit Target：当前周期已平仓净损益、账户余额达到目标且账户级持仓与挂单库存确认已清零。挂单清零是本系统的保守完整性门槛，不替代 FTMO 对资格的最终审核；
 - Best Day Rule：最盈利 FTMO 日 / 所有正收益 FTMO 日之和；
 - Minimum Trading Days：CE(S)T 日内至少开过一个仓位的日期数量。
 
-已平仓交易不能替代开仓日事件，因为跨日持仓只计开仓日。历史同步器先写交易和开仓日，再提交 `history_start_at` 与 `complete_through`；完整性水位未覆盖最新账户快照时，资格结果强制进入 `uncertain`。
+已平仓交易不能替代开仓日事件，因为跨日持仓只计开仓日。历史同步器先写交易和开仓日，再提交 `history_start_at` 与 `complete_through`；完整性水位未覆盖最新账户快照、账户持仓/挂单库存未知或账户快照超过资格新鲜度阈值时，资格结果强制进入 `uncertain`。
 
 浏览器看板只展示 `/v1/qualification/accounts`，不会把管理员令牌写入 URL 或本地存储。
 
@@ -244,7 +244,8 @@ account_id + phase + cycle_id
 - API 请求、状态码和决定代码；
 - 日历存在性、年龄、同步与恢复；
 - 账户状态分布；
-- 未知执行结果；
+- 未知执行结果和账户级新增风险锁；
+- 日历配置感知的过期状态、资格快照过期、账户不确定状态和凭证临近过期；
 - SQLite 健康；
 - 备份/恢复结果和最后备份年龄。
 
@@ -255,8 +256,8 @@ Prometheus 抓取示例和告警规则放在 `monitoring/`。告警覆盖数据�
 以下情况必须停止新增风险：
 
 - 账户权益超过 5 秒未更新；
-- 新闻日历超过 60 秒未同步；
-- 长休市日历超过 1 小时未同步；
+- 新闻日历超过 `news_controls.max_calendar_age_seconds` 未同步；
+- 长休市日历超过 `market_close_controls.max_schedule_age_seconds` 未同步；
 - 日界线转换失败；
 - 平台订单结果未知；
 - 核心风控服务不可用；

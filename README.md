@@ -1,12 +1,12 @@
 # FTMO 自营交易风控系统
 
-这是一个面向 FTMO 账户、MT5 和 cTrader 的可运行 V3 风控实现。
+这是一个面向 FTMO 账户、MT5 和 cTrader 的可运行 V4 风控实现。
 
 本项目是风控参考实现和平台接入模板，不构成 FTMO 官方软件、法律意见或实盘收益保证。上线前必须使用公司批准的数据源、目标账户规格和模拟账户回放验证。
 
 当前版本聚焦九类核心能力：
 
-1. 以损定仓：先确定止损和允许亏损，再计算交易量。
+1. 以损定仓：本系统内部先确定止损和允许亏损，再计算交易量；这是内部风控门槛，不是对 FTMO 官方止损政策的替代。
 2. 新闻时段：区分 FTMO 账户阶段、Standard/Swing 账户和受影响品种。
 3. 交易频率：限制短周期开仓、日内开仓和服务器请求数量。
 4. 日亏与最大亏损：按账户规则计算官方底线，并使用更保守的内部停止线。
@@ -15,6 +15,8 @@
 7. 日历韧性：新闻和休市快照持久化，重启自动恢复，支持在线备份和停机恢复。
 8. 账户安全：管理员令牌与账户凭证分离，支持作用域、轮换、重叠窗口、过期、撤销和可选 mTLS。
 9. 资格看板：按阶段和周期独立计算 Profit Target、Minimum Trading Days 和 Best Day Rule。
+10. 资格完整性：Profit Target 同时核对账户余额、账户级持仓/挂单库存和快照新鲜度；无法确认时显示需复核。
+11. 执行闭环：未知执行结果在服务器端形成账户级新增风险锁，最终核对后可幂等解除。
 
 内部日亏锁一旦触发会保持到下一 FTMO 日；观察到官方亏损底线后会持久锁定，权益反弹或重启服务都不会自动恢复新增风险。
 
@@ -72,7 +74,7 @@ export RISK_AUDIT_PATH='/var/log/ftmo-risk/audit.jsonl'
 python3 -m src.risk_api --config config/ftmo-v2.json
 ```
 
-`RISK_API_TOKEN` 是管理员令牌，只用于日历、监控、资格汇总和凭证管理。生产平台不保存管理员令牌；每个账户先签发独立凭证：
+`RISK_API_TOKEN` 是管理员令牌，只用于日历、监控、账户首次登记、资格汇总和凭证管理。生产平台不保存管理员令牌。管理员必须先用带已核对余额的 `/v1/account-sync` 登记账户基线，之后才能签发独立平台凭证；请求字段见 [API 契约](docs/api-contract.md#post-v1account-sync)：
 
 ```bash
 curl -sS \
@@ -82,7 +84,7 @@ curl -sS \
   http://127.0.0.1:8765/v1/admin/accounts/mt5-10001/credentials
 ```
 
-响应中的 `secret` 只显示一次，填入 MT5/cTrader 的 `AccountCredential`。生产 `/v1/evaluate` 必须使用 `account_id` 和 `X-Account-Credential`；管理员令牌不能代替账户凭证提交交易评估。
+响应中的 `secret` 只显示一次，填入 MT5/cTrader 的 `AccountCredential`。默认凭证仅含 `account:sync`、`trade:evaluate`、`trade:execution` 和 `calendar:read`；结算、资格同步和账户级资格读取必须另签发相应作用域。生产 `/v1/evaluate` 必须使用 `account_id` 和 `X-Account-Credential`；管理员令牌不能代替账户凭证提交交易评估。
 
 新闻事件必须先经过人工审核和品种映射，再同步：
 
@@ -106,7 +108,7 @@ http://127.0.0.1:8765/dashboard/qualification
 
 看板使用当前页面内存中的管理员令牌读取 `/v1/qualification/accounts`，不会把令牌写入 URL 或浏览器存储。资格历史必须按 `phase + cycle_id` 同步已平仓净损益、开仓日事件和完整性水位；缺少完整性确认时只显示“需复核”。
 
-批量同步审核后的资格历史：
+批量同步审核后的资格历史前，需为该账户签发仅含 `qualification:write` 的独立凭证：
 
 ```bash
 export RISK_ACCOUNT_CREDENTIAL='one-account-secret'
@@ -151,7 +153,8 @@ python3 scripts/restore_state.py \
 - 所有时间统一使用带时区的 ISO 8601 时间。
 - 规则变更必须增加 `rule_version`，不得静默覆盖历史审计记录。
 - Minimum Trading Days 使用 Prague/CE(S)T 开仓日：当天至少开过一个仓位计 1 天，持仓跨日不重复计数。
-- `ALLOW` 只表示当前交易请求通过风控，不表示账户已经满足 Profit Target、Minimum Trading Days 或 Best Day Rule。
+- `ALLOW` 只表示当前交易请求通过风控，不表示账户已经满足 Profit Target、Minimum Trading Days 或 Best Day Rule。看板额外要求同步的账户余额达到目标、`open_positions_count` 和 `pending_orders_count` 都为零；挂单清零是本系统的保守完整性门槛，不是对 FTMO 官方资格审核的替代。
+- 平台同步时间戳必须带毫秒精度或单调递增；同一时间戳上传冲突账户快照会被拒绝。
 
 完整上线步骤见 [部署检查](docs/deployment.md)，实际验证结果见 [验证报告](docs/verification.md)。
 

@@ -1,5 +1,5 @@
 #property strict
-#property version "1.1"
+#property version "1.2"
 #property description "Stateful FTMO risk API guard for MT5"
 
 #include <Trade/Trade.mqh>
@@ -21,6 +21,7 @@ input int NewsGuardIntervalSeconds = 5;
 input ulong MagicNumber = 26082201;
 
 bool UnknownExecutionLock = false;
+long LastTimestampMilliseconds = 0;
 
 string UnknownLockName()
 {
@@ -45,12 +46,22 @@ string JsonQuote(string value)
    return "\"" + value + "\"";
 }
 
-string IsoUtc(datetime value)
+string IsoUtcNow()
 {
-   string stamp = TimeToString(value, TIME_DATE | TIME_SECONDS);
+   datetime now = TimeGMT();
+   long milliseconds = (long)(GetMicrosecondCount() / 1000) % 1000;
+   long candidate = (long)now * 1000 + milliseconds;
+   if(candidate <= LastTimestampMilliseconds)
+   {
+      candidate = LastTimestampMilliseconds + 1;
+   }
+   LastTimestampMilliseconds = candidate;
+   datetime seconds = (datetime)(candidate / 1000);
+   int fractional = (int)(candidate % 1000);
+   string stamp = TimeToString(seconds, TIME_DATE | TIME_SECONDS);
    StringReplace(stamp, ".", "-");
    StringReplace(stamp, " ", "T");
-   return stamp + "Z";
+   return stamp + StringFormat(".%03dZ", fractional);
 }
 
 string NextRequestId(string action)
@@ -169,6 +180,10 @@ double CurrentOpenRisk()
          position_type == POSITION_TYPE_BUY
          ? tick.bid
          : tick.ask;
+      if(current_price <= 0.0)
+      {
+         return InitialCapital;
+      }
       double profit = 0.0;
 
       if(!OrderCalcProfit(
@@ -248,6 +263,11 @@ double CurrentOpenRisk()
    return total;
 }
 
+int OpenPositionsCount()
+{
+   return PositionsTotal();
+}
+
 bool SyncAccount()
 {
    string payload =
@@ -268,7 +288,11 @@ bool SyncAccount()
          DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + "\","
       "\"current_open_risk\":\"" +
          DoubleToString(CurrentOpenRisk(), 2) + "\","
-      "\"as_of\":" + JsonQuote(IsoUtc(TimeGMT()))
+      "\"open_positions_count\":" +
+         IntegerToString(OpenPositionsCount()) + ","
+      "\"pending_orders_count\":" +
+         IntegerToString(OrdersTotal()) + ","
+      "\"as_of\":" + JsonQuote(IsoUtcNow())
       + "}";
 
    string response;
@@ -326,9 +350,11 @@ double NormalizeVolumeForSymbol(string symbol, double requested_volume)
 bool EvaluateRequest(
    string request_json,
    string request_id,
-   string &response)
+   string &response,
+   bool risk_increasing)
 {
-   if(!SyncAccount())
+   bool synced = SyncAccount();
+   if(risk_increasing && !synced)
    {
       Print("RiskGuard: account sync failed; risk increase blocked");
       return false;
@@ -366,7 +392,7 @@ void ReportExecution(
       "\"outcome\":" + JsonQuote(outcome) + ","
       "\"action\":" + JsonQuote(action) + ","
       "\"symbol\":" + JsonQuote(symbol) + ","
-      "\"occurred_at\":" + JsonQuote(IsoUtc(TimeGMT())) + ","
+      "\"occurred_at\":" + JsonQuote(IsoUtcNow()) + ","
       "\"platform_status\":" + JsonQuote(platform_status) + ","
       "\"platform_order_id\":" + JsonQuote(platform_order_id)
       + "}";
@@ -377,6 +403,8 @@ void ReportExecution(
          NextRequestId("execution"),
          response))
    {
+      UnknownExecutionLock = true;
+      GlobalVariableSet(UnknownLockName(), 1.0);
       PrintFormat(
          "RiskGuard: execution audit unresolved request_id=%s",
          request_id);
@@ -490,7 +518,7 @@ bool RiskGuardMarket(
       "{"
       "\"symbol\":" + JsonQuote(symbol) + ","
       "\"action\":\"open\","
-      "\"requested_at\":" + JsonQuote(IsoUtc(TimeGMT())) + ","
+      "\"requested_at\":" + JsonQuote(IsoUtcNow()) + ","
       "\"volume\":\"" + DoubleToString(volume, 8) + "\","
       "\"entry_price\":\"" + DoubleToString(entry_price, 8) + "\","
       "\"stop_loss\":\"" + DoubleToString(stop_loss, 8) + "\","
@@ -503,7 +531,7 @@ bool RiskGuardMarket(
       + "}";
 
    string response;
-   if(!EvaluateRequest(request, request_id, response))
+   if(!EvaluateRequest(request, request_id, response, true))
    {
       PrintFormat("RiskGuard rejected open: %s", response);
       return false;
@@ -590,12 +618,12 @@ bool RiskGuardClose(ulong position_ticket)
       "{"
       "\"symbol\":" + JsonQuote(symbol) + ","
       "\"action\":\"close\","
-      "\"requested_at\":" + JsonQuote(IsoUtc(TimeGMT())) + ","
+      "\"requested_at\":" + JsonQuote(IsoUtcNow()) + ","
       "\"is_risk_increasing\":false"
       + "}";
 
    string response;
-   if(!EvaluateRequest(request, request_id, response))
+   if(!EvaluateRequest(request, request_id, response, false))
    {
       PrintFormat("RiskGuard rejected close: %s", response);
       return false;
@@ -633,13 +661,13 @@ bool RiskGuardClosePartial(ulong position_ticket, double volume)
       "{"
       "\"symbol\":" + JsonQuote(symbol) + ","
       "\"action\":\"close\","
-      "\"requested_at\":" + JsonQuote(IsoUtc(TimeGMT())) + ","
+      "\"requested_at\":" + JsonQuote(IsoUtcNow()) + ","
       "\"volume\":\"" + DoubleToString(volume, 8) + "\","
       "\"is_risk_increasing\":false"
       + "}";
 
    string response;
-   if(!EvaluateRequest(request, request_id, response))
+   if(!EvaluateRequest(request, request_id, response, false))
    {
       PrintFormat("RiskGuard rejected partial close: %s", response);
       return false;
@@ -669,13 +697,7 @@ bool RiskGuardModifyPosition(
       return false;
    }
    string symbol = PositionGetString(POSITION_SYMBOL);
-   if(is_risk_increasing && stop_loss <= 0.0)
-   {
-      Print("RiskGuard: risk-increasing modification requires a stop loss");
-      return false;
-   }
    double volume = PositionGetDouble(POSITION_VOLUME);
-   double entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
    double current_stop = PositionGetDouble(POSITION_SL);
    ENUM_POSITION_TYPE position_type =
       (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
@@ -683,37 +705,63 @@ bool RiskGuardModifyPosition(
       position_type == POSITION_TYPE_BUY
       ? ORDER_TYPE_BUY
       : ORDER_TYPE_SELL;
-   if(stop_loss > 0.0 &&
-      ((position_type == POSITION_TYPE_BUY && stop_loss >= entry_price) ||
-       (position_type == POSITION_TYPE_SELL && stop_loss <= entry_price)))
+   if(stop_loss <= 0.0)
    {
-      Print("RiskGuard: modified stop loss is on the wrong side");
+      if(current_stop <= 0.0 || is_risk_increasing)
+      {
+         Print("RiskGuard: position modification must keep a stop loss");
+         return false;
+      }
+      // A zero value means "keep the current stop" for a TP-only change.
+      stop_loss = current_stop;
+   }
+   MqlTick tick;
+   if(!SymbolInfoTick(symbol, tick))
+   {
+      Print("RiskGuard: unable to read current price for modification");
+      return false;
+   }
+   double current_price =
+      position_type == POSITION_TYPE_BUY ? tick.bid : tick.ask;
+   if((position_type == POSITION_TYPE_BUY && stop_loss >= current_price) ||
+      (position_type == POSITION_TYPE_SELL && stop_loss <= current_price))
+   {
+      Print("RiskGuard: modified stop loss is on the wrong side of market");
       return false;
    }
    double current_risk = InitialCapital;
-   double new_risk = InitialCapital;
+   double new_risk = 0.0;
    double profit = 0.0;
    if(current_stop > 0.0 &&
       OrderCalcProfit(
          order_type,
          symbol,
          volume,
-         entry_price,
+         current_price,
          current_stop,
          profit))
    {
       current_risk = profit < 0.0 ? MathAbs(profit) : 0.0;
    }
-   if(stop_loss > 0.0 &&
-      OrderCalcProfit(
+   else if(current_stop > 0.0)
+   {
+      Print("RiskGuard: unable to calculate current stop risk");
+      return false;
+   }
+   if(OrderCalcProfit(
          order_type,
          symbol,
          volume,
-         entry_price,
+         current_price,
          stop_loss,
          profit))
    {
       new_risk = profit < 0.0 ? MathAbs(profit) : 0.0;
+   }
+   else
+   {
+      Print("RiskGuard: unable to calculate modified stop risk");
+      return false;
    }
    double additional_risk = MathMax(0.0, new_risk - current_risk);
    bool effective_risk_increasing = additional_risk > 0.01;
@@ -729,7 +777,7 @@ bool RiskGuardModifyPosition(
       "{"
       "\"symbol\":" + JsonQuote(symbol) + ","
       "\"action\":\"modify\","
-      "\"requested_at\":" + JsonQuote(IsoUtc(TimeGMT())) + ","
+      "\"requested_at\":" + JsonQuote(IsoUtcNow()) + ","
       "\"stop_loss\":\"" + DoubleToString(stop_loss, 8) + "\","
       "\"additional_risk\":\"" +
          DoubleToString(additional_risk, 2) + "\","
@@ -738,7 +786,11 @@ bool RiskGuardModifyPosition(
       + "}";
 
    string response;
-   if(!EvaluateRequest(request, request_id, response))
+   if(!EvaluateRequest(
+         request,
+         request_id,
+         response,
+         effective_risk_increasing))
    {
       PrintFormat("RiskGuard rejected position modification: %s", response);
       return false;
@@ -772,12 +824,12 @@ bool RiskGuardCancelPending(ulong order_ticket)
       "{"
       "\"symbol\":" + JsonQuote(symbol) + ","
       "\"action\":\"cancel\","
-      "\"requested_at\":" + JsonQuote(IsoUtc(TimeGMT())) + ","
+      "\"requested_at\":" + JsonQuote(IsoUtcNow()) + ","
       "\"is_risk_increasing\":false"
       + "}";
 
    string response;
-   if(!EvaluateRequest(request, request_id, response))
+   if(!EvaluateRequest(request, request_id, response, false))
    {
       PrintFormat("RiskGuard rejected pending cancellation: %s", response);
       return false;
@@ -802,7 +854,7 @@ bool GuardStatus(string path, string symbol, string &response)
       "{"
       "\"account_id\":" + JsonQuote(AccountId) + ","
       "\"symbol\":" + JsonQuote(symbol) + ","
-      "\"now\":" + JsonQuote(IsoUtc(TimeGMT()))
+      "\"now\":" + JsonQuote(IsoUtcNow())
       + "}";
    return PostJson(
       path,

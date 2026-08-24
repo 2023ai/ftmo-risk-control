@@ -16,6 +16,7 @@ import os
 import re
 import socket
 import ssl
+import stat
 import threading
 import time
 from dataclasses import asdict
@@ -47,7 +48,12 @@ from .risk_engine import (
     validate_config,
 )
 from .qualification import qualification_snapshot
-from .state_store import StateStore, StoredAccount
+from .state_store import (
+    ACCOUNT_CREDENTIAL_SCOPES,
+    PLATFORM_CREDENTIAL_SCOPES,
+    StateStore,
+    StoredAccount,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -70,8 +76,22 @@ class ForbiddenError(AuthorizationError):
     """The caller is authenticated but lacks the requested scope."""
 
 
+def _json_object_without_duplicate_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise RequestError(
+                "request body must not contain duplicate object keys"
+            )
+        result[key] = value
+    return result
+
+
 ACCOUNT_SCOPES = {
     "/v1/account-sync": "account:sync",
+    "/v1/settlement-sync": "account:settlement",
     "/v1/evaluate": "trade:evaluate",
     "/v1/execution-result": "trade:execution",
     "/v1/news-status": "calendar:read",
@@ -183,13 +203,20 @@ def _age_seconds(value: Any, field: str) -> int | None:
         return None
     if isinstance(value, bool):
         raise RequestError(f"{field} must be a non-negative integer")
-    try:
-        result = int(value)
-    except (TypeError, ValueError) as exc:
-        raise RequestError(f"{field} must be a non-negative integer") from exc
+    if not isinstance(value, int):
+        raise RequestError(f"{field} must be a non-negative integer")
+    result = value
     if result < 0:
         raise RequestError(f"{field} must be a non-negative integer")
     return result
+
+
+def _optional_nonnegative_int(value: Any, field: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RequestError(f"{field} must be a non-negative integer")
+    return value
 
 
 def _snapshot(raw: Mapping[str, Any]) -> AccountSnapshot:
@@ -221,6 +248,14 @@ def _snapshot(raw: Mapping[str, Any]) -> AccountSnapshot:
         data_uncertain=bool(raw.get("data_uncertain", False)),
         day_locked=bool(raw.get("day_locked", False)),
         breach_latched=bool(raw.get("breach_latched", False)),
+        open_positions_count=_optional_nonnegative_int(
+            raw.get("open_positions_count"),
+            "open_positions_count",
+        ),
+        pending_orders_count=_optional_nonnegative_int(
+            raw.get("pending_orders_count"),
+            "pending_orders_count",
+        ),
     )
     if snapshot.initial_capital <= 0:
         raise RequestError("initial_capital must be positive")
@@ -300,6 +335,12 @@ def _trade_request(raw: Mapping[str, Any]) -> TradeRequest:
         raise RequestError("estimated_costs cannot be negative")
     if request.additional_risk < 0:
         raise RequestError("additional_risk cannot be negative")
+    if request.volume < 0:
+        raise RequestError("volume cannot be negative")
+    if request.entry_price is not None and request.entry_price <= 0:
+        raise RequestError("entry_price must be positive when supplied")
+    if request.stop_loss is not None and request.stop_loss <= 0:
+        raise RequestError("stop_loss must be positive when supplied")
     if (
         request.action == Action.MODIFY
         and request.additional_risk > 0
@@ -321,8 +362,6 @@ def _trade_request(raw: Mapping[str, Any]) -> TradeRequest:
             raise RequestError("opening volume must be positive")
         if request.entry_price is None or request.entry_price <= 0:
             raise RequestError("opening requests require a positive entry price")
-        if request.stop_loss is not None and request.stop_loss <= 0:
-            raise RequestError("opening stop loss must be positive")
     return request
 
 
@@ -542,6 +581,8 @@ def _stored_snapshot(account: StoredAccount) -> dict[str, Any]:
             "data_uncertain": snapshot.data_uncertain,
             "day_locked": snapshot.day_locked,
             "breach_latched": snapshot.breach_latched,
+            "open_positions_count": snapshot.open_positions_count,
+            "pending_orders_count": snapshot.pending_orders_count,
         }
     )
 
@@ -554,6 +595,16 @@ def _canonical_hash(payload: Mapping[str, Any]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _prometheus_label(value: Any) -> str:
+    """Escape a value for a Prometheus double-quoted label."""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace('"', '\\"')
+    )
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -587,15 +638,40 @@ def _acquire_state_server_lock(state_path: str | Path) -> Path:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     for _ in range(2):
         try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
             descriptor = os.open(
                 lock_path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                flags,
                 0o600,
             )
         except FileExistsError:
             try:
-                pid = int(lock_path.read_text(encoding="ascii").strip())
-            except (OSError, ValueError):
+                metadata = os.stat(lock_path, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise ValueError(
+                    "unable to inspect the existing state database lock"
+                ) from exc
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("state database lock must be a regular file")
+            if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+                raise ValueError(
+                    "state database lock must be owned by this user"
+                )
+            try:
+                read_flags = os.O_RDONLY
+                if hasattr(os, "O_NOFOLLOW"):
+                    read_flags |= os.O_NOFOLLOW
+                read_descriptor = os.open(lock_path, read_flags)
+                try:
+                    contents = os.read(read_descriptor, 64).decode("ascii")
+                finally:
+                    os.close(read_descriptor)
+                pid = int(contents.strip())
+            except (OSError, UnicodeDecodeError, ValueError):
                 pid = -1
             if _process_alive(pid):
                 raise ValueError(
@@ -603,9 +679,16 @@ def _acquire_state_server_lock(state_path: str | Path) -> Path:
                 )
             lock_path.unlink(missing_ok=True)
             continue
-        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
-            handle.write(str(os.getpid()))
-        os.chmod(lock_path, 0o600)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+                handle.write(str(os.getpid()))
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            lock_path.unlink(missing_ok=True)
+            raise
         return lock_path
     raise ValueError("unable to acquire state database server lock")
 
@@ -637,6 +720,14 @@ def account_sync_payload(
         raise RequestError("initial_capital must be positive")
     if current_open_risk < 0:
         raise RequestError("current_open_risk cannot be negative")
+    open_positions_count = _optional_nonnegative_int(
+        payload.get("open_positions_count"),
+        "open_positions_count",
+    )
+    pending_orders_count = _optional_nonnegative_int(
+        payload.get("pending_orders_count"),
+        "pending_orders_count",
+    )
 
     account_type = _enum(
         AccountType,
@@ -662,6 +753,8 @@ def account_sync_payload(
         balance=balance,
         equity=equity,
         current_open_risk=current_open_risk,
+        open_positions_count=open_positions_count,
+        pending_orders_count=pending_orders_count,
         as_of=as_of,
         received_at=received_at,
         profile=profile,
@@ -809,6 +902,7 @@ def evaluate_stored_payload(
         symbol=request.symbol,
         occurred_at=received_at,
         evaluator=evaluator,
+        block_on_unknown_execution=request.is_risk_increasing,
     )
 
 
@@ -910,7 +1004,10 @@ def news_status_payload(
         profile.phase == AccountPhase.FTMO_ACCOUNT
         and profile.style == AccountStyle.STANDARD
     )
-    stale = news_age_seconds is None or news_age_seconds > 60
+    stale = (
+        news_age_seconds is None
+        or news_age_seconds > profile.news_max_calendar_age_seconds
+    )
     if stale:
         return {
             "ok": True,
@@ -920,7 +1017,7 @@ def news_status_payload(
             "news_data_stale": True,
             "open_blocked": True,
             "force_flat": False,
-            "cancel_pending": False,
+            "cancel_pending": True,
             "hard_window": False,
             "emergency_alert": True,
             "event_ids": [],
@@ -952,9 +1049,11 @@ def news_status_payload(
 
         if -internal_after <= delta <= internal_before:
             open_blocked = True
+            cancel_pending = True
             event_ids.append(event.event_id)
         if is_restricted_account and -hard_after <= delta <= hard_before:
             hard_window = True
+            cancel_pending = True
         if (
             is_restricted_account
             and hard_before < delta <= force_flat_before
@@ -1026,7 +1125,7 @@ def market_status_payload(
             "market_data_stale": True,
             "open_blocked": True,
             "force_flat": False,
-            "cancel_pending": False,
+            "cancel_pending": True,
             "closure_active": False,
             "emergency_alert": True,
             "closure_ids": [],
@@ -1053,9 +1152,11 @@ def market_status_payload(
         if closure.start_time <= now <= closure.end_time:
             closure_active = True
             open_blocked = True
+            cancel_pending = True
             closure_ids.append(closure.closure_id)
         elif timedelta(0) <= until_start <= open_block_before:
             open_blocked = True
+            cancel_pending = True
             if (
                 is_restricted_account
                 and until_start <= flat_before
@@ -1102,25 +1203,14 @@ def _credential_json(record: Any) -> dict[str, Any]:
 
 def _credential_scopes(raw: Any) -> tuple[str, ...]:
     if raw is None:
-        return tuple(
-            sorted(
-                {
-                    "account:sync",
-                    "trade:evaluate",
-                    "trade:execution",
-                    "calendar:read",
-                    "qualification:read",
-                    "qualification:write",
-                }
-            )
-        )
+        return tuple(sorted(PLATFORM_CREDENTIAL_SCOPES))
     if not isinstance(raw, list) or not raw:
         raise RequestError("scopes must be a non-empty JSON list")
     scopes = tuple(sorted({str(item).strip() for item in raw if str(item).strip()}))
     if not scopes or any(len(item) > 64 for item in scopes):
         raise RequestError("scopes must contain non-empty values of at most 64 characters")
-    if "admin:*" in scopes:
-        raise RequestError("admin:* cannot be assigned to an account credential")
+    if any(item not in ACCOUNT_CREDENTIAL_SCOPES for item in scopes):
+        raise RequestError("scopes contain an unsupported account scope")
     return scopes
 
 
@@ -1158,6 +1248,12 @@ def create_credential_payload(
     state_store: StateStore,
     config_source: ConfigSource,
 ) -> dict[str, Any]:
+    try:
+        state_store.get_account(account_id)
+    except KeyError as exc:
+        raise RequestError(
+            "account must be provisioned before an account credential is issued"
+        ) from exc
     now = datetime.now(timezone.utc)
     not_before, expires_at = _credential_expiry(payload, config_source, now)
     record, secret = state_store.create_account_credential(
@@ -1428,6 +1524,10 @@ def evaluate_payload(
         "news_data_age_seconds",
         default_news_age_seconds,
     )
+    news_age_seconds = _age_seconds(
+        news_age_seconds,
+        "news_data_age_seconds",
+    )
     closures = (
         _market_closures(payload["market_closures"])
         if "market_closures" in payload
@@ -1436,6 +1536,10 @@ def evaluate_payload(
     market_age_seconds = payload.get(
         "market_data_age_seconds",
         default_market_age_seconds,
+    )
+    market_age_seconds = _age_seconds(
+        market_age_seconds,
+        "market_data_age_seconds",
     )
     config = _load_config(config_source)
     max_market_age = int(
@@ -1449,7 +1553,7 @@ def evaluate_payload(
         request.is_risk_increasing
         and (
             news_age_seconds is None
-            or int(news_age_seconds) > 60
+            or news_age_seconds > profile.news_max_calendar_age_seconds
         )
     ):
         decision = Decision(
@@ -1468,7 +1572,7 @@ def evaluate_payload(
             request.is_risk_increasing
             and (
                 market_age_seconds is None
-                or int(market_age_seconds) > max_market_age
+                or market_age_seconds > max_market_age
             )
             and evaluated.code != DecisionCode.REJECT_NEWS
         ):
@@ -1541,6 +1645,10 @@ def position_size_payload(
                     _required(payload, "min_volume"),
                     "min_volume",
                 ),
+                estimated_costs=_decimal(
+                    payload.get("estimated_costs", "0"),
+                    "estimated_costs",
+                ),
                 max_volume=(
                     _decimal(payload["max_volume"], "max_volume")
                     if payload.get("max_volume") is not None
@@ -1559,11 +1667,12 @@ def position_size_payload(
 
 
 class RiskRequestHandler(BaseHTTPRequestHandler):
-    server_version = "FTMO-RiskAPI/3.0"
+    server_version = "FTMO-RiskAPI/4.0"
 
     def setup(self) -> None:
         super().setup()
         self.connection.settimeout(self.risk_server.read_timeout_seconds)
+        self.auth_subject: str | None = None
 
     def log_message(self, format: str, *args: Any) -> None:
         # Keep the service quiet by default; platform adapters log decisions.
@@ -1669,9 +1778,10 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
             {
                 "request_id": request_id,
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "endpoint": endpoint,
+                "endpoint": _path_only(endpoint),
                 "http_status": status,
                 "client": self.client_address[0],
+                "auth_subject": self.auth_subject,
                 "decision": body.get("decision"),
                 "account": body.get("account"),
                 "rule_version": body.get("rule_version"),
@@ -1694,8 +1804,11 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
         if length <= 0 or length > self.risk_server.max_body_bytes:
             raise RequestError("request body is empty or too large")
         try:
-            body = json.loads(self.rfile.read(length))
-        except json.JSONDecodeError as exc:
+            body = json.loads(
+                self.rfile.read(length),
+                object_pairs_hook=_json_object_without_duplicate_keys,
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise RequestError("request body must be valid JSON") from exc
         if not isinstance(body, dict):
             raise RequestError("request body must be a JSON object")
@@ -1738,6 +1851,16 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     {"ok": False, "error": "invalid administrator token"},
                 )
                 return
+            self.auth_subject = "admin"
+            database_up = bool(
+                self.risk_server.state_store is not None
+                and self.risk_server.state_store.database_healthy()
+            )
+            unknown_executions = None
+            if database_up and self.risk_server.state_store is not None:
+                unknown_executions = (
+                    self.risk_server.state_store.unknown_execution_count()
+                )
             self._send_json(
                 HTTPStatus.OK,
                 {
@@ -1755,6 +1878,8 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                         "market"
                     ),
                     "persistent_state": self.risk_server.state_store is not None,
+                    "database_up": database_up,
+                    "unknown_execution_records": unknown_executions,
                     "account_credentials_required": (
                         self.risk_server.account_credentials_required
                     ),
@@ -1772,6 +1897,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     {"ok": False, "error": "invalid administrator token"},
                 )
                 return
+            self.auth_subject = "admin"
             encoded = self.risk_server.metrics_text().encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header(
@@ -1806,7 +1932,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 account_id = _account_id(values[0])
-                self._authorize_account(
+                self.auth_subject = self._authorize_account(
                     account_id=account_id,
                     scope="qualification:read",
                 )
@@ -1836,6 +1962,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     {"ok": False, "error": "invalid administrator token"},
                 )
                 return
+            self.auth_subject = "admin"
             if self.risk_server.state_store is None:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
@@ -1862,6 +1989,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     {"ok": False, "error": "invalid administrator token"},
                 )
                 return
+            self.auth_subject = "admin"
             if self.risk_server.state_store is None:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
@@ -1909,7 +2037,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json()
-            self._authorize_payload(path, payload)
+            self.auth_subject = self._authorize_payload(path, payload)
             if path == "/v1/evaluate":
                 with self.risk_server.news_lock:
                     cached_events = list(self.risk_server.news_events)
@@ -1972,6 +2100,17 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     raise RequestError(
                         "persistent state is disabled on this server"
                     )
+                if self.auth_subject != "admin":
+                    account_id = _account_id(
+                        _required(payload, "account_id")
+                    )
+                    try:
+                        self.risk_server.state_store.get_account(account_id)
+                    except KeyError as exc:
+                        raise ForbiddenError(
+                            "account must be provisioned by an administrator "
+                            "before a platform credential can synchronize it"
+                        ) from exc
                 body = account_sync_payload(
                     payload,
                     self.risk_server.state_store,
@@ -2106,6 +2245,9 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                         )
                     self.risk_server.news_events = events
                     self.risk_server.news_fetched_at = fetched_at
+                    self.risk_server.news_calendar_rule_version = (
+                        self.risk_server.rule_version
+                    )
                     with self.risk_server.metrics_lock:
                         sync_metric_key = ("news", "success")
                         self.risk_server.calendar_sync_counts[
@@ -2172,6 +2314,9 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                         )
                     self.risk_server.market_closures = closures
                     self.risk_server.market_fetched_at = fetched_at
+                    self.risk_server.market_calendar_rule_version = (
+                        self.risk_server.rule_version
+                    )
                     with self.risk_server.metrics_lock:
                         sync_metric_key = ("market", "success")
                         self.risk_server.calendar_sync_counts[
@@ -2332,8 +2477,10 @@ class RiskHTTPServer(ThreadingHTTPServer):
         self.calendar_restore_counts: dict[tuple[str, str], int] = {}
         self.news_events: list[NewsEvent] = []
         self.news_fetched_at: datetime | None = None
+        self.news_calendar_rule_version: str | None = None
         self.market_closures: list[MarketClosure] = []
         self.market_fetched_at: datetime | None = None
+        self.market_calendar_rule_version: str | None = None
         self.audit_path = os.environ.get("RISK_AUDIT_PATH", "")
         self.qualification_dashboard_path = (
             Path(__file__).resolve().parents[1]
@@ -2347,11 +2494,7 @@ class RiskHTTPServer(ThreadingHTTPServer):
         self.day_timezone = str(
             config.get("ftmo_day_timezone", "Europe/Prague")
         )
-        self.state_store = (
-            StateStore(state_path, day_timezone=self.day_timezone)
-            if state_path
-            else None
-        )
+        self.state_store: StateStore | None = None
         security = config.get("security", {})
         self.account_credentials_required = (
             bool(security.get("require_account_credentials", True))
@@ -2376,10 +2519,18 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 "client certificate validation requires TLS certificate and key"
             )
         self.mtls_enabled = tls_cert_path is not None
-        self._state_server_lock_path = (
-            _acquire_state_server_lock(state_path) if state_path else None
-        )
+        self._state_server_lock_path: Path | None = None
         try:
+            if state_path:
+                # Lock before opening SQLite so a competing process cannot
+                # touch the state file while it is failing startup.
+                self._state_server_lock_path = _acquire_state_server_lock(
+                    state_path
+                )
+                self.state_store = StateStore(
+                    state_path,
+                    day_timezone=self.day_timezone,
+                )
             super().__init__(server_address, RiskRequestHandler)
             if self.mtls_enabled:
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -2410,6 +2561,8 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 super().server_close()
             except Exception:
                 pass
+            if self.state_store is not None:
+                self.state_store.close()
             self._release_state_server_lock()
             raise
 
@@ -2425,6 +2578,8 @@ class RiskHTTPServer(ThreadingHTTPServer):
         try:
             super().server_close()
         finally:
+            if self.state_store is not None:
+                self.state_store.close()
             self._release_state_server_lock()
 
     def news_age_seconds(self) -> int | None:
@@ -2458,7 +2613,38 @@ class RiskHTTPServer(ThreadingHTTPServer):
             return
         try:
             snapshots = self.state_store.get_calendar_snapshots()
-            for calendar_type, snapshot in snapshots.items():
+        except Exception:
+            LOGGER.exception("failed to read persisted calendars")
+            with self.metrics_lock:
+                for calendar_type in ("news", "market"):
+                    key = (calendar_type, "failure")
+                    self.calendar_restore_counts[key] = (
+                        self.calendar_restore_counts.get(key, 0) + 1
+                    )
+            return
+
+        for calendar_type, snapshot in snapshots.items():
+            if calendar_type not in {"news", "market"}:
+                LOGGER.error(
+                    "unsupported persisted calendar type: %s",
+                    calendar_type,
+                )
+                continue
+            if snapshot.rule_version != self.rule_version:
+                LOGGER.error(
+                    "refusing persisted %s calendar from rule version %s; "
+                    "current rule version is %s",
+                    calendar_type,
+                    snapshot.rule_version,
+                    self.rule_version,
+                )
+                with self.metrics_lock:
+                    key = (calendar_type, "rule_mismatch")
+                    self.calendar_restore_counts[key] = (
+                        self.calendar_restore_counts.get(key, 0) + 1
+                    )
+                continue
+            try:
                 if calendar_type == "news":
                     events = _news_events(
                         cast(list[Mapping[str, Any]], snapshot.payload)
@@ -2466,53 +2652,71 @@ class RiskHTTPServer(ThreadingHTTPServer):
                     with self.news_lock:
                         self.news_events = events
                         self.news_fetched_at = snapshot.fetched_at
-                elif calendar_type == "market":
+                        self.news_calendar_rule_version = snapshot.rule_version
+                else:
                     closures = _market_closures(
                         cast(list[Mapping[str, Any]], snapshot.payload)
                     )
                     with self.market_lock:
                         self.market_closures = closures
                         self.market_fetched_at = snapshot.fetched_at
-                else:
-                    raise ValueError(
-                        f"unsupported persisted calendar type: {calendar_type}"
-                    )
+                        self.market_calendar_rule_version = snapshot.rule_version
+            except Exception:
+                LOGGER.exception(
+                    "failed to restore persisted %s calendar",
+                    calendar_type,
+                )
                 with self.metrics_lock:
-                    self.calendar_restore_counts[
-                        (calendar_type, "success")
-                    ] = (
-                        self.calendar_restore_counts.get(
-                            (calendar_type, "success"),
-                            0,
-                        )
-                        + 1
+                    key = (calendar_type, "failure")
+                    self.calendar_restore_counts[key] = (
+                        self.calendar_restore_counts.get(key, 0) + 1
                     )
-        except Exception:
-            LOGGER.exception("failed to restore persisted calendars")
+                continue
             with self.metrics_lock:
-                for calendar_type in ("news", "market"):
-                    self.calendar_restore_counts[
-                        (calendar_type, "failure")
-                    ] = (
-                        self.calendar_restore_counts.get(
-                            (calendar_type, "failure"),
-                            0,
-                        )
-                        + 1
-                    )
+                key = (calendar_type, "success")
+                self.calendar_restore_counts[key] = (
+                    self.calendar_restore_counts.get(key, 0) + 1
+                )
 
     def calendar_health(self, calendar_type: str) -> dict[str, Any]:
         if calendar_type == "news":
-            fetched_at = self.news_fetched_at
+            with self.news_lock:
+                fetched_at = self.news_fetched_at
+                rule_version = self.news_calendar_rule_version
             age = self.news_age_seconds()
+            max_age_seconds = int(
+                self.config["news_controls"]["max_calendar_age_seconds"]
+            )
         else:
-            fetched_at = self.market_fetched_at
+            with self.market_lock:
+                fetched_at = self.market_fetched_at
+                rule_version = self.market_calendar_rule_version
             age = self.market_age_seconds()
+            max_age_seconds = int(
+                self.config["market_close_controls"][
+                    "max_schedule_age_seconds"
+                ]
+            )
+        rule_version_match = (
+            rule_version == self.rule_version
+            if rule_version is not None
+            else False
+        )
+        stale = (
+            fetched_at is None
+            or age is None
+            or age > max_age_seconds
+            or not rule_version_match
+        )
         return {
             "present": fetched_at is not None,
             "fetched_at": fetched_at.isoformat() if fetched_at else None,
             "age_seconds": age,
+            "max_age_seconds": max_age_seconds,
+            "stale": stale,
             "persistent": self.state_store is not None,
+            "rule_version": rule_version,
+            "rule_version_match": rule_version_match,
         }
 
     def observe_response(
@@ -2558,7 +2762,9 @@ class RiskHTTPServer(ThreadingHTTPServer):
         for (method, endpoint, status), count in sorted(requests.items()):
             lines.append(
                 "ftmo_risk_http_requests_total"
-                f'{{method="{method}",endpoint="{endpoint}",status="{status}"}} '
+                f'{{method="{_prometheus_label(method)}",'
+                f'endpoint="{_prometheus_label(endpoint)}",'
+                f'status="{_prometheus_label(status)}"}} '
                 f"{count}"
             )
         lines.extend(
@@ -2569,7 +2775,8 @@ class RiskHTTPServer(ThreadingHTTPServer):
         )
         for code, count in sorted(decisions.items()):
             lines.append(
-                f'ftmo_risk_decisions_total{{code="{code}"}} {count}'
+                "ftmo_risk_decisions_total"
+                f'{{code="{_prometheus_label(code)}"}} {count}'
             )
         lines.extend(
             [
@@ -2580,7 +2787,8 @@ class RiskHTTPServer(ThreadingHTTPServer):
         for (calendar, result), count in sorted(calendar_sync.items()):
             lines.append(
                 "ftmo_risk_calendar_sync_total"
-                f'{{calendar="{calendar}",result="{result}"}} {count}'
+                f'{{calendar="{_prometheus_label(calendar)}",'
+                f'result="{_prometheus_label(result)}"}} {count}'
             )
         lines.extend(
             [
@@ -2591,7 +2799,8 @@ class RiskHTTPServer(ThreadingHTTPServer):
         for (calendar, result), count in sorted(calendar_restore.items()):
             lines.append(
                 "ftmo_risk_calendar_restore_total"
-                f'{{calendar="{calendar}",result="{result}"}} {count}'
+                f'{{calendar="{_prometheus_label(calendar)}",'
+                f'result="{_prometheus_label(result)}"}} {count}'
             )
         lines.extend(
             [
@@ -2599,6 +2808,10 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 "# TYPE ftmo_risk_calendar_present gauge",
                 "# HELP ftmo_risk_calendar_age_seconds Calendar age.",
                 "# TYPE ftmo_risk_calendar_age_seconds gauge",
+                "# HELP ftmo_risk_calendar_stale Whether a calendar is missing, stale, or uses an inactive rule version.",
+                "# TYPE ftmo_risk_calendar_stale gauge",
+                "# HELP ftmo_risk_calendar_rule_version_match Whether the loaded calendar uses the active rule version.",
+                "# TYPE ftmo_risk_calendar_rule_version_match gauge",
             ]
         )
         for calendar in ("news", "market"):
@@ -2606,12 +2819,24 @@ class RiskHTTPServer(ThreadingHTTPServer):
             present = 1 if health["present"] else 0
             age = health["age_seconds"]
             lines.append(
-                f'ftmo_risk_calendar_present{{calendar="{calendar}"}} '
+                "ftmo_risk_calendar_present"
+                f'{{calendar="{_prometheus_label(calendar)}"}} '
                 f"{present}"
             )
             lines.append(
-                f'ftmo_risk_calendar_age_seconds{{calendar="{calendar}"}} '
+                "ftmo_risk_calendar_age_seconds"
+                f'{{calendar="{_prometheus_label(calendar)}"}} '
                 f"{age if age is not None else -1}"
+            )
+            lines.append(
+                "ftmo_risk_calendar_stale"
+                f'{{calendar="{_prometheus_label(calendar)}"}} '
+                f"{1 if health['stale'] else 0}"
+            )
+            lines.append(
+                "ftmo_risk_calendar_rule_version_match"
+                f'{{calendar="{_prometheus_label(calendar)}"}} '
+                f"{1 if health['rule_version_match'] else 0}"
             )
 
         lines.extend(
@@ -2631,11 +2856,18 @@ class RiskHTTPServer(ThreadingHTTPServer):
         accounts: list[StoredAccount] = []
         unknown = 0
         backup: dict[str, Any] = {}
+        credential_metrics = {
+            "active": 0,
+            "expired": 0,
+            "expiring_soon": 0,
+            "not_yet_active": 0,
+        }
         if database_up and self.state_store is not None:
             try:
                 accounts = self.state_store.all_accounts()
                 unknown = self.state_store.unknown_execution_count()
                 backup = self.state_store.backup_metrics()
+                credential_metrics = self.state_store.credential_metrics()
             except Exception:
                 LOGGER.exception("failed to collect SQLite metrics")
                 database_up = 0
@@ -2645,27 +2877,53 @@ class RiskHTTPServer(ThreadingHTTPServer):
             "RED": 0,
             "LOCKED": 0,
             "BREACH": 0,
+            "UNKNOWN": 0,
         }
+        uncertain_accounts = 0
+        stale_qualification_snapshots = 0
+        qualification_age_limit = int(
+            self.config["qualification_controls"][
+                "max_account_snapshot_age_seconds"
+            ]
+        )
         for account in accounts:
-            profile, _ = _profile(
-                self.config,
-                {
-                    "account_type": account.account_type.value,
-                    "phase": account.phase.value,
-                    "style": account.style.value,
-                },
-            )
-            status = RiskEngine(
-                profile,
-                day_timezone=self.day_timezone,
-            ).status(account.snapshot)
-            status_counts[status] = status_counts.get(status, 0) + 1
+            if account.snapshot.data_uncertain:
+                uncertain_accounts += 1
+            if account.snapshot.data_age_seconds > qualification_age_limit:
+                stale_qualification_snapshots += 1
+            try:
+                profile, _ = _profile(
+                    self.config,
+                    {
+                        "account_type": account.account_type.value,
+                        "phase": account.phase.value,
+                        "style": account.style.value,
+                    },
+                )
+                status = RiskEngine(
+                    profile,
+                    day_timezone=self.day_timezone,
+                ).status(account.snapshot)
+                status_counts[status] = status_counts.get(status, 0) + 1
+            except Exception:
+                LOGGER.exception(
+                    "failed to calculate account metrics account_id=%s",
+                    account.account_id,
+                )
+                status_counts["UNKNOWN"] += 1
         for status, count in sorted(status_counts.items()):
             lines.append(
-                f'ftmo_risk_account_status{{status="{status}"}} {count}'
+                "ftmo_risk_account_status"
+                f'{{status="{_prometheus_label(status)}"}} {count}'
             )
         lines.extend(
             [
+                "# HELP ftmo_risk_accounts_uncertain Accounts with uncertain state.",
+                "# TYPE ftmo_risk_accounts_uncertain gauge",
+                f"ftmo_risk_accounts_uncertain {uncertain_accounts}",
+                "# HELP ftmo_risk_qualification_snapshots_stale Accounts whose qualification snapshot is too old.",
+                "# TYPE ftmo_risk_qualification_snapshots_stale gauge",
+                f"ftmo_risk_qualification_snapshots_stale {stale_qualification_snapshots}",
                 "# HELP ftmo_risk_unknown_execution_records Unknown executions.",
                 "# TYPE ftmo_risk_unknown_execution_records gauge",
                 f"ftmo_risk_unknown_execution_records {unknown}",
@@ -2676,6 +2934,12 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 "# HELP ftmo_risk_database_up SQLite health status.",
                 "# TYPE ftmo_risk_database_up gauge",
                 f"ftmo_risk_database_up {database_up}",
+                "# HELP ftmo_risk_credentials_expiring_soon Active credentials expiring within 24 hours.",
+                "# TYPE ftmo_risk_credentials_expiring_soon gauge",
+                f"ftmo_risk_credentials_expiring_soon {credential_metrics['expiring_soon']}",
+                "# HELP ftmo_risk_credentials_expired Active credentials past expiry.",
+                "# TYPE ftmo_risk_credentials_expired gauge",
+                f"ftmo_risk_credentials_expired {credential_metrics['expired']}",
             ]
         )
         lines.extend(
@@ -2755,7 +3019,7 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 self.rate_by_client = {
                     key: values
                     for key, values in self.rate_by_client.items()
-                    if values
+                    if values and values[-1] >= cutoff
                 }
             return True
 

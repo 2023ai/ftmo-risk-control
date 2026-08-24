@@ -20,13 +20,22 @@ groups:
           description: Risk-increasing trading is fail-closed without news data.
 
       - alert: FtmoRiskNewsCalendarStale
-        expr: ftmo_risk_calendar_age_seconds{calendar="news"} > 60
+        expr: ftmo_risk_calendar_present{calendar="news"} == 1 and ftmo_risk_calendar_stale{calendar="news"} == 1
         for: 1m
         labels:
           severity: critical
         annotations:
           summary: News calendar is stale
-          description: News data has exceeded the configured 60-second age.
+          description: News data is stale or tied to an inactive rule version.
+
+      - alert: FtmoRiskCalendarRuleVersionMismatch
+        expr: ftmo_risk_calendar_restore_total{result="rule_mismatch"} > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Persisted calendar uses an inactive rule version
+          description: The service refused to use a calendar snapshot until it is resynchronized.
 
       - alert: FtmoRiskMarketCalendarMissing
         expr: ftmo_risk_calendar_present{calendar="market"} == 0
@@ -38,13 +47,13 @@ groups:
           description: Risk-increasing trading is fail-closed without closures.
 
       - alert: FtmoRiskMarketCalendarStale
-        expr: ftmo_risk_calendar_age_seconds{calendar="market"} > 3600
+        expr: ftmo_risk_calendar_present{calendar="market"} == 1 and ftmo_risk_calendar_stale{calendar="market"} == 1
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: Market closure calendar is stale
-          description: Closure data has exceeded the configured one-hour age.
+          description: Closure data is stale or tied to an inactive rule version.
 
       - alert: FtmoRiskUnknownExecution
         expr: ftmo_risk_unknown_execution_records > 0
@@ -54,6 +63,24 @@ groups:
         annotations:
           summary: One or more execution outcomes are unknown
           description: Reconcile platform orders before releasing reservations.
+
+      - alert: FtmoRiskCredentialExpiring
+        expr: ftmo_risk_credentials_expiring_soon > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: An account credential expires within 24 hours
+          description: Rotate the account credential and verify platform synchronization.
+
+      - alert: FtmoRiskQualificationSnapshotStale
+        expr: ftmo_risk_qualification_snapshots_stale > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: A qualification snapshot is stale
+          description: The qualification dashboard must remain in manual-review state until account data is refreshed.
 
       - alert: FtmoRiskOfficialBreach
         expr: ftmo_risk_account_status{status="BREACH"} > 0

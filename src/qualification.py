@@ -112,6 +112,28 @@ def qualification_snapshot(
         if target_pct is not None
         else None
     )
+    target_balance = (
+        account.snapshot.initial_capital + target_amount
+        if target_amount is not None
+        else None
+    )
+    balance_target_met = (
+        account.snapshot.balance >= target_balance
+        if target_balance is not None
+        else True
+    )
+    positions_known = account.snapshot.open_positions_count is not None
+    pending_orders_known = account.snapshot.pending_orders_count is not None
+    all_positions_closed = (
+        account.snapshot.open_positions_count == 0
+        if positions_known
+        else False
+    )
+    all_pending_orders_cancelled = (
+        account.snapshot.pending_orders_count == 0
+        if pending_orders_known
+        else False
+    )
     progress_ratio = (
         total_profit / target_amount
         if target_amount is not None and target_amount > ZERO
@@ -120,6 +142,9 @@ def qualification_snapshot(
     profit_target_applicable = target_amount is not None
     profit_target_met = (
         total_profit >= target_amount
+        and balance_target_met
+        and all_positions_closed
+        and all_pending_orders_cancelled
         if target_amount is not None
         else True
     )
@@ -128,6 +153,20 @@ def qualification_snapshot(
     uncertainty_reasons: list[str] = []
     if account.snapshot.data_uncertain:
         uncertainty_reasons.append("account settlement baseline is uncertain")
+    max_snapshot_age = int(
+        config["qualification_controls"].get(
+            "max_account_snapshot_age_seconds",
+            60,
+        )
+    )
+    if account.snapshot.data_age_seconds > max_snapshot_age:
+        uncertainty_reasons.append(
+            "account snapshot is too old for qualification"
+        )
+    if target_amount is not None and not positions_known:
+        uncertainty_reasons.append("open position inventory is unavailable")
+    if target_amount is not None and not pending_orders_known:
+        uncertainty_reasons.append("pending order inventory is unavailable")
     history_complete = history_status is not None
     cycle_id: str | None = None
     history_start_at: str | None = None
@@ -229,6 +268,25 @@ def qualification_snapshot(
             ),
             "target_amount": (
                 _decimal_text(target_amount)
+                if target_amount is not None
+                else None
+            ),
+            "target_balance": (
+                _decimal_text(target_balance)
+                if target_balance is not None
+                else None
+            ),
+            "balance": _decimal_text(account.snapshot.balance),
+            "balance_target_met": (
+                balance_target_met if target_amount is not None else None
+            ),
+            "open_positions_count": account.snapshot.open_positions_count,
+            "all_positions_closed": (
+                all_positions_closed if target_amount is not None else None
+            ),
+            "pending_orders_count": account.snapshot.pending_orders_count,
+            "all_pending_orders_cancelled": (
+                all_pending_orders_cancelled
                 if target_amount is not None
                 else None
             ),

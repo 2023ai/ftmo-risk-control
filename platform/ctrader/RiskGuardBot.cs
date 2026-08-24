@@ -47,6 +47,7 @@ namespace FtmoRiskControl
         public string Label { get; set; }
 
         private bool _unknownExecutionLock;
+        private long _lastTimestampMilliseconds;
 
         private string UnknownExecutionLockKey
         {
@@ -87,10 +88,17 @@ namespace FtmoRiskControl
             return value.ToString("0.########", CultureInfo.InvariantCulture);
         }
 
-        private static string Iso(DateTime value)
+        private string Iso(DateTime value)
         {
-            return value.ToUniversalTime().ToString(
-                "yyyy-MM-dd'T'HH:mm:ss'Z'",
+            var milliseconds = value.ToUniversalTime().Ticks
+                / TimeSpan.TicksPerMillisecond;
+            if (milliseconds <= _lastTimestampMilliseconds)
+                milliseconds = _lastTimestampMilliseconds + 1;
+            _lastTimestampMilliseconds = milliseconds;
+            return new DateTime(
+                milliseconds * TimeSpan.TicksPerMillisecond,
+                DateTimeKind.Utc).ToString(
+                "yyyy-MM-dd'T'HH:mm:ss.fff'Z'",
                 CultureInfo.InvariantCulture);
         }
 
@@ -178,6 +186,8 @@ namespace FtmoRiskControl
                 var currentPrice = position.TradeType == TradeType.Buy
                     ? symbol.Bid
                     : symbol.Ask;
+                if (currentPrice <= 0 || symbol.PipSize <= 0)
+                    return InitialCapital;
                 var stopPips = Math.Abs(
                     currentPrice - position.StopLoss.Value)
                     / symbol.PipSize;
@@ -194,6 +204,8 @@ namespace FtmoRiskControl
 
                 var symbol = Symbols.GetSymbol(order.SymbolName);
                 if (symbol == null)
+                    return InitialCapital;
+                if (symbol.PipSize <= 0)
                     return InitialCapital;
 
                 var stopPips = Math.Abs(
@@ -224,6 +236,8 @@ namespace FtmoRiskControl
                 ["balance"] = DecimalText(Account.Balance),
                 ["equity"] = DecimalText(Account.Equity),
                 ["current_open_risk"] = DecimalText(CurrentOpenRisk()),
+                ["open_positions_count"] = Positions.Count,
+                ["pending_orders_count"] = PendingOrders.Count,
                 ["as_of"] = Iso(Server.TimeInUtc)
             };
             return SendRiskRequest(
@@ -235,10 +249,12 @@ namespace FtmoRiskControl
         private bool Evaluate(
             Dictionary<string, object> tradeRequest,
             string requestId,
-            out string response)
+            out string response,
+            bool riskIncreasing)
         {
             response = null;
-            if (!SyncAccount())
+            var synced = SyncAccount();
+            if (riskIncreasing && !synced)
                 return false;
 
             var payload = new Dictionary<string, object>
@@ -295,6 +311,7 @@ namespace FtmoRiskControl
                 NextRequestId("execution"));
             if (response == null)
             {
+                LockUnknownExecution();
                 Print(
                     "RiskGuard: execution audit unresolved request_id={0}",
                     requestId);
@@ -366,7 +383,7 @@ namespace FtmoRiskControl
                 ["idea_id"] = ideaId
             };
 
-            if (!Evaluate(request, requestId, out var response))
+            if (!Evaluate(request, requestId, out var response, true))
             {
                 Print("RiskGuard rejected open: {0}", response ?? "no response");
                 return null;
@@ -447,7 +464,7 @@ namespace FtmoRiskControl
                 ["requested_at"] = Iso(Server.TimeInUtc),
                 ["is_risk_increasing"] = false
             };
-            if (!Evaluate(request, requestId, out var response))
+            if (!Evaluate(request, requestId, out var response, false))
             {
                 Print("RiskGuard rejected close: {0}", response ?? "no response");
                 return null;
@@ -502,7 +519,7 @@ namespace FtmoRiskControl
                 ["volume"] = DecimalText(normalizedVolume),
                 ["is_risk_increasing"] = false
             };
-            if (!Evaluate(request, requestId, out var response))
+            if (!Evaluate(request, requestId, out var response, false))
             {
                 Print(
                     "RiskGuard rejected partial close: "
@@ -546,26 +563,35 @@ namespace FtmoRiskControl
             var positionSymbol = Symbols.GetSymbol(position.SymbolName);
             if (positionSymbol == null)
                 return null;
-            if (stopLossPrice.HasValue
-                && ((position.TradeType == TradeType.Buy
-                        && stopLossPrice.Value >= position.EntryPrice)
-                    || (position.TradeType == TradeType.Sell
-                        && stopLossPrice.Value <= position.EntryPrice)))
+            if (!stopLossPrice.HasValue)
+            {
+                if (!position.StopLoss.HasValue || isRiskIncreasing)
+                    return null;
+                // A missing stop means "keep the current stop" for a TP-only change.
+                stopLossPrice = position.StopLoss.Value;
+            }
+            var currentPrice = position.TradeType == TradeType.Buy
+                ? positionSymbol.Bid
+                : positionSymbol.Ask;
+            if (currentPrice <= 0)
+                return null;
+            if ((position.TradeType == TradeType.Buy
+                    && stopLossPrice.Value >= currentPrice)
+                || (position.TradeType == TradeType.Sell
+                    && stopLossPrice.Value <= currentPrice))
             {
                 return null;
             }
             var currentRisk = position.StopLoss.HasValue
                 ? positionSymbol.AmountRisked(
                     position.VolumeInUnits,
-                    Math.Abs(position.EntryPrice - position.StopLoss.Value)
+                    Math.Abs(currentPrice - position.StopLoss.Value)
                         / positionSymbol.PipSize)
                 : InitialCapital;
-            var newRisk = stopLossPrice.HasValue
-                ? positionSymbol.AmountRisked(
-                    position.VolumeInUnits,
-                    Math.Abs(position.EntryPrice - stopLossPrice.Value)
-                        / positionSymbol.PipSize)
-                : InitialCapital;
+            var newRisk = positionSymbol.AmountRisked(
+                position.VolumeInUnits,
+                Math.Abs(currentPrice - stopLossPrice.Value)
+                    / positionSymbol.PipSize);
             var additionalRisk = Math.Max(0, newRisk - currentRisk);
             var effectiveRiskIncreasing = additionalRisk > 0.01;
             if (effectiveRiskIncreasing && _unknownExecutionLock)
@@ -582,13 +608,11 @@ namespace FtmoRiskControl
                 ["symbol"] = position.SymbolName,
                 ["action"] = "modify",
                 ["requested_at"] = Iso(Server.TimeInUtc),
-                ["stop_loss"] = stopLossPrice.HasValue
-                    ? DecimalText(stopLossPrice.Value)
-                    : null,
+                ["stop_loss"] = DecimalText(stopLossPrice.Value),
                 ["additional_risk"] = DecimalText(additionalRisk),
                 ["is_risk_increasing"] = effectiveRiskIncreasing
             };
-            if (!Evaluate(request, requestId, out var response))
+            if (!Evaluate(request, requestId, out var response, effectiveRiskIncreasing))
             {
                 Print(
                     "RiskGuard rejected position modification: "
@@ -635,7 +659,7 @@ namespace FtmoRiskControl
                 ["requested_at"] = Iso(Server.TimeInUtc),
                 ["is_risk_increasing"] = false
             };
-            if (!Evaluate(request, requestId, out var response))
+            if (!Evaluate(request, requestId, out var response, false))
             {
                 Print(
                     "RiskGuard rejected pending cancellation: "

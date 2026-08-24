@@ -1,11 +1,11 @@
 # 验证报告
 
-验证日期：2026-08-23。
+验证日期：2026-08-24。
 
 ## 自动测试
 
 ```text
-113 tests passed
+142 tests passed
 ResourceWarning treated as error
 Python source compilation passed
 JSON configuration validation passed
@@ -32,26 +32,24 @@ mypy passed
 - 日内 `LOCKED` 跨权益反弹持续到下一 FTMO 日，官方 `BREACH` 持久锁定。
 - 新闻和休市日历 SQLite 持久化、内容冲突拒绝和 API 重启恢复。
 - SQLite 在线备份、`0600`、完整性校验、恢复和运行中服务锁拒绝。
+- 服务锁在打开 SQLite 前取得，拒绝第二个服务进程与不安全的锁文件触碰状态库。
 - 每账户凭证绑定、作用域、跨账户拒绝、轮换重叠、过期、撤销和只显示一次的秘密。
+- 管理员首次登记账户基线、默认平台凭证最小权限、孤儿凭证无法建立账户。
+- JSON 重复对象键拒绝，避免同一请求的字段歧义。
 - Prometheus 数据库、日历、决定、账户状态、未知执行和备份指标。
+- 服务端未知执行锁、最终结果幂等结算、账户级持仓/挂单库存、同时间戳快照冲突和内存状态库。
+- 配置感知的日历过期指标、凭证临近过期指标、失败备份后的最后成功备份年龄。
 - Qualification 的阶段/周期隔离、历史完整性、Best Day、Profit Target 和基于开仓日的 Minimum Trading Days。
 - 浏览器资格看板静态入口和受认证的账户汇总 API。
 - 资格看板在 1440x900 和 390x844 视口检查通过，页面无横向溢出；明细表在移动端使用受控横向滚动。
 
 ## MT5
 
-使用本机 MetaTrader 5 的 `metaeditor64.exe` 重新编译：
-
-```text
-Result: 0 errors, 0 warnings
-Target: X64 Regular
-```
-
-编译产物仅用于本地验证，不提交到仓库；仓库发布的是 [RiskGuardEA.mq5](../platform/mt5/RiskGuardEA.mq5) 源码。
+当前环境未找到 `metaeditor64.exe`，本轮未把旧的 `.ex5` 或 `.log` 文件当作验证证据。仓库发布的是 [RiskGuardEA.mq5](../platform/mt5/RiskGuardEA.mq5) 源码；必须在目标 MetaTrader 5 环境中重新编译，并验证毫秒时间戳、账户级持仓/挂单同步和执行上报失败锁。
 
 ## cTrader
 
-使用 FTMO Platform cTrader 的 `cAlgo.API.dll` 和 .NET SDK `10.0.302` 对 `net9.0` 重新构建：
+使用 FTMO Platform cTrader 的 `cAlgo.API.dll` 和本机 .NET SDK 对当前源码重新构建：
 
 ```text
 0 errors
@@ -66,7 +64,7 @@ Target: X64 Regular
 - 未验证具体账户的佣金、点值、滑点和所有品种交易时间；
 - 未启用服务器端网关拦截人工交易。
 - 未连接生产 Prometheus/Alertmanager 通知路由。
-- 未使用公司 PKI 执行真实 mTLS 证书握手；自动测试覆盖缺少证书/密钥时的启动拒绝。
+- 未使用公司 PKI 执行真实 mTLS 证书握手；本地自签 CA 已验证有客户端证书可握手，自动测试仍覆盖缺少证书/密钥时的启动拒绝。
 
 这些项目必须在上线检查中使用公司的目标账户和批准数据源完成。
 
@@ -81,10 +79,12 @@ market sync: accepted
 account sync: accepted
 evaluation decision: ALLOW
 audit request_id: smoke-evaluate
-audit rule_version: ftmo-v3-2026-08-23
+audit rule_version: ftmo-v4-2026-08-23
 calendar restart restore: passed
 account credential isolation and rotation: passed
 qualification dashboard API: passed
 backup and restore round trip: passed
 Prometheus metrics: passed
+server-side unknown execution lock and resolution: passed
+account position/pending-order inventory: passed
 ```

@@ -46,6 +46,7 @@ class DecisionCode(str, Enum):
     REJECT_FREQUENCY = "REJECT_FREQUENCY"
     REJECT_RISK = "REJECT_RISK"
     REJECT_DATA_STALE = "REJECT_DATA_STALE"
+    REJECT_UNKNOWN_EXECUTION = "REJECT_UNKNOWN_EXECUTION"
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,7 @@ class RuleProfile:
     news_internal_after_minutes: int = 10
     news_force_flat_before_minutes: int = 10
     news_cancel_pending_before_minutes: int = 10
+    news_max_calendar_age_seconds: int = 60
     max_opens_5m: int = 3
     max_opens_1h: int = 10
     max_opens_day: int = 30
@@ -146,6 +148,9 @@ class RuleProfile:
             news_cancel_pending_before_minutes=int(
                 news["cancel_pending_before_ftmo_window_minutes"]
             ),
+            news_max_calendar_age_seconds=int(
+                news["max_calendar_age_seconds"]
+            ),
             max_opens_5m=int(frequency["max_opens_5m"]),
             max_opens_1h=int(frequency["max_opens_1h"]),
             max_opens_day=int(frequency["max_opens_day"]),
@@ -215,6 +220,8 @@ class AccountSnapshot:
     data_uncertain: bool = False
     day_locked: bool = False
     breach_latched: bool = False
+    open_positions_count: int | None = None
+    pending_orders_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -255,6 +262,11 @@ class FrequencyState:
         self.request_times[:] = [
             item for item in self.request_times if item >= retention_start
         ]
+        self.last_modify_by_symbol = {
+            symbol: item
+            for symbol, item in self.last_modify_by_symbol.items()
+            if item >= retention_start
+        }
 
     def opens_in_last(self, now: datetime, window: timedelta) -> int:
         threshold = now - window
@@ -459,6 +471,7 @@ class RiskEngine:
         volume_step: Decimal,
         min_volume: Decimal,
         max_volume: Optional[Decimal] = None,
+        estimated_costs: Decimal = ZERO,
     ) -> PositionSize:
         if loss_per_volume_unit <= ZERO:
             raise ValueError("loss_per_volume_unit must be positive")
@@ -466,19 +479,24 @@ class RiskEngine:
             raise ValueError("volume_step must be positive")
         if min_volume <= ZERO:
             raise ValueError("min_volume must be positive")
+        if estimated_costs < ZERO:
+            raise ValueError("estimated_costs cannot be negative")
         if max_volume is not None and max_volume <= ZERO:
             raise ValueError("max_volume must be positive")
         if max_volume is not None and max_volume < min_volume:
             raise ValueError("max_volume cannot be below min_volume")
         budget = self.risk_budget(snapshot).total_budget
-        raw_volume = budget / loss_per_volume_unit
+        volume_budget = max(ZERO, budget - estimated_costs)
+        raw_volume = volume_budget / loss_per_volume_unit
         steps = (raw_volume / volume_step).to_integral_value(
             rounding=ROUND_DOWN
         )
         volume = steps * volume_step
         if max_volume is not None:
             volume = min(volume, max_volume)
-        expected_loss = volume * loss_per_volume_unit
+        expected_loss = volume * loss_per_volume_unit + (
+            estimated_costs if volume > ZERO else ZERO
+        )
         if volume < min_volume:
             volume = ZERO
             expected_loss = ZERO
@@ -496,6 +514,51 @@ class RiskEngine:
         news_events: Iterable[NewsEvent] = (),
         market_closures: Iterable[MarketClosure] = (),
     ) -> Decision:
+        if not request.symbol.strip():
+            return Decision(
+                DecisionCode.REJECT_RISK,
+                ("symbol must not be empty",),
+            )
+        if request.requested_at.tzinfo is None:
+            return Decision(
+                DecisionCode.REJECT_DATA_STALE,
+                ("request timestamp must include a timezone",),
+            )
+        if request.action == Action.OPEN and not request.is_risk_increasing:
+            return Decision(
+                DecisionCode.REJECT_RISK,
+                ("open requests must be risk-increasing",),
+            )
+        if request.action in {Action.CLOSE, Action.CANCEL} and request.is_risk_increasing:
+            return Decision(
+                DecisionCode.REJECT_RISK,
+                ("close and cancel requests must be risk-reducing",),
+            )
+        if request.volume < ZERO:
+            return Decision(
+                DecisionCode.REJECT_RISK,
+                ("volume cannot be negative",),
+            )
+        if request.entry_price is not None and request.entry_price <= ZERO:
+            return Decision(
+                DecisionCode.REJECT_RISK,
+                ("entry price must be positive when supplied",),
+            )
+        if request.stop_loss is not None and request.stop_loss <= ZERO:
+            return Decision(
+                DecisionCode.REJECT_STOP_LOSS,
+                ("stop loss must be positive when supplied",),
+            )
+        if request.estimated_costs < ZERO or request.additional_risk < ZERO:
+            return Decision(
+                DecisionCode.REJECT_RISK,
+                ("risk inputs cannot be negative",),
+            )
+        if not request.is_risk_increasing and request.additional_risk > ZERO:
+            return Decision(
+                DecisionCode.REJECT_RISK,
+                ("risk-reducing requests cannot declare additional risk",),
+            )
         if (
             request.is_risk_increasing
             and (snapshot.data_age_seconds > 5 or snapshot.data_uncertain)
@@ -936,6 +999,10 @@ def validate_config(config: Mapping[str, Any]) -> None:
         news.get("cancel_pending_before_ftmo_window_minutes"),
         "news_controls.cancel_pending_before_ftmo_window_minutes",
     )
+    _validate_positive_int(
+        news.get("max_calendar_age_seconds"),
+        "news_controls.max_calendar_age_seconds",
+    )
     hard_before = int(news["ftmo_hard_before_minutes"])
     hard_after = int(news["ftmo_hard_after_minutes"])
     internal_before = int(news["internal_before_minutes"])
@@ -1027,6 +1094,10 @@ def validate_config(config: Mapping[str, Any]) -> None:
     qualification = config.get("qualification_controls")
     if not isinstance(qualification, Mapping):
         raise ValueError("qualification_controls must be an object")
+    _validate_positive_int(
+        qualification.get("max_account_snapshot_age_seconds"),
+        "qualification_controls.max_account_snapshot_age_seconds",
+    )
     one_step = qualification.get(AccountType.ONE_STEP.value)
     two_step = qualification.get(AccountType.TWO_STEP.value)
     if not isinstance(one_step, Mapping):

@@ -1,5 +1,5 @@
 {
-  "rule_version": "ftmo-v3-2026-08-23",
+  "rule_version": "ftmo-v4-2026-08-23",
   "ftmo_day_timezone": "Europe/Prague",
   "accounts": {
     "one_step": {
@@ -34,6 +34,7 @@
     "internal_after_minutes": 10,
     "force_flat_before_ftmo_window_minutes": 10,
     "cancel_pending_before_ftmo_window_minutes": 10,
+    "max_calendar_age_seconds": 60,
     "restricted_account_phase": "ftmo_account",
     "restricted_account_style": "standard"
   },
@@ -52,6 +53,7 @@
     "max_schedule_age_seconds": 3600
   },
   "qualification_controls": {
+    "max_account_snapshot_age_seconds": 60,
     "one_step": {
       "evaluation": {
         "profit_target_pct": "0.10",

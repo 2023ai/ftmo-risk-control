@@ -1,7 +1,10 @@
+import json
 import os
+import sqlite3
 import stat
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -73,6 +76,13 @@ class StateStoreTests(unittest.TestCase):
                 payload=[{"event_id": "conflict"}],
                 rule_version="test-rule",
             )
+        with self.assertRaises(ValueError):
+            self.store.save_calendar_snapshot(
+                calendar_type="news",
+                fetched_at=fetched_at,
+                payload=[],
+                rule_version="different-rule",
+            )
 
     def test_account_credential_scope_expiry_and_revocation(self):
         record, secret = self.store.create_account_credential(
@@ -123,6 +133,33 @@ class StateStoreTests(unittest.TestCase):
                 secret=secret,
                 scope="trade:evaluate",
                 now=self.now + timedelta(minutes=6),
+            )
+        )
+
+    def test_legacy_admin_wildcard_credential_is_not_authorized(self):
+        record, secret = self.store.create_account_credential(
+            account_id="legacy-wildcard",
+            scopes=("trade:evaluate",),
+            not_before=self.now,
+            expires_at=self.now + timedelta(hours=1),
+            now=self.now,
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """
+                UPDATE account_credentials
+                SET scopes_json = ?
+                WHERE credential_id = ?
+                """,
+                (json.dumps(["admin:*"]), record.credential_id),
+            )
+            connection.commit()
+        self.assertIsNone(
+            self.store.authenticate_account_credential(
+                account_id="legacy-wildcard",
+                secret=secret,
+                scope="trade:evaluate",
+                now=self.now,
             )
         )
 
@@ -179,6 +216,19 @@ class StateStoreTests(unittest.TestCase):
         metrics = self.store.backup_metrics()
         self.assertEqual(metrics["backup_success"], 1)
 
+    def test_backup_age_uses_last_success_after_failed_attempt(self):
+        output = Path(self.tempdir.name) / "backups" / "risk.db"
+        self.store.backup_to(output)
+        self.store.record_backup_event(
+            operation="backup",
+            success=False,
+            detail="simulated failure",
+        )
+        metrics = self.store.backup_metrics()
+        self.assertIsNotNone(metrics["last_backup_at"])
+        self.assertFalse(metrics["last_backup_success"])
+        self.assertIsNotNone(metrics["last_backup_attempt_at"])
+
     def tearDown(self):
         self.tempdir.cleanup()
 
@@ -192,6 +242,8 @@ class StateStoreTests(unittest.TestCase):
             "balance": Decimal("100000"),
             "equity": Decimal("99800"),
             "current_open_risk": Decimal("100"),
+            "open_positions_count": 0,
+            "pending_orders_count": 0,
             "as_of": self.now,
             "bootstrap_day_start_balance": Decimal("100000"),
             "bootstrap_highest_settled_balance": Decimal("100000"),
@@ -217,11 +269,49 @@ class StateStoreTests(unittest.TestCase):
         )
         self.assertEqual(reloaded.snapshot.equity, Decimal("99800"))
 
+    def test_open_position_inventory_survives_restart(self):
+        self.sync(open_positions_count=2, pending_orders_count=3)
+        reloaded = StateStore(self.path).get_account("mt5-10001")
+        self.assertEqual(reloaded.snapshot.open_positions_count, 2)
+        self.assertEqual(reloaded.snapshot.pending_orders_count, 3)
+
+    def test_equal_account_snapshot_timestamp_rejects_conflicting_content(self):
+        self.sync()
+        with self.assertRaises(ValueError):
+            self.sync(balance=Decimal("100001"))
+
+    def test_in_memory_store_retains_state_between_operations(self):
+        store = StateStore(":memory:")
+        try:
+            account = store.sync_account(
+                account_id="memory-account",
+                account_type=AccountType.TWO_STEP,
+                phase=AccountPhase.EVALUATION,
+                style=AccountStyle.STANDARD,
+                initial_capital=Decimal("100000"),
+                balance=Decimal("100000"),
+                equity=Decimal("100000"),
+                current_open_risk=Decimal("0"),
+                open_positions_count=0,
+                pending_orders_count=0,
+                as_of=self.now,
+                received_at=self.now,
+                bootstrap_day_start_balance=Decimal("100000"),
+                bootstrap_highest_settled_balance=Decimal("100000"),
+            )
+            self.assertEqual(
+                store.get_account(account.account_id).snapshot.balance,
+                Decimal("100000"),
+            )
+        finally:
+            store.close()
+
     def test_one_step_rollover_updates_settled_high_water_mark(self):
         self.sync()
         self.sync(
             balance=Decimal("103000"),
             equity=Decimal("103000"),
+            as_of=self.now + timedelta(seconds=1),
         )
         next_day = self.now + timedelta(days=1)
         self.store.confirm_settlement(
@@ -258,6 +348,7 @@ class StateStoreTests(unittest.TestCase):
             account_type=AccountType.TWO_STEP,
             balance=Decimal("103000"),
             equity=Decimal("103000"),
+            as_of=self.now + timedelta(seconds=1),
         )
         account = self.sync(
             account_id="ctrader-20002",
@@ -296,7 +387,7 @@ class StateStoreTests(unittest.TestCase):
         account = self.sync(
             balance=Decimal("101000"),
             equity=Decimal("101000"),
-            as_of=before_rollover,
+            as_of=after_rollover,
             received_at=after_rollover,
             bootstrap_day_start_balance=None,
             bootstrap_highest_settled_balance=None,
@@ -385,6 +476,33 @@ class StateStoreTests(unittest.TestCase):
                 source="approved-source",
             )
 
+    def test_settlement_day_must_match_settlement_timestamp(self):
+        self.sync()
+        with self.assertRaises(ValueError):
+            self.store.confirm_settlement(
+                account_id="mt5-10001",
+                ftmo_day="2026-08-24",
+                settled_balance=Decimal("100000"),
+                settled_at=self.now,
+                source="approved-source",
+            )
+
+    def test_qualification_history_cannot_get_ahead_of_account_phase(self):
+        self.sync()
+        with self.assertRaises(ValueError):
+            self.store.record_closed_trade(
+                account_id="mt5-10001",
+                trade_id="future-phase-trade",
+                phase=AccountPhase.VERIFICATION,
+                cycle_id="verification-1",
+                closed_at=self.now,
+                ftmo_day=ftmo_day_key(self.now),
+                net_profit=Decimal("100"),
+                symbol="EURUSD",
+                source="test",
+                request_id="future-phase-request",
+            )
+
     def test_frequency_survives_restart(self):
         self.sync()
         self.store.record_activity(
@@ -404,6 +522,18 @@ class StateStoreTests(unittest.TestCase):
         frequency = StateStore(self.path).frequency("mt5-10001")
         self.assertEqual(len(frequency.request_times), 1)
         self.assertEqual(len(frequency.open_times), 1)
+
+    def test_frequency_prunes_old_modification_cooldowns(self):
+        self.sync()
+        self.store.record_activity(
+            account_id="mt5-10001",
+            kind="modify",
+            symbol="EURUSD",
+            occurred_at=self.now - timedelta(days=3),
+            request_id="old-modify",
+        )
+        frequency = self.store.frequency("mt5-10001")
+        self.assertNotIn("EURUSD", frequency.last_modify_by_symbol)
 
     def test_future_activity_cannot_prune_other_account_frequency(self):
         self.sync()
