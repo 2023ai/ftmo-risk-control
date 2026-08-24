@@ -478,12 +478,15 @@ class StateStoreTests(unittest.TestCase):
 
     def test_settlement_day_must_match_settlement_timestamp(self):
         self.sync()
+        settled_at = datetime(2026, 8, 24, 12, tzinfo=UTC)
+        mismatched_day = ftmo_day_key(settled_at + timedelta(days=1))
+        self.assertNotEqual(ftmo_day_key(settled_at), mismatched_day)
         with self.assertRaises(ValueError):
             self.store.confirm_settlement(
                 account_id="mt5-10001",
-                ftmo_day="2026-08-24",
+                ftmo_day=mismatched_day,
                 settled_balance=Decimal("100000"),
-                settled_at=self.now,
+                settled_at=settled_at,
                 source="approved-source",
             )
 
