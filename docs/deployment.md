@@ -24,6 +24,8 @@ curl -s \
   http://127.0.0.1:8765/health
 ```
 
+`/health` 是存活信息，可在日历尚未就绪时返回 `200`。完成 SQLite 和两种日历同步后，再用同一管理员令牌请求 `/ready`；只有返回 `200` 且 `ready_for_risk_increase=true` 时才允许平台开始新增风险。
+
 非 loopback 监听默认被拒绝。确需从另一台机器访问时，必须显式增加 `--allow-remote-bind`，并放在专用内网、VPN 或已认证的 TLS 反向代理后面，同时限制来源 IP；不能直接把明文 HTTP 服务暴露到公网。
 
 SQLite 状态文件和 JSONL 审计文件会被服务收紧为仅属主可读写（`0600`）。部署目录仍应由专用系统账户持有，并禁止其他用户读取。
@@ -85,7 +87,7 @@ curl -sS \
 
 旧库中若遗留 `admin:*` 账户凭证，服务会拒绝其授权；必须重新签发显式最小作用域凭证，不能把管理员能力迁移到平台适配器。
 
-升级已有 SQLite 时服务会自动迁移新增字段和表。升级前已经发生但当前权益已恢复的历史触线无法由快照重建，首次上线该版本前必须人工核对账户历史和 FTMO 状态。
+升级已有 SQLite 时服务会自动迁移新增字段和表。V5 日历必须含覆盖起止时间，且 `rule_version` 已更新；升级后必须重新同步新闻和休市日历，不能继续使用旧快照开放新增风险。升级前已经发生但当前权益已恢复的历史触线无法由快照重建，首次上线该版本前必须人工核对账户历史和 FTMO 状态。
 
 ## 3. 可选 mTLS
 
@@ -105,7 +107,7 @@ python3 -m src.risk_api \
 
 ## 4. 日历同步
 
-`config/news-events.example.json` 只是格式示例，不是实际新闻日历。上线前应由公司人员或已批准的数据源生成并审核 `affected_symbols`。
+`config/news-events.example.json` 只是格式示例，不是实际新闻日历。示例用 `*` 保守阻断全部品种，防止未经审核的局部映射漏掉受影响资产。上线前应由公司人员或已批准的数据源生成并审核 `affected_symbols`、`coverage_start` 和 `coverage_end`；只有完整覆盖 FTMO 公布的受影响货币、指数和其他资产及经纪商品种后缀后，才能把 `*` 缩小为受控列表。经纪商带后缀的品种可使用尾部通配符，例如 `EURUSD*`。
 
 ```bash
 python3 scripts/sync_news.py \
@@ -113,7 +115,7 @@ python3 scripts/sync_news.py \
   --url http://127.0.0.1:8765
 ```
 
-新增风险请求必须有不超过配置阈值（默认 60 秒）的新鲜新闻数据。同步成功后 SQLite 保存快照，API 重启会自动恢复；恢复不改变原 `fetched_at`，因此过期快照仍会 fail-closed。若持久化快照的 `rule_version` 与当前配置不一致，服务拒绝加载并要求重新同步。
+新增风险请求必须有不超过配置阈值（默认 60 秒）的新鲜新闻数据，且覆盖范围必须包含当前时间前后的全部内部新闻窗口。同步脚本只刷新 `fetched_at`，不会自动延长审核文件的覆盖时间。同步成功后 SQLite 保存快照，API 重启会重算内容哈希再恢复；恢复不改变原 `fetched_at`，因此过期或覆盖不足的快照仍会 fail-closed。若持久化快照的 `rule_version` 与当前配置不一致，服务拒绝加载并要求重新同步。
 
 周末和超过 2 小时的休市日历也必须由批准的数据源生成：
 
@@ -123,7 +125,7 @@ python3 scripts/sync_market.py \
   --url http://127.0.0.1:8765
 ```
 
-市场日历超过 `market_close_controls.max_schedule_age_seconds`（默认 1 小时）未更新时，新增风险保持 fail-closed 并发出告警。
+市场日历超过 `market_close_controls.max_schedule_age_seconds`（默认 1 小时）未更新，或 `coverage_end` 没有延伸到未来 120 分钟禁开仓窗口之外时，新增风险保持 fail-closed 并发出告警。
 
 所有 POST 请求都会返回 `request_id`。设置 `RISK_AUDIT_PATH` 后，服务以 JSON Lines 格式记录请求 ID、规则版本、决定、账户状态、HTTP 状态和错误原因。
 
@@ -154,12 +156,12 @@ python3 scripts/backup_state.py \
 ```bash
 systemctl stop ftmo-risk-api
 python3 scripts/restore_state.py \
-  --source /var/backups/ftmo-risk/risk-state-2026-08-23.db \
+  --source /var/backups/ftmo-risk/risk-state-2026-08-26.db \
   --state "$RISK_STATE_PATH"
 systemctl start ftmo-risk-api
 ```
 
-运行中的 API 会持有 `.server.lock`，恢复工具检测到锁时拒绝覆盖。恢复后检查 `/health`、日历时间、账户状态、未知执行和资格历史，再开放平台连接。
+运行中的 API 会持有 `.server.lock`，恢复工具检测到锁时拒绝覆盖。恢复后检查 `/health`、日历时间与覆盖范围、账户状态、未知执行和资格历史，最后确认 `/ready` 返回 `200` 再开放平台连接。
 
 ## 6. Prometheus 与告警
 
@@ -168,7 +170,7 @@ systemctl start ftmo-risk-api
 最低告警闭环：
 
 - 数据库不可用：立即停止新增风险并升级为 critical；
-- 新闻/休市缺失或过期：保持 fail-closed，检查同步器；
+- 新闻/休市缺失、过期或覆盖不足：保持 fail-closed，检查同步器和审核文件；
 - 未知执行：人工核对订单和频率预留；
 - 凭证临近过期：在 24 小时告警窗口内完成轮换并验证同步；
 - 官方 `BREACH`：冻结账户并启动合规复核；

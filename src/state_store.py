@@ -8,6 +8,7 @@ import os
 import secrets
 import sqlite3
 import threading
+import time
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -52,6 +53,44 @@ PLATFORM_CREDENTIAL_SCOPES = frozenset(
     }
 )
 
+CREDENTIAL_LAST_USED_WRITE_INTERVAL = timedelta(seconds=60)
+CALENDAR_HASH_VERSION = 2
+DATABASE_INTEGRITY_CHECK_INTERVAL_SECONDS = 60.0
+
+
+def _calendar_content_hash(
+    *,
+    calendar_type: str,
+    fetched_at: datetime,
+    coverage_start: datetime | None,
+    coverage_end: datetime | None,
+    payload: list[dict[str, Any]],
+    rule_version: str,
+) -> str:
+    encoded = json.dumps(
+        {
+            "hash_version": CALENDAR_HASH_VERSION,
+            "calendar_type": calendar_type,
+            "fetched_at": fetched_at.isoformat(),
+            "coverage_start": (
+                coverage_start.isoformat()
+                if coverage_start is not None
+                else None
+            ),
+            "coverage_end": (
+                coverage_end.isoformat()
+                if coverage_end is not None
+                else None
+            ),
+            "payload": payload,
+            "rule_version": rule_version,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
 
 @dataclass(frozen=True)
 class StoredAccount:
@@ -67,6 +106,8 @@ class StoredAccount:
 class CalendarSnapshot:
     calendar_type: str
     fetched_at: datetime
+    coverage_start: datetime | None
+    coverage_end: datetime | None
     content_hash: str
     payload: list[dict[str, Any]]
     rule_version: str
@@ -94,6 +135,8 @@ class StateStore:
         self.path = str(path)
         self.day_timezone = day_timezone
         self._lock = threading.RLock()
+        self._last_integrity_check_monotonic = float("-inf")
+        self._last_integrity_check_ok = False
         self._memory_connection: sqlite3.Connection | None = None
         self._memory_uri: str | None = None
         if self.path == ":memory:":
@@ -264,6 +307,9 @@ class StateStore:
                 CREATE TABLE IF NOT EXISTS calendar_snapshots (
                     calendar_type TEXT PRIMARY KEY,
                     fetched_at TEXT NOT NULL,
+                    coverage_start TEXT,
+                    coverage_end TEXT,
+                    hash_version INTEGER NOT NULL DEFAULT 2,
                     content_hash TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     rule_version TEXT NOT NULL,
@@ -371,6 +417,27 @@ class StateStore:
                     "ALTER TABLE accounts ADD COLUMN pending_orders_count "
                     "INTEGER"
                 )
+            calendar_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(calendar_snapshots)"
+                ).fetchall()
+            }
+            if "coverage_start" not in calendar_columns:
+                connection.execute(
+                    "ALTER TABLE calendar_snapshots ADD COLUMN coverage_start "
+                    "TEXT"
+                )
+            if "coverage_end" not in calendar_columns:
+                connection.execute(
+                    "ALTER TABLE calendar_snapshots ADD COLUMN coverage_end "
+                    "TEXT"
+                )
+            if "hash_version" not in calendar_columns:
+                connection.execute(
+                    "ALTER TABLE calendar_snapshots ADD COLUMN hash_version "
+                    "INTEGER NOT NULL DEFAULT 1"
+                )
             execution_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -451,6 +518,8 @@ class StateStore:
         *,
         calendar_type: str,
         fetched_at: datetime,
+        coverage_start: datetime | None = None,
+        coverage_end: datetime | None = None,
         payload: list[dict[str, Any]],
         rule_version: str,
     ) -> CalendarSnapshot:
@@ -462,16 +531,34 @@ class StateStore:
             raise ValueError("calendar payload must be a list")
         if not rule_version.strip():
             raise ValueError("rule_version must be non-empty")
+        if (coverage_start is None) != (coverage_end is None):
+            raise ValueError(
+                "calendar coverage_start and coverage_end must be supplied together"
+            )
+        coverage_start_utc: datetime | None = None
+        coverage_end_utc: datetime | None = None
+        if coverage_start is not None and coverage_end is not None:
+            if coverage_start.tzinfo is None or coverage_end.tzinfo is None:
+                raise ValueError("calendar coverage timestamps must be timezone-aware")
+            coverage_start_utc = coverage_start.astimezone(timezone.utc)
+            coverage_end_utc = coverage_end.astimezone(timezone.utc)
+            if coverage_end_utc <= coverage_start_utc:
+                raise ValueError("calendar coverage_end must be after coverage_start")
         payload_json = json.dumps(
             payload,
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
         )
-        content_hash = hashlib.sha256(
-            payload_json.encode("utf-8")
-        ).hexdigest()
         fetched_at_utc = fetched_at.astimezone(timezone.utc)
+        content_hash = _calendar_content_hash(
+            calendar_type=calendar_type,
+            fetched_at=fetched_at_utc,
+            coverage_start=coverage_start_utc,
+            coverage_end=coverage_end_utc,
+            payload=payload,
+            rule_version=rule_version,
+        )
         created_at = datetime.now(timezone.utc)
         with self._lock, self._connection() as connection:
             existing = connection.execute(
@@ -493,6 +580,18 @@ class StateStore:
                     and (
                         existing["content_hash"] != content_hash
                         or existing["rule_version"] != rule_version
+                        or existing["coverage_start"]
+                        != (
+                            coverage_start_utc.isoformat()
+                            if coverage_start_utc is not None
+                            else None
+                        )
+                        or existing["coverage_end"]
+                        != (
+                            coverage_end_utc.isoformat()
+                            if coverage_end_utc is not None
+                            else None
+                        )
                     )
                 ):
                     raise ValueError(
@@ -502,11 +601,15 @@ class StateStore:
             connection.execute(
                 """
                 INSERT INTO calendar_snapshots (
-                    calendar_type, fetched_at, content_hash, payload_json,
-                    rule_version, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    calendar_type, fetched_at, coverage_start, coverage_end,
+                    hash_version, content_hash, payload_json, rule_version,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(calendar_type) DO UPDATE SET
                     fetched_at = excluded.fetched_at,
+                    coverage_start = excluded.coverage_start,
+                    coverage_end = excluded.coverage_end,
+                    hash_version = excluded.hash_version,
                     content_hash = excluded.content_hash,
                     payload_json = excluded.payload_json,
                     rule_version = excluded.rule_version,
@@ -515,6 +618,17 @@ class StateStore:
                 (
                     calendar_type,
                     fetched_at_utc.isoformat(),
+                    (
+                        coverage_start_utc.isoformat()
+                        if coverage_start_utc is not None
+                        else None
+                    ),
+                    (
+                        coverage_end_utc.isoformat()
+                        if coverage_end_utc is not None
+                        else None
+                    ),
+                    CALENDAR_HASH_VERSION,
                     content_hash,
                     payload_json,
                     rule_version,
@@ -525,6 +639,8 @@ class StateStore:
         return CalendarSnapshot(
             calendar_type=calendar_type,
             fetched_at=fetched_at_utc,
+            coverage_start=coverage_start_utc,
+            coverage_end=coverage_end_utc,
             content_hash=content_hash,
             payload=payload,
             rule_version=rule_version,
@@ -538,11 +654,73 @@ class StateStore:
             ).fetchall()
         result: dict[str, CalendarSnapshot] = {}
         for row in rows:
+            payload_json = row["payload_json"]
+            payload = json.loads(payload_json)
+            if not isinstance(payload, list):
+                raise ValueError("persisted calendar payload must be a list")
+            fetched_at = datetime.fromisoformat(row["fetched_at"])
+            if fetched_at.tzinfo is None:
+                raise ValueError("persisted calendar fetched_at needs a timezone")
+            coverage_start = (
+                datetime.fromisoformat(row["coverage_start"])
+                if row["coverage_start"]
+                else None
+            )
+            coverage_end = (
+                datetime.fromisoformat(row["coverage_end"])
+                if row["coverage_end"]
+                else None
+            )
+            if (coverage_start is None) != (coverage_end is None):
+                raise ValueError(
+                    "persisted calendar coverage bounds are incomplete"
+                )
+            if coverage_start is not None and coverage_start.tzinfo is None:
+                raise ValueError(
+                    "persisted calendar coverage_start needs a timezone"
+                )
+            if coverage_end is not None and coverage_end.tzinfo is None:
+                raise ValueError(
+                    "persisted calendar coverage_end needs a timezone"
+                )
+            if (
+                coverage_start is not None
+                and coverage_end is not None
+                and coverage_end <= coverage_start
+            ):
+                raise ValueError("persisted calendar coverage bounds are invalid")
+            hash_version = int(row["hash_version"])
+            if hash_version == 1:
+                if coverage_start is not None or coverage_end is not None:
+                    raise ValueError(
+                        "legacy calendar snapshots cannot declare trusted coverage"
+                    )
+                content_hash = hashlib.sha256(
+                    payload_json.encode("utf-8")
+                ).hexdigest()
+            elif hash_version == CALENDAR_HASH_VERSION:
+                content_hash = _calendar_content_hash(
+                    calendar_type=row["calendar_type"],
+                    fetched_at=fetched_at,
+                    coverage_start=coverage_start,
+                    coverage_end=coverage_end,
+                    payload=payload,
+                    rule_version=row["rule_version"],
+                )
+            else:
+                raise ValueError("persisted calendar hash version is unsupported")
+            if not compare_digest(content_hash, row["content_hash"]):
+                raise ValueError(
+                    f"persisted {row['calendar_type']} calendar content hash "
+                    "does not match its safety metadata"
+                )
             result[row["calendar_type"]] = CalendarSnapshot(
                 calendar_type=row["calendar_type"],
-                fetched_at=datetime.fromisoformat(row["fetched_at"]),
-                content_hash=row["content_hash"],
-                payload=json.loads(row["payload_json"]),
+                fetched_at=fetched_at,
+                coverage_start=coverage_start,
+                coverage_end=coverage_end,
+                content_hash=content_hash,
+                payload=payload,
                 rule_version=row["rule_version"],
                 created_at=datetime.fromisoformat(row["created_at"]),
             )
@@ -658,16 +836,26 @@ class StateStore:
                 bytes(row["secret_hash"]),
             ):
                 return None
-            connection.execute(
-                """
-                UPDATE account_credentials
-                SET last_used_at = ?
-                WHERE credential_id = ?
-                """,
-                (now.isoformat(), record.credential_id),
+            last_used_at = (
+                record.last_used_at.astimezone(timezone.utc)
+                if record.last_used_at is not None
+                else None
             )
-            connection.commit()
-            return replace(record, last_used_at=now)
+            if (
+                last_used_at is None
+                or now - last_used_at >= CREDENTIAL_LAST_USED_WRITE_INTERVAL
+            ):
+                connection.execute(
+                    """
+                    UPDATE account_credentials
+                    SET last_used_at = ?
+                    WHERE credential_id = ?
+                    """,
+                    (now.isoformat(), record.credential_id),
+                )
+                connection.commit()
+                return replace(record, last_used_at=now)
+            return record
         return None
 
     def rotate_account_credential(
@@ -1275,6 +1463,18 @@ class StateStore:
                         """
                     ).fetchall()
                 }
+                monotonic_now = time.monotonic()
+                if (
+                    monotonic_now - self._last_integrity_check_monotonic
+                    >= DATABASE_INTEGRITY_CHECK_INTERVAL_SECONDS
+                ):
+                    integrity = connection.execute(
+                        "PRAGMA quick_check(1)"
+                    ).fetchone()
+                    self._last_integrity_check_ok = bool(
+                        integrity and integrity[0] == "ok"
+                    )
+                    self._last_integrity_check_monotonic = monotonic_now
             required = {
                 "accounts",
                 "calendar_snapshots",
@@ -1288,8 +1488,14 @@ class StateStore:
                 "qualification_trading_days",
                 "backup_runs",
             }
-            return bool(row and row[0] == 1 and required <= tables)
+            return bool(
+                row
+                and row[0] == 1
+                and self._last_integrity_check_ok
+                and required <= tables
+            )
         except (OSError, sqlite3.DatabaseError):
+            self._last_integrity_check_ok = False
             return False
 
     def unknown_execution_count(self, account_id: str | None = None) -> int:

@@ -1,6 +1,6 @@
 # FTMO 合规矩阵
 
-核对日期：2026-08-23。
+核对日期：2026-08-26。
 
 官方核对来源：
 
@@ -8,6 +8,8 @@
 - [FTMO Challenge: 2-Step Trading Objectives](https://ftmo.com/en/trading-objectives/2-step/)
 - [How long does it take to become an FTMO Trader?](https://ftmo.com/en/faq/how-long-does-it-take-to-become-an-ftmo-trader/)
 - [I have successfully passed my FTMO Challenge. What’s next?](https://ftmo.com/en/faq/i-have-successfully-passed-what-to-do-now/)
+- [Can I trade news?](https://ftmo.com/en/faq/can-i-trade-news/)
+- [Can I trade on the weekend?](https://ftmo.com/en/faq/can-i-trade-on-the-weekend/)
 
 规则仍以目标账户页面和当日生效条款为准；配置值不能替代上线时的账户级人工核对。
 
@@ -26,15 +28,15 @@
 | 周末/长休市持仓 | Standard FTMO Account 在休市前 10 分钟平仓撤单 |
 | 交易频率 | 5 分钟 3 笔、1 小时 10 笔、每天 30 笔 |
 | 服务器请求 | 500 预警、1000 停止，低于 FTMO 异常活跃阈值 |
-| 数据异常 | 账户超过 5 秒、新闻/市场日历超过配置阈值即 fail-closed；日界线使用服务器时间 |
+| 数据异常 | 账户超过 5 秒、新闻/市场日历超过配置阈值或未覆盖完整守护窗口即 fail-closed；日界线使用服务器时间 |
 | 触线记忆 | 内部 `LOCKED` 保持到下一 FTMO 日；官方 `BREACH` 跨日持久锁定 |
 | 重启规避 | SQLite 保存账户日界线、开仓和请求频率 |
 | 审计 | `request_id` 关联规则版本、决定和平台执行结果 |
-| 日历持久化 | 新闻和休市快照、哈希、时间和规则版本写入 SQLite，重启恢复但不刷新年龄 |
+| 日历持久化 | 新闻和休市快照、哈希、抓取时间、覆盖起止时间和规则版本写入 SQLite；恢复时重算哈希并保留原年龄 |
 | 备份恢复 | SQLite 在线一致性备份、`quick_check`、`0600`、停机锁和原子恢复 |
 | 账户凭证 | 管理员先登记不可变账户基线；每账户最小作用域绑定、一次性明文、摘要存储、轮换重叠、过期和撤销 |
 | 传输安全 | 默认 loopback；远程监听显式授权；支持直接 mTLS 或反向代理 mTLS |
-| 可观测性 | Prometheus 请求、决定、日历过期状态、账户状态、不确定快照、未知执行、凭证和备份指标 |
+| 可观测性 | Prometheus 使用有界路由标签，覆盖请求、决定、日历覆盖/过期、服务就绪、账户状态、不确定快照、未知执行、凭证和备份指标 |
 
 ## 独立资格目标
 
@@ -56,7 +58,7 @@
 - 禁止跨多个 FTMO 账户协调同向/反向交易、规避风险限制或复制不属于本交易者的信号。
 - 禁止延迟套利、错误报价利用、超高频服务器压力、模拟环境可行但真实市场不可复制的策略。
 - 人工订单、其他 EA/cBot 和移动端订单必须被账户权限或交易网关隔离。
-- 新闻和市场休市数据必须来自经过批准且与 FTMO 品种名称一致的数据源。
+- 新闻和市场休市数据必须来自经过批准的数据源，并审核覆盖时间与 FTMO/经纪商品种映射；映射未完成时使用全品种 `*` 保守阻断，不能用不完整列表开放未核对资产，带后缀品种应使用受控尾部通配符。
 - FTMO 更新条款后，由合规负责人核对规则，更新配置并增加 `rule_version`。
 - Prometheus 告警必须连接公司值班路由；仓库内规则文件本身不能证明通知已经送达。
 

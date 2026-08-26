@@ -1,11 +1,13 @@
 {
-  "fetched_at": "2026-08-28T12:00:00+00:00",
+  "fetched_at": "2026-08-26T00:00:00+00:00",
+  "coverage_start": "2026-08-25T00:00:00+00:00",
+  "coverage_end": "2026-09-02T00:00:00+00:00",
   "closures": [
     {
       "closure_id": "EXAMPLE-EURUSD-weekend-2026-08-28",
       "start_time": "2026-08-28T21:55:00+00:00",
       "end_time": "2026-08-30T21:05:00+00:00",
-      "affected_symbols": ["EURUSD"],
+      "affected_symbols": ["EURUSD*"],
       "source": "approved-broker-symbol-schedule"
     }
   ]

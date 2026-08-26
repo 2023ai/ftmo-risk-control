@@ -1,10 +1,10 @@
 # FTMO 自营交易风控系统
 
-这是一个面向 FTMO 账户、MT5 和 cTrader 的可运行 V4 风控实现。
+这是一个面向 FTMO 账户、MT5 和 cTrader 的可运行 V5 风控实现。
 
 本项目是风控参考实现和平台接入模板，不构成 FTMO 官方软件、法律意见或实盘收益保证。上线前必须使用公司批准的数据源、目标账户规格和模拟账户回放验证。
 
-当前版本聚焦九类核心能力：
+当前版本聚焦十一类核心能力：
 
 1. 以损定仓：本系统内部先确定止损和允许亏损，再计算交易量；这是内部风控门槛，不是对 FTMO 官方止损政策的替代。
 2. 新闻时段：区分 FTMO 账户阶段、Standard/Swing 账户和受影响品种。
@@ -12,7 +12,7 @@
 4. 日亏与最大亏损：按账户规则计算官方底线，并使用更保守的内部停止线。
 5. 周末与长休市：全阶段提前 2 小时禁止开仓，Standard FTMO Account 提前平仓撤单。
 6. 持久化审计：SQLite 保存日界线、结算确认、频率、风控决定幂等记录与平台执行结果。
-7. 日历韧性：新闻和休市快照持久化，重启自动恢复，支持在线备份和停机恢复。
+7. 日历韧性：新闻和休市快照持久化，校验内容哈希与覆盖时间，重启自动恢复，支持在线备份和停机恢复。
 8. 账户安全：管理员令牌与账户凭证分离，支持作用域、轮换、重叠窗口、过期、撤销和可选 mTLS。
 9. 资格看板：按阶段和周期独立计算 Profit Target、Minimum Trading Days 和 Best Day Rule。
 10. 资格完整性：Profit Target 同时核对账户余额、账户级持仓/挂单库存和快照新鲜度；无法确认时显示需复核。
@@ -93,12 +93,14 @@ python3 scripts/sync_news.py \
   --file config/news-events.example.json
 ```
 
-Standard FTMO Account 还需要同步周末和超过 2 小时的休市时段：
+所有生产账户都需要同步周末和超过 2 小时的休市时段，用于全阶段提前禁止新增风险；Standard FTMO Account 另外执行提前平仓撤单：
 
 ```bash
 python3 scripts/sync_market.py \
   --file config/market-closures.example.json
 ```
+
+两种日历文件都必须包含 `coverage_start` 和 `coverage_end`。新闻覆盖至少要包含当前时间前后的内部新闻窗口，休市日历要覆盖未来的禁开仓窗口。抓取时间虽新但覆盖不足时，服务仍会 fail-closed。`affected_symbols` 支持精确品种、尾部通配符（如 `EURUSD*`）和全品种 `*`。新闻示例故意使用 `*` 作为保守占位；只有在已批准映射完整覆盖该事件的全部 FTMO 受影响资产和经纪商品种后缀后，才能缩小范围，不能直接照抄不完整的品种列表。
 
 浏览器资格看板：
 
@@ -121,14 +123,14 @@ python3 scripts/sync_qualification.py \
 ```bash
 python3 scripts/backup_state.py \
   --state runtime/risk-state.db \
-  --output backups/risk-state-2026-08-23.db
+  --output backups/risk-state-2026-08-26.db
 
 python3 scripts/restore_state.py \
-  --source backups/risk-state-2026-08-23.db \
+  --source backups/risk-state-2026-08-26.db \
   --state runtime/risk-state.db
 ```
 
-`GET /metrics` 提供 Prometheus 文本指标；示例抓取配置和告警规则位于 `monitoring/`。
+`GET /health` 是服务存活信息；`GET /ready` 是新增风险就绪检查，SQLite 或任一必需日历缺失、过期、版本不匹配或覆盖不足时返回 `503`。`GET /metrics` 提供 Prometheus 文本指标；示例抓取配置和告警规则位于 `monitoring/`。
 
 ## 使用边界
 
@@ -148,7 +150,7 @@ python3 scripts/restore_state.py \
 - 日亏计算使用 FTMO 的 CE(S)T 日界线；系统实现使用 `Europe/Prague` 时区。
 - 日界线由风控服务器接收时间决定；平台时间仅用于 ±30 秒时钟健康检查。
 - 已有持仓按当前可平仓报价到止损计算剩余权益风险，挂单按目标入场价到止损计算。
-- 新闻数据必须保存来源、发布时间、影响品种和规则版本。
+- 新闻数据必须保存来源、发布时间、影响品种、覆盖时间和规则版本。
 - 长休市日历必须来自实际 FTMO/经纪商品种交易时间，示例文件不能直接用于实盘。
 - 所有时间统一使用带时区的 ISO 8601 时间。
 - 规则变更必须增加 `rule_version`，不得静默覆盖历史审计记录。

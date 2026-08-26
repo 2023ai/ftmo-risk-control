@@ -26,7 +26,9 @@ X-Account-Credential: <one-account-secret>
 {
   "ok": true,
   "service": "ftmo-risk-api",
-  "rule_version": "ftmo-v4-2026-08-23",
+  "rule_version": "ftmo-v5-2026-08-26",
+  "ready_for_risk_increase": true,
+  "readiness_reasons": [],
   "news_data_age_seconds": 0,
   "market_data_age_seconds": 0,
   "persistent_state": true,
@@ -38,7 +40,11 @@ X-Account-Credential: <one-account-secret>
 }
 ```
 
-新闻和休市字段还包含最近持久化时间、年龄、配置阈值、是否过期和规则版本。规则版本不匹配的持久化快照不会被加载。
+新闻和休市字段还包含最近持久化时间、年龄、配置阈值、覆盖起止时间、当前所需覆盖窗口、是否过期和规则版本。规则版本不匹配的持久化快照不会被加载。
+
+## `GET /ready`
+
+新增风险的就绪检查。SQLite 完整性检查通过，且新闻和休市日历同时满足新鲜度、规则版本和覆盖窗口时返回 `200`；否则返回 `503`并在 `readiness_reasons` 列出原因。该接口使用管理员令牌，适合负载均衡器、部署系统和值班检查；`/health` 仍保持存活信息用途。
 
 ## `POST /v1/news-sync`
 
@@ -46,12 +52,14 @@ X-Account-Credential: <one-account-secret>
 
 ```json
 {
-  "fetched_at": "2026-08-22T12:00:00+00:00",
+  "fetched_at": "2026-08-26T00:00:00+00:00",
+  "coverage_start": "2026-08-25T00:00:00+00:00",
+  "coverage_end": "2026-09-02T00:00:00+00:00",
   "events": [
     {
-      "event_id": "NFP-2026-08-22",
-      "release_time": "2026-08-22T12:30:00+00:00",
-      "affected_symbols": ["EURUSD", "XAUUSD"],
+      "event_id": "EXAMPLE-USD-2026-08-28",
+      "release_time": "2026-08-28T12:30:00+00:00",
+      "affected_symbols": ["EURUSD*", "XAUUSD*"],
       "importance": "high",
       "source": "company-news-mapper"
     }
@@ -59,7 +67,9 @@ X-Account-Credential: <one-account-secret>
 }
 ```
 
-同步成功后，服务先把快照、内容哈希、`fetched_at` 和 `rule_version` 原子写入 SQLite，再替换内存日历。重启时自动恢复最近快照。生产评估只使用服务端日历，客户端不能覆盖事件列表或新鲜度。事件 ID 必须唯一；相同 `fetched_at` 只能重放相同内容，不能用冲突内容覆盖。
+同步成功后，服务先把快照、内容哈希、`fetched_at`、`coverage_start`、`coverage_end` 和 `rule_version` 原子写入 SQLite，再替换内存日历。重启时会重新计算内容哈希，不一致时拒绝恢复。生产评估只使用服务端日历，客户端不能覆盖事件列表或新鲜度。新鲜但未覆盖完整守护窗口的快照仍会 fail-closed。事件 ID 必须唯一；相同 `fetched_at` 只能重放相同内容和覆盖边界，不能用冲突内容覆盖。
+
+`affected_symbols` 支持精确品种（`EURUSD`）、尾部通配符（`EURUSD*`，可命中 `EURUSD.a`）和全品种 `*`。通配符只能出现一次且位于末尾。
 
 ## `POST /v1/market-sync`
 
@@ -67,20 +77,22 @@ X-Account-Credential: <one-account-secret>
 
 ```json
 {
-  "fetched_at": "2026-08-22T12:00:00+00:00",
+  "fetched_at": "2026-08-26T00:00:00+00:00",
+  "coverage_start": "2026-08-25T00:00:00+00:00",
+  "coverage_end": "2026-09-02T00:00:00+00:00",
   "closures": [
     {
       "closure_id": "EURUSD-weekend",
       "start_time": "2026-08-28T21:55:00+00:00",
       "end_time": "2026-08-30T21:05:00+00:00",
-      "affected_symbols": ["EURUSD"],
+      "affected_symbols": ["EURUSD*"],
       "source": "approved-broker-symbol-schedule"
     }
   ]
 }
 ```
 
-同步脚本会在上传时把 `fetched_at` 替换成当前 UTC 时间。未来超过 30 秒的时间戳会被拒绝。休市 ID 必须唯一；相同 `fetched_at` 的冲突内容也会被拒绝。
+同步脚本会在上传时把 `fetched_at` 替换成当前 UTC 时间，但不会伪造或延长审核文件中的覆盖范围。未来超过 30 秒的时间戳会被拒绝。休市 ID 必须唯一；相同 `fetched_at` 的冲突内容或覆盖边界也会被拒绝。
 
 ## `POST /v1/market-status`
 
@@ -106,7 +118,7 @@ X-Account-Credential: <one-account-secret>
 {
   "account_id": "mt5-10001",
   "symbol": "EURUSD",
-  "now": "2026-08-22T12:21:00+00:00"
+  "now": "2026-08-28T12:21:00+00:00"
 }
 ```
 
@@ -122,7 +134,7 @@ X-Account-Credential: <one-account-secret>
   "cancel_pending": true,
   "hard_window": false,
   "emergency_alert": false,
-  "event_ids": ["NFP-2026-08-22"]
+  "event_ids": ["EXAMPLE-USD-2026-08-28"]
 }
 ```
 
@@ -150,7 +162,7 @@ X-Account-Credential: <one-account-secret>
   "current_open_risk": "100",
   "open_positions_count": 0,
   "pending_orders_count": 0,
-  "as_of": "2026-08-22T12:00:00+00:00"
+  "as_of": "2026-08-26T12:00:00+00:00"
 }
 ```
 
@@ -167,9 +179,9 @@ X-Account-Credential: <one-account-secret>
 ```json
 {
   "account_id": "mt5-10001",
-  "ftmo_day": "2026-08-23",
+  "ftmo_day": "2026-08-27",
   "settled_balance": "104000",
-  "settled_at": "2026-08-23T00:00:00+02:00",
+  "settled_at": "2026-08-27T00:00:00+02:00",
   "source": "approved-platform-settlement"
 }
 ```
@@ -193,14 +205,14 @@ X-Account-Credential: <one-account-secret>
     "highest_settled_balance": "100000",
     "balance": "100000",
     "equity": "99800",
-    "as_of": "2026-08-22T12:00:00+00:00",
+    "as_of": "2026-08-26T12:00:00+00:00",
     "current_open_risk": "100",
     "data_age_seconds": 0
   },
   "request": {
     "symbol": "EURUSD",
     "action": "open",
-    "requested_at": "2026-08-22T12:00:00+00:00",
+    "requested_at": "2026-08-26T12:00:00+00:00",
     "volume": "1.00",
     "entry_price": "1.1000",
     "stop_loss": "1.0800",
@@ -208,7 +220,7 @@ X-Account-Credential: <one-account-secret>
     "estimated_costs": "8",
     "additional_risk": "0",
     "is_risk_increasing": true,
-    "idea_id": "strategy-a-20260822-001"
+    "idea_id": "strategy-a-20260826-001"
   },
   "frequency": {
     "open_times": [],
@@ -219,8 +231,8 @@ X-Account-Credential: <one-account-secret>
   "market_data_age_seconds": 0,
   "news_events": [
     {
-      "event_id": "NFP-2026-08-22",
-      "release_time": "2026-08-22T12:01:00+00:00",
+      "event_id": "NFP-2026-08-26",
+      "release_time": "2026-08-26T12:01:00+00:00",
       "affected_symbols": ["EURUSD", "XAUUSD"],
       "importance": "high",
       "source": "ftmo-calendar"
@@ -237,11 +249,11 @@ X-Account-Credential: <one-account-secret>
 ```json
 {
   "ok": true,
-  "rule_version": "ftmo-v4-2026-08-23",
+  "rule_version": "ftmo-v5-2026-08-26",
   "decision": {
     "code": "REJECT_NEWS",
     "allowed": false,
-    "reasons": ["NFP-2026-08-22 is inside the FTMO hard news window"],
+    "reasons": ["NFP-2026-08-26 is inside the FTMO hard news window"],
     "risk_budget": null
   },
   "account": {
@@ -274,7 +286,7 @@ X-Account-Credential: <one-account-secret>
   "outcome": "success",
   "action": "open",
   "symbol": "EURUSD",
-  "occurred_at": "2026-08-22T12:00:01+00:00",
+  "occurred_at": "2026-08-26T12:00:01+00:00",
   "platform_status": "TRADE_RETCODE_DONE",
   "platform_order_id": "123456789"
 }
@@ -299,7 +311,7 @@ GET  /v1/admin/credentials?account_id={account_id}
 
 ```json
 {
-  "expires_at": "2026-09-22T12:00:00+00:00",
+  "expires_at": "2026-09-26T12:00:00+00:00",
   "scopes": [
     "account:sync",
     "trade:evaluate",
@@ -325,7 +337,7 @@ GET  /v1/admin/credentials?account_id={account_id}
   "trade_id": "deal-12345",
   "phase": "evaluation",
   "cycle_id": "challenge-2026-08",
-  "closed_at": "2026-08-22T14:00:00+00:00",
+  "closed_at": "2026-08-26T14:00:00+00:00",
   "net_profit": "2500.00",
   "symbol": "EURUSD",
   "source": "mt5-history"
@@ -343,7 +355,7 @@ GET  /v1/admin/credentials?account_id={account_id}
   "account_id": "mt5-10001",
   "phase": "evaluation",
   "cycle_id": "challenge-2026-08",
-  "opened_at": "2026-08-22T09:00:00+00:00",
+  "opened_at": "2026-08-26T09:00:00+00:00",
   "source": "mt5-history"
 }
 ```
@@ -360,7 +372,7 @@ GET  /v1/admin/credentials?account_id={account_id}
   "phase": "evaluation",
   "cycle_id": "challenge-2026-08",
   "history_start_at": "2026-08-01T00:00:00+02:00",
-  "complete_through": "2026-08-23T12:00:00+00:00",
+  "complete_through": "2026-08-27T12:00:00+00:00",
   "source": "mt5-history"
 }
 ```
@@ -393,10 +405,10 @@ GET /dashboard/qualification
 
 - HTTP 请求和状态码；
 - 风控决定代码；
-- 新闻/休市日历是否存在、年龄、配置感知的过期状态、同步和恢复结果；
+- 新闻/休市日历是否存在、年龄、覆盖充足性、配置感知的过期状态、同步和恢复结果；
 - `GREEN/AMBER/RED/LOCKED/BREACH` 账户数量；
 - 未知执行结果、资格快照过期、账户不确定状态和即将过期凭证数量；
-- SQLite 健康状态；
+- SQLite 健康状态和新增风险就绪状态；
 - 备份/恢复结果和最后备份年龄。
 
 告警规则见 `monitoring/alerts.yml`。
@@ -419,7 +431,7 @@ GET /dashboard/qualification
     "highest_settled_balance": "100000",
     "balance": "100000",
     "equity": "100000",
-    "as_of": "2026-08-22T12:00:00+00:00",
+    "as_of": "2026-08-26T12:00:00+00:00",
     "current_open_risk": "0",
     "data_age_seconds": 0
   },
@@ -435,7 +447,7 @@ GET /dashboard/qualification
 ```json
 {
   "ok": true,
-  "rule_version": "ftmo-v4-2026-08-23",
+  "rule_version": "ftmo-v5-2026-08-26",
   "position_size": {
     "volume": "2.50",
     "expected_loss": "250.00",

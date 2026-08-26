@@ -101,9 +101,49 @@ ACCOUNT_SCOPES = {
     "/v1/qualification-history-sync": "qualification:write",
 }
 
+METRIC_ENDPOINTS = frozenset(
+    {
+        "/dashboard/qualification",
+        "/health",
+        "/ready",
+        "/metrics",
+        "/v1/qualification",
+        "/v1/qualification/accounts",
+        "/v1/admin/credentials",
+        *ACCOUNT_SCOPES,
+        "/v1/news-sync",
+        "/v1/market-sync",
+        "/v1/position-size",
+    }
+)
+METRIC_ENDPOINT_PATTERNS = (
+    (
+        re.compile(r"/v1/admin/accounts/[^/]+/credentials"),
+        "/v1/admin/accounts/{account_id}/credentials",
+    ),
+    (
+        re.compile(r"/v1/admin/credentials/[^/]+/rotate"),
+        "/v1/admin/credentials/{credential_id}/rotate",
+    ),
+    (
+        re.compile(r"/v1/admin/credentials/[^/]+/revoke"),
+        "/v1/admin/credentials/{credential_id}/revoke",
+    ),
+)
+
 
 def _path_only(path: str) -> str:
     return urlsplit(path).path
+
+
+def _metric_endpoint(path: str) -> str:
+    endpoint = _path_only(path)
+    if endpoint in METRIC_ENDPOINTS:
+        return endpoint
+    for pattern, normalized in METRIC_ENDPOINT_PATTERNS:
+        if pattern.fullmatch(endpoint):
+            return normalized
+    return "/__unknown__"
 
 
 def _news_calendar_payload(
@@ -209,6 +249,24 @@ def _age_seconds(value: Any, field: str) -> int | None:
     if result < 0:
         raise RequestError(f"{field} must be a non-negative integer")
     return result
+
+
+def _calendar_coverage(
+    payload: Mapping[str, Any],
+) -> tuple[datetime, datetime]:
+    coverage_start = _timestamp(
+        _required(payload, "coverage_start"),
+        "coverage_start",
+    ).astimezone(timezone.utc)
+    coverage_end = _timestamp(
+        _required(payload, "coverage_end"),
+        "coverage_end",
+    ).astimezone(timezone.utc)
+    if coverage_end <= coverage_start:
+        raise RequestError("coverage_end must be after coverage_start")
+    if coverage_end - coverage_start > timedelta(days=366):
+        raise RequestError("calendar coverage cannot exceed 366 days")
+    return coverage_start, coverage_end
 
 
 def _optional_nonnegative_int(value: Any, field: str) -> int | None:
@@ -398,6 +456,27 @@ def _frequency(raw: Mapping[str, Any] | None) -> FrequencyState:
     )
 
 
+def _affected_symbols(raw: Any, field: str) -> frozenset[str]:
+    if not isinstance(raw, list) or len(raw) > 100:
+        raise RequestError(f"{field} must be a list of at most 100 symbols")
+    symbols: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            raise RequestError(f"{field} entries must be strings")
+        symbol = item.strip()
+        if not 1 <= len(symbol) <= 64:
+            raise RequestError(
+                f"{field} entries must contain 1 to 64 characters"
+            )
+        if not re.fullmatch(r"(?:[A-Za-z0-9._:/#-]+\*?|\*)", symbol):
+            raise RequestError(
+                f"{field} entries may use broker symbol characters and only "
+                "one optional trailing wildcard"
+            )
+        symbols.add(symbol.upper())
+    return frozenset(symbols)
+
+
 def _news_events(raw: list[Mapping[str, Any]] | None) -> list[NewsEvent]:
     if raw is None:
         return []
@@ -416,14 +495,6 @@ def _news_events(raw: list[Mapping[str, Any]] | None) -> list[NewsEvent]:
         if event_id in event_ids:
             raise RequestError(f"duplicate news event_id: {event_id}")
         event_ids.add(event_id)
-        affected_symbols = item.get("affected_symbols", [])
-        if (
-            not isinstance(affected_symbols, list)
-            or len(affected_symbols) > 100
-        ):
-            raise RequestError(
-                "affected_symbols must be a list of at most 100 symbols"
-            )
         events.append(
             NewsEvent(
                 event_id=event_id,
@@ -431,10 +502,9 @@ def _news_events(raw: list[Mapping[str, Any]] | None) -> list[NewsEvent]:
                     _required(item, "release_time"),
                     "news.release_time",
                 ),
-                affected_symbols=frozenset(
-                    str(symbol).strip()
-                    for symbol in affected_symbols
-                    if str(symbol).strip()
+                affected_symbols=_affected_symbols(
+                    item.get("affected_symbols", []),
+                    "affected_symbols",
                 ),
                 importance=str(item.get("importance", "high")),
                 source=str(item.get("source", "ftmo-calendar")),
@@ -471,14 +541,6 @@ def _market_closures(
                 f"duplicate market closure_id: {closure_id}"
             )
         closure_ids.add(closure_id)
-        affected_symbols = item.get("affected_symbols", [])
-        if (
-            not isinstance(affected_symbols, list)
-            or len(affected_symbols) > 100
-        ):
-            raise RequestError(
-                "affected_symbols must be a list of at most 100 symbols"
-            )
         start_time = _timestamp(
             _required(item, "start_time"),
             "market.start_time",
@@ -494,10 +556,9 @@ def _market_closures(
                 closure_id=closure_id,
                 start_time=start_time,
                 end_time=end_time,
-                affected_symbols=frozenset(
-                    str(symbol).strip()
-                    for symbol in affected_symbols
-                    if str(symbol).strip()
+                affected_symbols=_affected_symbols(
+                    item.get("affected_symbols", []),
+                    "affected_symbols",
                 ),
                 source=str(
                     item.get("source", "approved-market-schedule")
@@ -511,6 +572,42 @@ def _market_closures(
             closure.closure_id,
         ),
     )
+
+
+def _validate_news_coverage(
+    events: list[NewsEvent],
+    coverage_start: datetime,
+    coverage_end: datetime,
+) -> None:
+    outside = [
+        event.event_id
+        for event in events
+        if not coverage_start <= event.release_time.astimezone(timezone.utc)
+        <= coverage_end
+    ]
+    if outside:
+        raise RequestError(
+            "news events fall outside the declared coverage interval: "
+            + ", ".join(outside[:5])
+        )
+
+
+def _validate_market_coverage(
+    closures: list[MarketClosure],
+    coverage_start: datetime,
+    coverage_end: datetime,
+) -> None:
+    outside = [
+        closure.closure_id
+        for closure in closures
+        if closure.end_time.astimezone(timezone.utc) < coverage_start
+        or closure.start_time.astimezone(timezone.utc) > coverage_end
+    ]
+    if outside:
+        raise RequestError(
+            "market closures do not intersect the declared coverage interval: "
+            + ", ".join(outside[:5])
+        )
 
 
 def _profile(
@@ -1667,7 +1764,8 @@ def position_size_payload(
 
 
 class RiskRequestHandler(BaseHTTPRequestHandler):
-    server_version = "FTMO-RiskAPI/4.0"
+    server_version = "FTMO-RiskAPI/5.0"
+    sys_version = ""
 
     def setup(self) -> None:
         super().setup()
@@ -1763,6 +1861,8 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(encoded)
         self.risk_server.observe_response(self.command, self.path, status, body)
@@ -1844,7 +1944,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                 {},
             )
             return
-        if path == "/health":
+        if path in {"/health", "/ready"}:
             if not self._global_authorized():
                 self._send_json(
                     HTTPStatus.UNAUTHORIZED,
@@ -1852,42 +1952,47 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             self.auth_subject = "admin"
-            database_up = bool(
-                self.risk_server.state_store is not None
-                and self.risk_server.state_store.database_healthy()
-            )
+            readiness = self.risk_server.readiness()
+            database_up = bool(readiness["database_up"])
             unknown_executions = None
             if database_up and self.risk_server.state_store is not None:
                 unknown_executions = (
                     self.risk_server.state_store.unknown_execution_count()
                 )
+            body = {
+                "ok": readiness["ready"] if path == "/ready" else True,
+                "service": "ftmo-risk-api",
+                "rule_version": self.risk_server.rule_version,
+                "ready_for_risk_increase": readiness["ready"],
+                "readiness_reasons": readiness["reasons"],
+                "news_data_age_seconds": (
+                    self.risk_server.news_age_seconds()
+                ),
+                "market_data_age_seconds": (
+                    self.risk_server.market_age_seconds()
+                ),
+                "news_calendar": self.risk_server.calendar_health("news"),
+                "market_calendar": self.risk_server.calendar_health(
+                    "market"
+                ),
+                "persistent_state": self.risk_server.state_store is not None,
+                "database_up": database_up,
+                "unknown_execution_records": unknown_executions,
+                "account_credentials_required": (
+                    self.risk_server.account_credentials_required
+                ),
+                "mtls_enabled": self.risk_server.mtls_enabled,
+                "mtls_client_certificate_required": (
+                    self.risk_server.require_client_cert
+                ),
+            }
             self._send_json(
-                HTTPStatus.OK,
-                {
-                    "ok": True,
-                    "service": "ftmo-risk-api",
-                    "rule_version": self.risk_server.rule_version,
-                    "news_data_age_seconds": (
-                        self.risk_server.news_age_seconds()
-                    ),
-                    "market_data_age_seconds": (
-                        self.risk_server.market_age_seconds()
-                    ),
-                    "news_calendar": self.risk_server.calendar_health("news"),
-                    "market_calendar": self.risk_server.calendar_health(
-                        "market"
-                    ),
-                    "persistent_state": self.risk_server.state_store is not None,
-                    "database_up": database_up,
-                    "unknown_execution_records": unknown_executions,
-                    "account_credentials_required": (
-                        self.risk_server.account_credentials_required
-                    ),
-                    "mtls_enabled": self.risk_server.mtls_enabled,
-                    "mtls_client_certificate_required": (
-                        self.risk_server.require_client_cert
-                    ),
-                },
+                (
+                    HTTPStatus.OK
+                    if path == "/health" or readiness["ready"]
+                    else HTTPStatus.SERVICE_UNAVAILABLE
+                ),
+                body,
             )
             return
         if path == "/metrics":
@@ -1906,6 +2011,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
             )
             self.send_header("Content-Length", str(len(encoded)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(encoded)
             self.risk_server.observe_response(
@@ -1998,16 +2104,26 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                 return
             query = parse_qs(urlsplit(self.path).query)
             values = query.get("account_id", [])
-            credential_account_id: str | None = (
-                _account_id(values[0]) if values else None
-            )
-            self._send_json(
-                HTTPStatus.OK,
-                list_credentials_payload(
-                    account_id=credential_account_id,
-                    state_store=self.risk_server.state_store,
-                ),
-            )
+            try:
+                if len(values) > 1:
+                    raise RequestError(
+                        "account_id query parameter must not be repeated"
+                    )
+                credential_account_id: str | None = (
+                    _account_id(values[0]) if values else None
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    list_credentials_payload(
+                        account_id=credential_account_id,
+                        state_store=self.risk_server.state_store,
+                    ),
+                )
+            except RequestError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": str(exc)},
+                )
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
 
@@ -2041,13 +2157,15 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
             if path == "/v1/evaluate":
                 with self.risk_server.news_lock:
                     cached_events = list(self.risk_server.news_events)
-                    cached_news_age = self.risk_server.news_age_seconds()
+                    cached_news_age = self.risk_server.calendar_age_for_risk(
+                        "news"
+                    )
                 with self.risk_server.market_lock:
                     cached_closures = list(
                         self.risk_server.market_closures
                     )
                     cached_market_age = (
-                        self.risk_server.market_age_seconds()
+                        self.risk_server.calendar_age_for_risk("market")
                     )
                 if "account_id" in payload:
                     if self.risk_server.state_store is None:
@@ -2141,7 +2259,9 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     )
                 with self.risk_server.news_lock:
                     cached_events = list(self.risk_server.news_events)
-                    cached_news_age = self.risk_server.news_age_seconds()
+                    cached_news_age = self.risk_server.calendar_age_for_risk(
+                        "news"
+                    )
                 body = news_status_payload(
                     payload,
                     self.risk_server.state_store,
@@ -2159,7 +2279,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                         self.risk_server.market_closures
                     )
                     cached_market_age = (
-                        self.risk_server.market_age_seconds()
+                        self.risk_server.calendar_age_for_risk("market")
                     )
                 body = market_status_payload(
                     payload,
@@ -2199,6 +2319,12 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                 )
             elif path == "/v1/news-sync":
                 events = _news_events(_required(payload, "events"))
+                coverage_start, coverage_end = _calendar_coverage(payload)
+                _validate_news_coverage(
+                    events,
+                    coverage_start,
+                    coverage_end,
+                )
                 fetched_at = _timestamp(
                     _required(payload, "fetched_at"),
                     "fetched_at",
@@ -2231,20 +2357,31 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     if (
                         cached_at is not None
                         and incoming_at == cached_at
-                        and events != self.risk_server.news_events
+                        and (
+                            events != self.risk_server.news_events
+                            or coverage_start
+                            != self.risk_server.news_coverage_start
+                            or coverage_end
+                            != self.risk_server.news_coverage_end
+                        )
                     ):
                         raise RequestError(
-                            "news calendar timestamp already has different content"
+                            "news calendar timestamp already has different content "
+                            "or coverage"
                         )
                     if self.risk_server.state_store is not None:
                         self.risk_server.state_store.save_calendar_snapshot(
                             calendar_type="news",
                             fetched_at=fetched_at,
+                            coverage_start=coverage_start,
+                            coverage_end=coverage_end,
                             payload=_news_calendar_payload(events),
                             rule_version=self.risk_server.rule_version,
                         )
                     self.risk_server.news_events = events
                     self.risk_server.news_fetched_at = fetched_at
+                    self.risk_server.news_coverage_start = coverage_start
+                    self.risk_server.news_coverage_end = coverage_end
                     self.risk_server.news_calendar_rule_version = (
                         self.risk_server.rule_version
                     )
@@ -2263,10 +2400,18 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "event_count": len(events),
                     "news_data_age_seconds": age,
+                    "coverage_start": coverage_start.isoformat(),
+                    "coverage_end": coverage_end.isoformat(),
                 }
             elif path == "/v1/market-sync":
                 closures = _market_closures(
                     _required(payload, "closures")
+                )
+                coverage_start, coverage_end = _calendar_coverage(payload)
+                _validate_market_coverage(
+                    closures,
+                    coverage_start,
+                    coverage_end,
                 )
                 fetched_at = _timestamp(
                     _required(payload, "fetched_at"),
@@ -2300,20 +2445,31 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     if (
                         cached_at is not None
                         and incoming_at == cached_at
-                        and closures != self.risk_server.market_closures
+                        and (
+                            closures != self.risk_server.market_closures
+                            or coverage_start
+                            != self.risk_server.market_coverage_start
+                            or coverage_end
+                            != self.risk_server.market_coverage_end
+                        )
                     ):
                         raise RequestError(
-                            "market calendar timestamp already has different content"
+                            "market calendar timestamp already has different content "
+                            "or coverage"
                         )
                     if self.risk_server.state_store is not None:
                         self.risk_server.state_store.save_calendar_snapshot(
                             calendar_type="market",
                             fetched_at=fetched_at,
+                            coverage_start=coverage_start,
+                            coverage_end=coverage_end,
                             payload=_market_calendar_payload(closures),
                             rule_version=self.risk_server.rule_version,
                         )
                     self.risk_server.market_closures = closures
                     self.risk_server.market_fetched_at = fetched_at
+                    self.risk_server.market_coverage_start = coverage_start
+                    self.risk_server.market_coverage_end = coverage_end
                     self.risk_server.market_calendar_rule_version = (
                         self.risk_server.rule_version
                     )
@@ -2332,6 +2488,8 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "closure_count": len(closures),
                     "market_data_age_seconds": age,
+                    "coverage_start": coverage_start.isoformat(),
+                    "coverage_end": coverage_end.isoformat(),
                 }
             elif re.fullmatch(
                 r"/v1/admin/accounts/[^/]+/credentials",
@@ -2464,8 +2622,8 @@ class RiskHTTPServer(ThreadingHTTPServer):
             raise ValueError(
                 "auth_token is required when the API is not bound to loopback"
             )
-        self.news_lock = threading.Lock()
-        self.market_lock = threading.Lock()
+        self.news_lock = threading.RLock()
+        self.market_lock = threading.RLock()
         self.audit_lock = threading.Lock()
         self.rate_lock = threading.Lock()
         self.metrics_lock = threading.Lock()
@@ -2477,9 +2635,13 @@ class RiskHTTPServer(ThreadingHTTPServer):
         self.calendar_restore_counts: dict[tuple[str, str], int] = {}
         self.news_events: list[NewsEvent] = []
         self.news_fetched_at: datetime | None = None
+        self.news_coverage_start: datetime | None = None
+        self.news_coverage_end: datetime | None = None
         self.news_calendar_rule_version: str | None = None
         self.market_closures: list[MarketClosure] = []
         self.market_fetched_at: datetime | None = None
+        self.market_coverage_start: datetime | None = None
+        self.market_coverage_end: datetime | None = None
         self.market_calendar_rule_version: str | None = None
         self.audit_path = os.environ.get("RISK_AUDIT_PATH", "")
         self.qualification_dashboard_path = (
@@ -2649,17 +2811,39 @@ class RiskHTTPServer(ThreadingHTTPServer):
                     events = _news_events(
                         cast(list[Mapping[str, Any]], snapshot.payload)
                     )
+                    if (
+                        snapshot.coverage_start is not None
+                        and snapshot.coverage_end is not None
+                    ):
+                        _validate_news_coverage(
+                            events,
+                            snapshot.coverage_start,
+                            snapshot.coverage_end,
+                        )
                     with self.news_lock:
                         self.news_events = events
                         self.news_fetched_at = snapshot.fetched_at
+                        self.news_coverage_start = snapshot.coverage_start
+                        self.news_coverage_end = snapshot.coverage_end
                         self.news_calendar_rule_version = snapshot.rule_version
                 else:
                     closures = _market_closures(
                         cast(list[Mapping[str, Any]], snapshot.payload)
                     )
+                    if (
+                        snapshot.coverage_start is not None
+                        and snapshot.coverage_end is not None
+                    ):
+                        _validate_market_coverage(
+                            closures,
+                            snapshot.coverage_start,
+                            snapshot.coverage_end,
+                        )
                     with self.market_lock:
                         self.market_closures = closures
                         self.market_fetched_at = snapshot.fetched_at
+                        self.market_coverage_start = snapshot.coverage_start
+                        self.market_coverage_end = snapshot.coverage_end
                         self.market_calendar_rule_version = snapshot.rule_version
             except Exception:
                 LOGGER.exception(
@@ -2679,17 +2863,32 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 )
 
     def calendar_health(self, calendar_type: str) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
         if calendar_type == "news":
             with self.news_lock:
                 fetched_at = self.news_fetched_at
+                coverage_start = self.news_coverage_start
+                coverage_end = self.news_coverage_end
                 rule_version = self.news_calendar_rule_version
             age = self.news_age_seconds()
             max_age_seconds = int(
                 self.config["news_controls"]["max_calendar_age_seconds"]
             )
+            required_start = now - timedelta(
+                minutes=int(
+                    self.config["news_controls"]["internal_after_minutes"]
+                )
+            )
+            required_end = now + timedelta(
+                minutes=int(
+                    self.config["news_controls"]["internal_before_minutes"]
+                )
+            )
         else:
             with self.market_lock:
                 fetched_at = self.market_fetched_at
+                coverage_start = self.market_coverage_start
+                coverage_end = self.market_coverage_end
                 rule_version = self.market_calendar_rule_version
             age = self.market_age_seconds()
             max_age_seconds = int(
@@ -2697,16 +2896,31 @@ class RiskHTTPServer(ThreadingHTTPServer):
                     "max_schedule_age_seconds"
                 ]
             )
+            required_start = now
+            required_end = now + timedelta(
+                minutes=int(
+                    self.config["market_close_controls"][
+                        "gap_open_block_before_minutes"
+                    ]
+                )
+            )
         rule_version_match = (
             rule_version == self.rule_version
             if rule_version is not None
             else False
+        )
+        coverage_sufficient = bool(
+            coverage_start is not None
+            and coverage_end is not None
+            and coverage_start <= required_start
+            and coverage_end >= required_end
         )
         stale = (
             fetched_at is None
             or age is None
             or age > max_age_seconds
             or not rule_version_match
+            or not coverage_sufficient
         )
         return {
             "present": fetched_at is not None,
@@ -2717,6 +2931,47 @@ class RiskHTTPServer(ThreadingHTTPServer):
             "persistent": self.state_store is not None,
             "rule_version": rule_version,
             "rule_version_match": rule_version_match,
+            "coverage_start": (
+                coverage_start.isoformat()
+                if coverage_start is not None
+                else None
+            ),
+            "coverage_end": (
+                coverage_end.isoformat()
+                if coverage_end is not None
+                else None
+            ),
+            "required_start": required_start.isoformat(),
+            "required_end": required_end.isoformat(),
+            "coverage_sufficient": coverage_sufficient,
+        }
+
+    def calendar_age_for_risk(self, calendar_type: str) -> int | None:
+        health = self.calendar_health(calendar_type)
+        return None if health["stale"] else cast(int, health["age_seconds"])
+
+    def readiness(self) -> dict[str, Any]:
+        database_up = bool(
+            self.state_store is not None
+            and self.state_store.database_healthy()
+        )
+        news = self.calendar_health("news")
+        market = self.calendar_health("market")
+        reasons: list[str] = []
+        if not database_up:
+            reasons.append("persistent state database is unavailable")
+        if news["stale"]:
+            reasons.append("news calendar is missing, stale, or under-covered")
+        if market["stale"]:
+            reasons.append(
+                "market closure calendar is missing, stale, or under-covered"
+            )
+        return {
+            "ready": not reasons,
+            "database_up": database_up,
+            "news_calendar_ready": not news["stale"],
+            "market_calendar_ready": not market["stale"],
+            "reasons": reasons,
         }
 
     def observe_response(
@@ -2726,7 +2981,7 @@ class RiskHTTPServer(ThreadingHTTPServer):
         status: HTTPStatus,
         body: Mapping[str, Any],
     ) -> None:
-        endpoint = _path_only(path)
+        endpoint = _metric_endpoint(path)
         status_text = str(int(status))
         decision = body.get("decision")
         decision_code = (
@@ -2812,6 +3067,8 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 "# TYPE ftmo_risk_calendar_stale gauge",
                 "# HELP ftmo_risk_calendar_rule_version_match Whether the loaded calendar uses the active rule version.",
                 "# TYPE ftmo_risk_calendar_rule_version_match gauge",
+                "# HELP ftmo_risk_calendar_coverage_sufficient Whether the calendar covers the full active guard horizon.",
+                "# TYPE ftmo_risk_calendar_coverage_sufficient gauge",
             ]
         )
         for calendar in ("news", "market"):
@@ -2838,6 +3095,21 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 f'{{calendar="{_prometheus_label(calendar)}"}} '
                 f"{1 if health['rule_version_match'] else 0}"
             )
+            lines.append(
+                "ftmo_risk_calendar_coverage_sufficient"
+                f'{{calendar="{_prometheus_label(calendar)}"}} '
+                f"{1 if health['coverage_sufficient'] else 0}"
+            )
+
+        readiness = self.readiness()
+        lines.extend(
+            [
+                "# HELP ftmo_risk_ready_for_risk_increase Whether persistent state and both calendars are ready for new risk.",
+                "# TYPE ftmo_risk_ready_for_risk_increase gauge",
+                "ftmo_risk_ready_for_risk_increase "
+                f"{1 if readiness['ready'] else 0}",
+            ]
+        )
 
         lines.extend(
             [

@@ -54,6 +54,27 @@ def _open_request(when="2026-08-22T12:00:00+00:00"):
     }
 
 
+def _calendar_coverage(
+    reference: datetime | None = None,
+) -> dict[str, str]:
+    reference = reference or datetime.now(UTC)
+    return {
+        "coverage_start": (reference - timedelta(days=1)).isoformat(),
+        "coverage_end": (reference + timedelta(days=7)).isoformat(),
+    }
+
+
+def _with_calendar_coverage(
+    path: str,
+    payload: dict | None,
+) -> dict | None:
+    if payload is None or path not in {"/v1/news-sync", "/v1/market-sync"}:
+        return payload
+    if "coverage_start" in payload or "coverage_end" in payload:
+        return payload
+    return {**payload, **_calendar_coverage()}
+
+
 class RiskAPITests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -95,6 +116,7 @@ class RiskAPITests(unittest.TestCase):
     def request(self, method, path, payload=None, token="test-token"):
         headers = {}
         data = None
+        payload = _with_calendar_coverage(path, payload)
         if payload is not None:
             headers["Content-Type"] = "application/json"
             data = json.dumps(payload).encode("utf-8")
@@ -113,9 +135,23 @@ class RiskAPITests(unittest.TestCase):
         status, body = self.request("GET", "/health")
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
-        self.assertEqual(body["rule_version"], "ftmo-v4-2026-08-23")
+        self.assertEqual(body["rule_version"], "ftmo-v5-2026-08-26")
         self.assertFalse(body["database_up"])
+        self.assertFalse(body["ready_for_risk_increase"])
+        self.assertIn(
+            "persistent state database is unavailable",
+            body["readiness_reasons"],
+        )
         self.assertIsNone(body["unknown_execution_records"])
+
+    def test_ready_returns_service_unavailable_without_persistent_state(self):
+        with self.assertRaises(HTTPError) as context:
+            self.request("GET", "/ready")
+        self.assertEqual(context.exception.code, 503)
+        body = json.loads(context.exception.read())
+        self.assertFalse(body["ok"])
+        self.assertFalse(body["ready_for_risk_increase"])
+        context.exception.close()
 
     def test_evaluate_allows_order_within_budget(self):
         payload = {
@@ -137,7 +173,7 @@ class RiskAPITests(unittest.TestCase):
         )
 
     def test_evaluate_rejects_hard_news_window(self):
-        event_time = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+        event_time = datetime.now(UTC)
         self.request(
             "POST",
             "/v1/news-sync",
@@ -183,7 +219,7 @@ class RiskAPITests(unittest.TestCase):
         self.assertEqual(body["decision"]["code"], "REJECT_DATA_STALE")
 
     def test_news_sync_populates_cache_for_standard_account(self):
-        event_time = datetime(2026, 8, 22, 12, 30, tzinfo=UTC)
+        event_time = datetime.now(UTC) + timedelta(minutes=30)
         sync_payload = {
             "fetched_at": datetime.now(UTC).isoformat(),
             "events": [
@@ -219,6 +255,72 @@ class RiskAPITests(unittest.TestCase):
         with self.assertRaises(HTTPError) as context:
             self.request("POST", "/v1/news-sync", payload)
         self.assertEqual(context.exception.code, 400)
+
+    def test_calendar_sync_requires_explicit_coverage(self):
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/news-sync",
+                {
+                    "fetched_at": datetime.now(UTC).isoformat(),
+                    "coverage_start": None,
+                    "coverage_end": None,
+                    "events": [],
+                },
+            )
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
+
+    def test_fresh_but_undercovered_calendar_is_fail_closed(self):
+        now = datetime.now(UTC)
+        self.request(
+            "POST",
+            "/v1/news-sync",
+            {
+                "fetched_at": now.isoformat(),
+                "coverage_start": (now - timedelta(minutes=1)).isoformat(),
+                "coverage_end": (now + timedelta(minutes=1)).isoformat(),
+                "events": [],
+            },
+        )
+        status, body = self.request(
+            "POST",
+            "/v1/evaluate",
+            {
+                "account_type": "two_step",
+                "phase": "evaluation",
+                "style": "standard",
+                "snapshot": _snapshot(),
+                "request": _open_request(),
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["decision"]["code"], "REJECT_DATA_STALE")
+        self.assertFalse(self.server.calendar_health("news")["coverage_sufficient"])
+
+    def test_calendar_entries_must_match_declared_coverage(self):
+        now = datetime.now(UTC)
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/news-sync",
+                {
+                    "fetched_at": now.isoformat(),
+                    "coverage_start": (now - timedelta(minutes=5)).isoformat(),
+                    "coverage_end": (now + timedelta(minutes=5)).isoformat(),
+                    "events": [
+                        {
+                            "event_id": "OUTSIDE-COVERAGE",
+                            "release_time": (
+                                now + timedelta(hours=1)
+                            ).isoformat(),
+                            "affected_symbols": ["EURUSD"],
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
 
     def test_position_size_returns_decimal_strings(self):
         payload = {
@@ -419,13 +521,19 @@ class RiskAPITests(unittest.TestCase):
     def test_equal_calendar_timestamp_cannot_change_content(self):
         with self.server.news_lock:
             fetched_at = self.server.news_fetched_at
+            coverage_start = self.server.news_coverage_start
+            coverage_end = self.server.news_coverage_end
         self.assertIsNotNone(fetched_at)
+        self.assertIsNotNone(coverage_start)
+        self.assertIsNotNone(coverage_end)
         with self.assertRaises(HTTPError) as context:
             self.request(
                 "POST",
                 "/v1/news-sync",
                 {
                     "fetched_at": fetched_at.isoformat(),
+                    "coverage_start": coverage_start.isoformat(),
+                    "coverage_end": coverage_end.isoformat(),
                     "events": [
                         {
                             "event_id": "CONFLICT",
@@ -436,6 +544,30 @@ class RiskAPITests(unittest.TestCase):
                 },
             )
         self.assertEqual(context.exception.code, 400)
+
+    def test_equal_calendar_timestamp_cannot_change_coverage(self):
+        with self.server.news_lock:
+            fetched_at = self.server.news_fetched_at
+            coverage_start = self.server.news_coverage_start
+            coverage_end = self.server.news_coverage_end
+        self.assertIsNotNone(fetched_at)
+        self.assertIsNotNone(coverage_start)
+        self.assertIsNotNone(coverage_end)
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/news-sync",
+                {
+                    "fetched_at": fetched_at.isoformat(),
+                    "coverage_start": coverage_start.isoformat(),
+                    "coverage_end": (
+                        coverage_end + timedelta(days=1)
+                    ).isoformat(),
+                    "events": [],
+                },
+            )
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
 
     def test_duplicate_calendar_ids_are_rejected(self):
         event = {
@@ -453,6 +585,25 @@ class RiskAPITests(unittest.TestCase):
                 },
             )
         self.assertEqual(context.exception.code, 400)
+
+    def test_calendar_symbol_wildcard_must_be_trailing(self):
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/news-sync",
+                {
+                    "fetched_at": datetime.now(UTC).isoformat(),
+                    "events": [
+                        {
+                            "event_id": "BAD-PATTERN",
+                            "release_time": datetime.now(UTC).isoformat(),
+                            "affected_symbols": ["EUR*USD"],
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
 
     def test_duplicate_json_keys_are_rejected(self):
         request = Request(
@@ -569,7 +720,7 @@ class SecurityContractTests(unittest.TestCase):
                     json.dump(config, target)
                 self.assertEqual(
                     server.config["rule_version"],
-                    "ftmo-v4-2026-08-23",
+                    "ftmo-v5-2026-08-26",
                 )
             finally:
                 server.server_close()
@@ -665,6 +816,7 @@ class StatefulRiskAPITests(unittest.TestCase):
         cls.tempdir.cleanup()
 
     def request(self, path, payload, request_id=None):
+        payload = _with_calendar_coverage(path, payload)
         headers = {
             "Content-Type": "application/json",
             "X-Risk-Token": "test-token",
@@ -1454,6 +1606,7 @@ class CredentialQualificationAPITests(unittest.TestCase):
     ):
         headers = {}
         data = None
+        payload = _with_calendar_coverage(path, payload)
         if payload is not None:
             headers["Content-Type"] = "application/json"
             data = json.dumps(payload).encode("utf-8")
@@ -1527,6 +1680,29 @@ class CredentialQualificationAPITests(unittest.TestCase):
                 admin=True,
             )
         return credential, created["credential"]["credential_id"]
+
+    def test_ready_succeeds_with_persistent_state_and_covered_calendars(self):
+        self.bootstrap_account("ready-account")
+        status, body = self.request("GET", "/ready", admin=True)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["ready_for_risk_increase"])
+        self.assertEqual(body["readiness_reasons"], [])
+
+    def test_credential_list_rejects_invalid_or_repeated_account_query(self):
+        for query in (
+            "account_id=invalid%2Faccount",
+            "account_id=first&account_id=second",
+        ):
+            with self.subTest(query=query):
+                with self.assertRaises(HTTPError) as context:
+                    self.request(
+                        "GET",
+                        f"/v1/admin/credentials?{query}",
+                        admin=True,
+                    )
+                self.assertEqual(context.exception.code, 400)
+                context.exception.close()
 
     def test_account_credential_is_bound_to_account_and_scope(self):
         credential, _ = self.bootstrap_account("bound-account")
@@ -1754,15 +1930,39 @@ class CredentialQualificationAPITests(unittest.TestCase):
             finally:
                 server.server_close()
 
-    def test_prometheus_endpoint_labels_are_escaped(self):
+    def test_prometheus_endpoint_labels_are_bounded(self):
         self.server.observe_response(
             "GET",
             '/bad"quote',
             HTTPStatus.OK,
             {},
         )
+        self.server.observe_response(
+            "GET",
+            "/another-random-path",
+            HTTPStatus.OK,
+            {},
+        )
+        self.server.observe_response(
+            "POST",
+            "/v1/admin/credentials/first/rotate",
+            HTTPStatus.OK,
+            {},
+        )
+        self.server.observe_response(
+            "POST",
+            "/v1/admin/credentials/second/rotate",
+            HTTPStatus.OK,
+            {},
+        )
         metrics = self.server.metrics_text()
-        self.assertIn('endpoint="/bad\\"quote"', metrics)
+        self.assertIn('endpoint="/__unknown__",status="200"} 2', metrics)
+        self.assertIn(
+            'endpoint="/v1/admin/credentials/{credential_id}/rotate",'
+            'status="200"} 2',
+            metrics,
+        )
+        self.assertNotIn("another-random-path", metrics)
 
     def test_qualification_dashboard_uses_closed_trade_history(self):
         credential, _ = self.bootstrap_account(
@@ -1879,6 +2079,11 @@ class CredentialQualificationAPITests(unittest.TestCase):
             'ftmo_risk_calendar_stale{calendar="news"} 0',
             metrics,
         )
+        self.assertIn(
+            'ftmo_risk_calendar_coverage_sufficient{calendar="news"} 1',
+            metrics,
+        )
+        self.assertIn("ftmo_risk_ready_for_risk_increase 1", metrics)
         self.assertIn(
             'ftmo_risk_decisions_total{code="ALLOW"} 1',
             metrics,

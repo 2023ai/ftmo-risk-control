@@ -13,6 +13,16 @@ from zoneinfo import ZoneInfo
 ZERO = Decimal("0")
 
 
+def _symbol_pattern_matches(pattern: str, symbol: str) -> bool:
+    normalized_pattern = pattern.upper()
+    normalized_symbol = symbol.upper()
+    if normalized_pattern == "*":
+        return True
+    if normalized_pattern.endswith("*"):
+        return normalized_symbol.startswith(normalized_pattern[:-1])
+    return normalized_pattern == normalized_symbol
+
+
 class AccountType(str, Enum):
     ONE_STEP = "one_step"
     TWO_STEP = "two_step"
@@ -233,7 +243,10 @@ class NewsEvent:
     source: str = "ftmo-calendar"
 
     def affects(self, symbol: str) -> bool:
-        return symbol.upper() in {item.upper() for item in self.affected_symbols}
+        return any(
+            _symbol_pattern_matches(item, symbol)
+            for item in self.affected_symbols
+        )
 
 
 @dataclass(frozen=True)
@@ -245,7 +258,10 @@ class MarketClosure:
     source: str = "approved-market-schedule"
 
     def affects(self, symbol: str) -> bool:
-        return symbol.upper() in {item.upper() for item in self.affected_symbols}
+        return any(
+            _symbol_pattern_matches(item, symbol)
+            for item in self.affected_symbols
+        )
 
 
 @dataclass

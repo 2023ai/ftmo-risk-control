@@ -10,6 +10,15 @@ groups:
           summary: FTMO risk SQLite state is unavailable
           description: Stop all risk-increasing trading until state is healthy.
 
+      - alert: FtmoRiskNotReady
+        expr: ftmo_risk_ready_for_risk_increase == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: FTMO risk service is not ready for new risk
+          description: Persistent state or a required calendar is unavailable, stale, or under-covered.
+
       - alert: FtmoRiskNewsCalendarMissing
         expr: ftmo_risk_calendar_present{calendar="news"} == 0
         for: 1m
@@ -36,6 +45,15 @@ groups:
         annotations:
           summary: Persisted calendar uses an inactive rule version
           description: The service refused to use a calendar snapshot until it is resynchronized.
+
+      - alert: FtmoRiskCalendarCoverageInsufficient
+        expr: ftmo_risk_calendar_present == 1 and ftmo_risk_calendar_coverage_sufficient == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: A risk calendar does not cover the active guard horizon
+          description: Publish a reviewed calendar with coverage spanning the full look-behind and look-ahead window.
 
       - alert: FtmoRiskMarketCalendarMissing
         expr: ftmo_risk_calendar_present{calendar="market"} == 0

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sqlite3
@@ -8,6 +9,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 from src.risk_engine import (
     AccountPhase,
@@ -33,6 +35,27 @@ class StateStoreTests(unittest.TestCase):
         mode = stat.S_IMODE(os.stat(self.path).st_mode)
         self.assertEqual(mode, 0o600)
 
+    def test_database_integrity_scan_is_cached_for_one_minute(self):
+        with patch(
+            "src.state_store.time.monotonic",
+            side_effect=(100.0, 110.0, 161.0),
+        ):
+            self.assertTrue(self.store.database_healthy())
+            self.assertEqual(
+                self.store._last_integrity_check_monotonic,
+                100.0,
+            )
+            self.assertTrue(self.store.database_healthy())
+            self.assertEqual(
+                self.store._last_integrity_check_monotonic,
+                100.0,
+            )
+            self.assertTrue(self.store.database_healthy())
+            self.assertEqual(
+                self.store._last_integrity_check_monotonic,
+                161.0,
+            )
+
     def test_calendar_snapshot_survives_restart(self):
         fetched_at = self.now.replace(microsecond=0)
         payload = [
@@ -47,12 +70,22 @@ class StateStoreTests(unittest.TestCase):
         self.store.save_calendar_snapshot(
             calendar_type="news",
             fetched_at=fetched_at,
+            coverage_start=fetched_at - timedelta(days=1),
+            coverage_end=fetched_at + timedelta(days=7),
             payload=payload,
             rule_version="test-rule",
         )
         snapshot = StateStore(self.path).get_calendar_snapshots()["news"]
         self.assertEqual(snapshot.payload, payload)
         self.assertEqual(snapshot.rule_version, "test-rule")
+        self.assertEqual(
+            snapshot.coverage_start,
+            fetched_at - timedelta(days=1),
+        )
+        self.assertEqual(
+            snapshot.coverage_end,
+            fetched_at + timedelta(days=7),
+        )
 
     def test_calendar_snapshot_rejects_older_and_conflicting_content(self):
         fetched_at = self.now.replace(microsecond=0)
@@ -84,6 +117,126 @@ class StateStoreTests(unittest.TestCase):
                 rule_version="different-rule",
             )
 
+    def test_calendar_snapshot_detects_persisted_payload_corruption(self):
+        fetched_at = self.now.replace(microsecond=0)
+        self.store.save_calendar_snapshot(
+            calendar_type="news",
+            fetched_at=fetched_at,
+            coverage_start=fetched_at - timedelta(days=1),
+            coverage_end=fetched_at + timedelta(days=7),
+            payload=[],
+            rule_version="test-rule",
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """
+                UPDATE calendar_snapshots
+                SET payload_json = ?
+                WHERE calendar_type = 'news'
+                """,
+                ('[{"event_id":"tampered"}]',),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(ValueError, "content hash"):
+            self.store.get_calendar_snapshots()
+
+    def test_calendar_snapshot_detects_coverage_tampering(self):
+        fetched_at = self.now.replace(microsecond=0)
+        self.store.save_calendar_snapshot(
+            calendar_type="market",
+            fetched_at=fetched_at,
+            coverage_start=fetched_at - timedelta(days=1),
+            coverage_end=fetched_at + timedelta(days=7),
+            payload=[],
+            rule_version="test-rule",
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """
+                UPDATE calendar_snapshots
+                SET coverage_end = ?
+                WHERE calendar_type = 'market'
+                """,
+                ((fetched_at + timedelta(days=30)).isoformat(),),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(ValueError, "safety metadata"):
+            self.store.get_calendar_snapshots()
+
+    def test_legacy_hash_version_cannot_claim_trusted_coverage(self):
+        fetched_at = self.now.replace(microsecond=0)
+        self.store.save_calendar_snapshot(
+            calendar_type="news",
+            fetched_at=fetched_at,
+            coverage_start=fetched_at - timedelta(days=1),
+            coverage_end=fetched_at + timedelta(days=7),
+            payload=[],
+            rule_version="test-rule",
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """
+                UPDATE calendar_snapshots
+                SET hash_version = 1,
+                    content_hash = ?
+                WHERE calendar_type = 'news'
+                """,
+                (hashlib.sha256(b"[]").hexdigest(),),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(ValueError, "legacy calendar snapshots"):
+            self.store.get_calendar_snapshots()
+
+    def test_legacy_calendar_schema_migrates_without_trusting_coverage(self):
+        legacy_path = Path(self.tempdir.name) / "legacy.db"
+        payload_json = "[]"
+        fetched_at = self.now.replace(microsecond=0)
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            connection.execute(
+                """
+                CREATE TABLE calendar_snapshots (
+                    calendar_type TEXT PRIMARY KEY,
+                    fetched_at TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    rule_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO calendar_snapshots (
+                    calendar_type, fetched_at, content_hash, payload_json,
+                    rule_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "news",
+                    fetched_at.isoformat(),
+                    hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+                    payload_json,
+                    "legacy-rule",
+                    fetched_at.isoformat(),
+                ),
+            )
+            connection.commit()
+
+        migrated = StateStore(legacy_path).get_calendar_snapshots()["news"]
+        self.assertEqual(migrated.payload, [])
+        self.assertIsNone(migrated.coverage_start)
+        self.assertIsNone(migrated.coverage_end)
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(calendar_snapshots)"
+                )
+            }
+        self.assertIn("coverage_start", columns)
+        self.assertIn("coverage_end", columns)
+        self.assertIn("hash_version", columns)
+
     def test_account_credential_scope_expiry_and_revocation(self):
         record, secret = self.store.create_account_credential(
             account_id="mt5-credential",
@@ -99,6 +252,28 @@ class StateStoreTests(unittest.TestCase):
             now=self.now + timedelta(seconds=1),
         )
         self.assertIsNotNone(authenticated)
+        first_last_used = authenticated.last_used_at
+        authenticated_again = self.store.authenticate_account_credential(
+            account_id="mt5-credential",
+            secret=secret,
+            scope="trade:evaluate",
+            now=self.now + timedelta(seconds=30),
+        )
+        self.assertIsNotNone(authenticated_again)
+        self.assertEqual(authenticated_again.last_used_at, first_last_used)
+        authenticated_after_interval = (
+            self.store.authenticate_account_credential(
+                account_id="mt5-credential",
+                secret=secret,
+                scope="trade:evaluate",
+                now=self.now + timedelta(seconds=62),
+            )
+        )
+        self.assertIsNotNone(authenticated_after_interval)
+        self.assertEqual(
+            authenticated_after_interval.last_used_at,
+            self.now + timedelta(seconds=62),
+        )
         self.assertIsNone(
             self.store.authenticate_account_credential(
                 account_id="other-account",

@@ -253,6 +253,22 @@ class RiskEngineTests(unittest.TestCase):
         )
         self.assertEqual(decision.code, DecisionCode.REJECT_NEWS)
 
+    def test_calendar_symbol_patterns_cover_broker_suffixes_and_all_symbols(self):
+        event = NewsEvent(
+            event_id="NFP",
+            release_time=self.now,
+            affected_symbols=frozenset({"EURUSD*"}),
+        )
+        closure = MarketClosure(
+            closure_id="all-markets",
+            start_time=self.now,
+            end_time=self.now + timedelta(days=2),
+            affected_symbols=frozenset({"*"}),
+        )
+        self.assertTrue(event.affects("EURUSD.a"))
+        self.assertFalse(event.affects("GBPUSD"))
+        self.assertTrue(closure.affects("US30.cash"))
+
     def test_evaluation_does_not_apply_ftmo_hard_news_rule_but_internal_buffer_applies(
         self,
     ):
