@@ -16,6 +16,7 @@ from src.risk_engine import (
     RiskEngine,
     RuleProfile,
     TradeRequest,
+    TradeSide,
     ftmo_day_key,
     load_profile,
     validate_config,
@@ -63,6 +64,7 @@ def open_request(
         symbol=symbol,
         action=Action.OPEN,
         requested_at=when,
+        side=TradeSide.BUY,
         volume=Decimal(volume),
         entry_price=Decimal("1.1000"),
         stop_loss=Decimal(stop_loss),
@@ -252,6 +254,63 @@ class RiskEngineTests(unittest.TestCase):
             [event],
         )
         self.assertEqual(decision.code, DecisionCode.REJECT_NEWS)
+
+    def test_ftmo_account_standard_blocks_close_and_modify_in_hard_window(self):
+        engine = RiskEngine(
+            RuleProfile.two_step_default(
+                phase=AccountPhase.FTMO_ACCOUNT,
+                style=AccountStyle.STANDARD,
+            )
+        )
+        event = NewsEvent(
+            event_id="CPI",
+            release_time=self.now,
+            affected_symbols=frozenset({"EURUSD"}),
+        )
+        for action in (Action.CLOSE, Action.MODIFY):
+            with self.subTest(action=action):
+                request = TradeRequest(
+                    symbol="EURUSD",
+                    action=action,
+                    requested_at=self.now + timedelta(minutes=1),
+                    stop_loss=Decimal("1.0800")
+                    if action == Action.MODIFY
+                    else None,
+                    is_risk_increasing=False,
+                )
+                decision = engine.evaluate(
+                    snapshot(),
+                    request,
+                    self.frequency,
+                    [event],
+                )
+                self.assertEqual(decision.code, DecisionCode.REJECT_NEWS)
+
+    def test_cancel_remains_allowed_in_hard_news_window(self):
+        engine = RiskEngine(
+            RuleProfile.two_step_default(
+                phase=AccountPhase.FTMO_ACCOUNT,
+                style=AccountStyle.STANDARD,
+            )
+        )
+        event = NewsEvent(
+            event_id="CPI",
+            release_time=self.now,
+            affected_symbols=frozenset({"EURUSD"}),
+        )
+        request = TradeRequest(
+            symbol="EURUSD",
+            action=Action.CANCEL,
+            requested_at=self.now + timedelta(minutes=1),
+            is_risk_increasing=False,
+        )
+        decision = engine.evaluate(
+            snapshot(),
+            request,
+            self.frequency,
+            [event],
+        )
+        self.assertEqual(decision.code, DecisionCode.ALLOW)
 
     def test_calendar_symbol_patterns_cover_broker_suffixes_and_all_symbols(self):
         event = NewsEvent(

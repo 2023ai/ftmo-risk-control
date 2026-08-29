@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -44,6 +45,7 @@ from .risk_engine import (
     RiskEngine,
     RuleProfile,
     TradeRequest,
+    TradeSide,
     ftmo_day_key,
     validate_config,
 )
@@ -58,6 +60,14 @@ from .state_store import (
 
 LOGGER = logging.getLogger(__name__)
 ConfigSource = str | Path | Mapping[str, Any]
+MAX_DECIMAL_TEXT_LENGTH = 128
+MAX_DECIMAL_SIGNIFICANT_DIGITS = 40
+MAX_DECIMAL_EXPONENT = 100
+MAX_TIMESTAMP_TEXT_LENGTH = 128
+MAX_AGE_SECONDS = 10 * 365 * 24 * 60 * 60
+MAX_COUNT_VALUE = 10_000_000
+MAX_SERVER_BODY_BYTES = 10_000_000
+MAX_AUTH_TOKEN_LENGTH = 512
 
 
 class RequestError(ValueError):
@@ -89,11 +99,18 @@ def _json_object_without_duplicate_keys(
     return result
 
 
+def _reject_json_constant(value: str) -> None:
+    raise RequestError(
+        f"JSON constants such as {value} are not supported; use a finite value"
+    )
+
+
 ACCOUNT_SCOPES = {
     "/v1/account-sync": "account:sync",
     "/v1/settlement-sync": "account:settlement",
     "/v1/evaluate": "trade:evaluate",
     "/v1/execution-result": "trade:execution",
+    "/v1/execution-status": "trade:execution",
     "/v1/news-status": "calendar:read",
     "/v1/market-status": "calendar:read",
     "/v1/closed-trade-sync": "qualification:write",
@@ -110,6 +127,7 @@ METRIC_ENDPOINTS = frozenset(
         "/v1/qualification",
         "/v1/qualification/accounts",
         "/v1/admin/credentials",
+        "/v1/admin/execution-reservations",
         *ACCOUNT_SCOPES,
         "/v1/news-sync",
         "/v1/market-sync",
@@ -179,12 +197,24 @@ def _market_calendar_payload(
 def _decimal(value: Any, field: str) -> Decimal:
     if isinstance(value, bool) or value is None:
         raise RequestError(f"{field} must be a decimal-compatible value")
+    text = str(value)
+    if len(text) > MAX_DECIMAL_TEXT_LENGTH:
+        raise RequestError(f"{field} exceeds the decimal input length limit")
     try:
-        parsed = Decimal(str(value))
+        parsed = Decimal(text)
     except Exception as exc:
         raise RequestError(f"{field} must be a decimal-compatible value") from exc
     if not parsed.is_finite():
         raise RequestError(f"{field} must be a finite decimal")
+    exponent = parsed.as_tuple().exponent
+    if not isinstance(exponent, int):
+        raise RequestError(f"{field} must be a finite decimal")
+    if (
+        len(parsed.as_tuple().digits) > MAX_DECIMAL_SIGNIFICANT_DIGITS
+        or abs(exponent) > MAX_DECIMAL_EXPONENT
+        or (parsed != 0 and abs(parsed.adjusted()) > MAX_DECIMAL_EXPONENT)
+    ):
+        raise RequestError(f"{field} exceeds the decimal precision or magnitude limit")
     return parsed
 
 
@@ -194,9 +224,30 @@ def _required(raw: Mapping[str, Any], field: str) -> Any:
     return raw[field]
 
 
+def _bounded_string(
+    value: Any,
+    field: str,
+    maximum: int,
+    *,
+    required: bool = True,
+) -> str:
+    if not isinstance(value, str):
+        raise RequestError(f"{field} must be a string")
+    result = value.strip()
+    if required and not result:
+        raise RequestError(f"{field} must not be empty")
+    if len(result) > maximum:
+        raise RequestError(f"{field} must contain at most {maximum} characters")
+    if any(ord(character) < 32 for character in result):
+        raise RequestError(f"{field} must not contain control characters")
+    return result
+
+
 def _timestamp(value: Any, field: str) -> datetime:
     if not isinstance(value, str):
         raise RequestError(f"{field} must be an ISO 8601 string")
+    if len(value) > MAX_TIMESTAMP_TEXT_LENGTH:
+        raise RequestError(f"{field} exceeds the timestamp input length limit")
     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
         parsed = datetime.fromisoformat(normalized)
@@ -248,6 +299,8 @@ def _age_seconds(value: Any, field: str) -> int | None:
     result = value
     if result < 0:
         raise RequestError(f"{field} must be a non-negative integer")
+    if result > MAX_AGE_SECONDS:
+        raise RequestError(f"{field} exceeds the supported age range")
     return result
 
 
@@ -274,6 +327,8 @@ def _optional_nonnegative_int(value: Any, field: str) -> int | None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise RequestError(f"{field} must be a non-negative integer")
+    if value > MAX_COUNT_VALUE:
+        raise RequestError(f"{field} exceeds the supported count range")
     return value
 
 
@@ -302,6 +357,10 @@ def _snapshot(raw: Mapping[str, Any]) -> AccountSnapshot:
         current_open_risk=_decimal(
             raw.get("current_open_risk", "0"), "current_open_risk"
         ),
+        reserved_open_risk=_decimal(
+            raw.get("reserved_open_risk", "0"),
+            "reserved_open_risk",
+        ),
         data_age_seconds=parsed_age,
         data_uncertain=bool(raw.get("data_uncertain", False)),
         day_locked=bool(raw.get("day_locked", False)),
@@ -323,6 +382,8 @@ def _snapshot(raw: Mapping[str, Any]) -> AccountSnapshot:
         raise RequestError("highest_settled_balance must be positive")
     if snapshot.current_open_risk < 0:
         raise RequestError("current_open_risk cannot be negative")
+    if snapshot.reserved_open_risk < 0:
+        raise RequestError("reserved_open_risk cannot be negative")
     if snapshot.data_age_seconds < 0:
         raise RequestError("data_age_seconds cannot be negative")
     if not isinstance(raw.get("data_uncertain", False), bool):
@@ -338,6 +399,11 @@ def _trade_request(raw: Mapping[str, Any]) -> TradeRequest:
     if not isinstance(raw, Mapping):
         raise RequestError("request must be a JSON object")
     action = _enum(Action, _required(raw, "action"), "action")
+    side = (
+        _enum(TradeSide, raw["side"], "side")
+        if raw.get("side") is not None
+        else None
+    )
     risk_increasing = raw.get(
         "is_risk_increasing",
         action in {Action.OPEN, Action.MODIFY},
@@ -350,16 +416,14 @@ def _trade_request(raw: Mapping[str, Any]) -> TradeRequest:
         raise RequestError(
             "close and cancel requests must be risk-reducing"
         )
-    raw_symbol = _required(raw, "symbol")
-    if not isinstance(raw_symbol, str):
-        raise RequestError("symbol must be a string")
-    symbol = raw_symbol.strip()
-    if not symbol or len(symbol) > 64:
-        raise RequestError("symbol must contain 1 to 64 characters")
+    if action == Action.OPEN and side is None:
+        raise RequestError("opening requests require side=buy or side=sell")
+    symbol = _bounded_string(_required(raw, "symbol"), "symbol", 64)
     request = TradeRequest(
         symbol=symbol,
         action=action,
         requested_at=_timestamp(_required(raw, "requested_at"), "requested_at"),
+        side=side,
         volume=_decimal(raw.get("volume", "0"), "volume"),
         entry_price=(
             _decimal(raw["entry_price"], "entry_price")
@@ -387,7 +451,12 @@ def _trade_request(raw: Mapping[str, Any]) -> TradeRequest:
             "additional_risk",
         ),
         is_risk_increasing=risk_increasing,
-        idea_id=str(raw.get("idea_id", "")),
+        idea_id=_bounded_string(
+            raw.get("idea_id", ""),
+            "idea_id",
+            128,
+            required=False,
+        ),
     )
     if request.estimated_costs < 0:
         raise RequestError("estimated_costs cannot be negative")
@@ -474,6 +543,8 @@ def _affected_symbols(raw: Any, field: str) -> frozenset[str]:
                 "one optional trailing wildcard"
             )
         symbols.add(symbol.upper())
+    if not symbols:
+        raise RequestError(f"{field} must contain at least one symbol")
     return frozenset(symbols)
 
 
@@ -487,11 +558,11 @@ def _news_events(raw: list[Mapping[str, Any]] | None) -> list[NewsEvent]:
     events = []
     event_ids: set[str] = set()
     for item in raw:
-        event_id = str(_required(item, "event_id")).strip()
-        if not 1 <= len(event_id) <= 128:
-            raise RequestError(
-                "news event_id must contain 1 to 128 characters"
-            )
+        event_id = _bounded_string(
+            _required(item, "event_id"),
+            "news event_id",
+            128,
+        )
         if event_id in event_ids:
             raise RequestError(f"duplicate news event_id: {event_id}")
         event_ids.add(event_id)
@@ -506,8 +577,16 @@ def _news_events(raw: list[Mapping[str, Any]] | None) -> list[NewsEvent]:
                     item.get("affected_symbols", []),
                     "affected_symbols",
                 ),
-                importance=str(item.get("importance", "high")),
-                source=str(item.get("source", "ftmo-calendar")),
+                importance=_bounded_string(
+                    item.get("importance", "high"),
+                    "news importance",
+                    32,
+                ),
+                source=_bounded_string(
+                    item.get("source", "ftmo-calendar"),
+                    "news source",
+                    128,
+                ),
             )
         )
     return sorted(
@@ -531,11 +610,11 @@ def _market_closures(
     closures = []
     closure_ids: set[str] = set()
     for item in raw or []:
-        closure_id = str(_required(item, "closure_id")).strip()
-        if not 1 <= len(closure_id) <= 128:
-            raise RequestError(
-                "market closure_id must contain 1 to 128 characters"
-            )
+        closure_id = _bounded_string(
+            _required(item, "closure_id"),
+            "market closure_id",
+            128,
+        )
         if closure_id in closure_ids:
             raise RequestError(
                 f"duplicate market closure_id: {closure_id}"
@@ -560,8 +639,10 @@ def _market_closures(
                     item.get("affected_symbols", []),
                     "affected_symbols",
                 ),
-                source=str(
-                    item.get("source", "approved-market-schedule")
+                source=_bounded_string(
+                    item.get("source", "approved-market-schedule"),
+                    "market source",
+                    128,
                 ),
             )
         )
@@ -641,7 +722,7 @@ def _account_id(value: Any) -> str:
     result = value
     if not result or len(result) > 128:
         raise RequestError("account_id must contain 1 to 128 characters")
-    if not all(character.isalnum() or character in "._:-" for character in result):
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", result):
         raise RequestError(
             "account_id may only contain letters, digits, dot, underscore, "
             "colon, and dash"
@@ -674,6 +755,10 @@ def _stored_snapshot(account: StoredAccount) -> dict[str, Any]:
             "equity": snapshot.equity,
             "as_of": snapshot.as_of.isoformat(),
             "current_open_risk": snapshot.current_open_risk,
+            "reserved_open_risk": snapshot.reserved_open_risk,
+            "effective_open_risk": (
+                snapshot.current_open_risk + snapshot.reserved_open_risk
+            ),
             "data_age_seconds": snapshot.data_age_seconds,
             "data_uncertain": snapshot.data_uncertain,
             "day_locked": snapshot.day_locked,
@@ -730,9 +815,31 @@ def _process_alive(pid: int) -> bool:
 
 
 def _acquire_state_server_lock(state_path: str | Path) -> Path:
-    state = Path(state_path).expanduser().resolve()
+    if str(state_path) == ":memory:":
+        raise ValueError(
+            "risk API requires a persistent state_path; ':memory:' is "
+            "supported only for direct StateStore tests"
+        )
+    state = Path(os.path.abspath(os.path.expanduser(str(state_path))))
+    StateStore._assert_no_symlink_components(state, "state database")
     lock_path = state.with_name(state.name + ".server.lock")
+    StateStore._assert_no_symlink_components(
+        lock_path.parent,
+        "state database lock directory",
+    )
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    StateStore._assert_no_symlink_components(
+        lock_path,
+        "state database lock",
+    )
+    StateStore._assert_directory(
+        lock_path.parent,
+        "state database lock directory",
+    )
+    StateStore._assert_regular_or_missing(
+        lock_path,
+        "state database lock",
+    )
     for _ in range(2):
         try:
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -794,6 +901,8 @@ def account_sync_payload(
     payload: Mapping[str, Any],
     state_store: StateStore,
     config_source: ConfigSource,
+    *,
+    allow_phase_advance: bool = True,
 ) -> dict[str, Any]:
     account_id = _account_id(_required(payload, "account_id"))
     as_of = _timestamp(_required(payload, "as_of"), "as_of")
@@ -833,6 +942,19 @@ def account_sync_payload(
     )
     phase = _enum(AccountPhase, _required(payload, "phase"), "phase")
     style = _enum(AccountStyle, _required(payload, "style"), "style")
+    if not allow_phase_advance:
+        try:
+            existing_account = state_store.get_account(account_id)
+        except KeyError as exc:
+            raise ForbiddenError(
+                "account must be provisioned by an administrator before "
+                "platform synchronization"
+            ) from exc
+        if existing_account.phase != phase:
+            raise ForbiddenError(
+                "platform credentials cannot change the account phase; "
+                "an administrator must approve the transition"
+            )
     profile, _ = _profile(
         config_source,
         {
@@ -882,7 +1004,7 @@ def settlement_sync_payload(
     state_store: StateStore,
 ) -> dict[str, Any]:
     account_id = _account_id(_required(payload, "account_id"))
-    ftmo_day = str(_required(payload, "ftmo_day"))
+    ftmo_day = _bounded_string(_required(payload, "ftmo_day"), "ftmo_day", 10)
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", ftmo_day):
         raise RequestError("ftmo_day must use YYYY-MM-DD format")
     settled_balance = _decimal(
@@ -902,9 +1024,11 @@ def settlement_sync_payload(
             "settled_at must belong to the supplied ftmo_day in the configured "
             "day timezone"
         )
-    source = str(payload.get("source", "platform-settlement")).strip()
-    if len(source) > 128:
-        raise RequestError("source must contain at most 128 characters")
+    source = _bounded_string(
+        payload.get("source", "platform-settlement"),
+        "source",
+        128,
+    )
     account = state_store.confirm_settlement(
         account_id=account_id,
         ftmo_day=ftmo_day,
@@ -940,6 +1064,15 @@ def evaluate_stored_payload(
             "request": payload["request"],
         }
     )
+    reservation_risk = Decimal("0")
+    if request.is_risk_increasing:
+        if request.action == Action.OPEN and request.loss_per_volume_unit is not None:
+            reservation_risk = (
+                request.volume * request.loss_per_volume_unit
+                + request.estimated_costs
+            )
+        elif request.action == Action.MODIFY:
+            reservation_risk = request.additional_risk
 
     def evaluator(
         account: StoredAccount,
@@ -1000,6 +1133,7 @@ def evaluate_stored_payload(
         occurred_at=received_at,
         evaluator=evaluator,
         block_on_unknown_execution=request.is_risk_increasing,
+        reservation_risk=reservation_risk,
     )
 
 
@@ -1029,9 +1163,7 @@ def execution_result_payload(
             raise RequestError("success must be a JSON boolean")
         outcome = "success" if raw_success else "failure"
     action = _enum(Action, _required(payload, "action"), "action")
-    symbol = str(_required(payload, "symbol")).strip()
-    if not symbol:
-        raise RequestError("symbol must not be empty")
+    symbol = _bounded_string(_required(payload, "symbol"), "symbol", 64)
     occurred_at = _timestamp(
         _required(payload, "occurred_at"),
         "occurred_at",
@@ -1043,8 +1175,18 @@ def execution_result_payload(
         raise RequestError(
             "occurred_at is more than 30 seconds in the future"
         )
-    platform_status = str(payload.get("platform_status", ""))
-    platform_order_id = str(payload.get("platform_order_id", ""))
+    platform_status = _bounded_string(
+        payload.get("platform_status", ""),
+        "platform_status",
+        128,
+        required=False,
+    )
+    platform_order_id = _bounded_string(
+        payload.get("platform_order_id", ""),
+        "platform_order_id",
+        128,
+        required=False,
+    )
     detail = json.dumps(
         {
             "outcome": outcome,
@@ -1076,6 +1218,33 @@ def execution_result_payload(
     )
 
 
+def execution_status_payload(
+    payload: Mapping[str, Any],
+    state_store: StateStore,
+) -> dict[str, Any]:
+    account_id = _account_id(_required(payload, "account_id"))
+    state_store.get_account(account_id)
+    state_store.reconcile_expired_reservations(account_id)
+    reservation_metrics = state_store.risk_reservation_metrics(account_id)
+    unknown_executions = state_store.unknown_execution_count(account_id)
+    unresolved_reservations = reservation_metrics["unresolved"]
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "unknown_execution_records": unknown_executions,
+        "pending_execution_reservations": reservation_metrics["pending"],
+        "unknown_execution_reservations": reservation_metrics["unknown"],
+        "committed_execution_reservations": reservation_metrics["committed"],
+        "unresolved_execution_reservations": unresolved_reservations,
+        "reconciliation_complete": (
+            unknown_executions == 0 and unresolved_reservations == 0
+        ),
+        "risk_increase_blocked": (
+            unknown_executions > 0 or reservation_metrics["unknown"] > 0
+        ),
+    }
+
+
 def news_status_payload(
     payload: Mapping[str, Any],
     state_store: StateStore,
@@ -1084,7 +1253,7 @@ def news_status_payload(
     config_source: ConfigSource,
 ) -> dict[str, Any]:
     account_id = _account_id(_required(payload, "account_id"))
-    symbol = str(_required(payload, "symbol")).upper()
+    symbol = _bounded_string(_required(payload, "symbol"), "symbol", 64).upper()
     client_now = _timestamp(_required(payload, "now"), "now")
     _validate_clock_skew(client_now, "now")
     now = datetime.now(timezone.utc)
@@ -1185,7 +1354,7 @@ def market_status_payload(
     config_source: ConfigSource,
 ) -> dict[str, Any]:
     account_id = _account_id(_required(payload, "account_id"))
-    symbol = str(_required(payload, "symbol")).upper()
+    symbol = _bounded_string(_required(payload, "symbol"), "symbol", 64).upper()
     client_now = _timestamp(_required(payload, "now"), "now")
     _validate_clock_skew(client_now, "now")
     now = datetime.now(timezone.utc)
@@ -1250,6 +1419,8 @@ def market_status_payload(
             closure_active = True
             open_blocked = True
             cancel_pending = True
+            if is_restricted_account:
+                force_flat = True
             closure_ids.append(closure.closure_id)
         elif timedelta(0) <= until_start <= open_block_before:
             open_blocked = True
@@ -1303,7 +1474,9 @@ def _credential_scopes(raw: Any) -> tuple[str, ...]:
         return tuple(sorted(PLATFORM_CREDENTIAL_SCOPES))
     if not isinstance(raw, list) or not raw:
         raise RequestError("scopes must be a non-empty JSON list")
-    scopes = tuple(sorted({str(item).strip() for item in raw if str(item).strip()}))
+    if any(not isinstance(item, str) for item in raw):
+        raise RequestError("scopes must contain strings")
+    scopes = tuple(sorted({item.strip() for item in raw if item.strip()}))
     if not scopes or any(len(item) > 64 for item in scopes):
         raise RequestError("scopes must contain non-empty values of at most 64 characters")
     if any(item not in ACCOUNT_CREDENTIAL_SCOPES for item in scopes):
@@ -1378,12 +1551,16 @@ def rotate_credential_payload(
     now = datetime.now(timezone.utc)
     not_before, expires_at = _credential_expiry(payload, config_source, now)
     security = _load_config(config_source).get("security", {})
-    overlap_seconds = int(
-        payload.get(
-            "overlap_seconds",
-            security.get("credential_rotation_overlap_seconds", 300),
-        )
+    raw_overlap_seconds = payload.get(
+        "overlap_seconds",
+        security.get("credential_rotation_overlap_seconds", 300),
     )
+    if isinstance(raw_overlap_seconds, bool) or not isinstance(
+        raw_overlap_seconds,
+        int,
+    ):
+        raise RequestError("overlap_seconds must be an integer")
+    overlap_seconds = raw_overlap_seconds
     if overlap_seconds < 0 or overlap_seconds > 86400:
         raise RequestError("overlap_seconds must be between 0 and 86400")
     record, secret = state_store.rotate_account_credential(
@@ -1435,9 +1612,7 @@ def closed_trade_sync_payload(
     request_id: str,
 ) -> dict[str, Any]:
     account_id = _account_id(_required(payload, "account_id"))
-    trade_id = str(_required(payload, "trade_id")).strip()
-    if not 1 <= len(trade_id) <= 160:
-        raise RequestError("trade_id must contain 1 to 160 characters")
+    trade_id = _bounded_string(_required(payload, "trade_id"), "trade_id", 160)
     if not re.fullmatch(r"[A-Za-z0-9._:/-]+", trade_id):
         raise RequestError("trade_id contains unsupported characters")
     closed_at = _timestamp(_required(payload, "closed_at"), "closed_at")
@@ -1452,12 +1627,17 @@ def closed_trade_sync_payload(
         "phase",
     )
     cycle_id = _request_id(_required(payload, "cycle_id"))
-    symbol = str(payload.get("symbol", "")).strip().upper()
-    source = str(payload.get("source", "platform-history")).strip()
-    if len(symbol) > 64:
-        raise RequestError("symbol must contain at most 64 characters")
-    if not source or len(source) > 128:
-        raise RequestError("source must contain 1 to 128 characters")
+    symbol = _bounded_string(
+        payload.get("symbol", ""),
+        "symbol",
+        64,
+        required=False,
+    ).upper()
+    source = _bounded_string(
+        payload.get("source", "platform-history"),
+        "source",
+        128,
+    )
     result = state_store.record_closed_trade(
         account_id=account_id,
         trade_id=trade_id,
@@ -1468,7 +1648,7 @@ def closed_trade_sync_payload(
         net_profit=net_profit,
         symbol=symbol,
         source=source,
-        request_id=_request_id(str(payload.get("request_id", request_id))),
+        request_id=_request_id(payload.get("request_id", request_id)),
     )
     return result
 
@@ -1499,9 +1679,11 @@ def qualification_history_sync_payload(
         raise RequestError(
             "complete_through cannot be more than 30 seconds in the future"
         )
-    source = str(payload.get("source", "platform-history")).strip()
-    if not source or len(source) > 128:
-        raise RequestError("source must contain 1 to 128 characters")
+    source = _bounded_string(
+        payload.get("source", "platform-history"),
+        "source",
+        128,
+    )
     status = state_store.set_qualification_history_status(
         account_id=account_id,
         phase=phase,
@@ -1533,9 +1715,11 @@ def trading_day_sync_payload(
         raise RequestError(
             "opened_at cannot be more than 30 seconds in the future"
         )
-    source = str(payload.get("source", "platform-history")).strip()
-    if not source or len(source) > 128:
-        raise RequestError("source must contain 1 to 128 characters")
+    source = _bounded_string(
+        payload.get("source", "platform-history"),
+        "source",
+        128,
+    )
     trading_day = state_store.record_qualification_trading_day(
         account_id=account_id,
         phase=phase,
@@ -1543,7 +1727,7 @@ def trading_day_sync_payload(
         opened_at=opened_at,
         ftmo_day=ftmo_day_key(opened_at, state_store.day_timezone),
         source=source,
-        request_id=_request_id(str(payload.get("request_id", request_id))),
+        request_id=_request_id(payload.get("request_id", request_id)),
     )
     return {"ok": True, "trading_day": trading_day}
 
@@ -1692,6 +1876,11 @@ def evaluate_payload(
             },
             "account": {
                 "status": engine.status(snapshot),
+                "current_open_risk": snapshot.current_open_risk,
+                "reserved_open_risk": snapshot.reserved_open_risk,
+                "effective_open_risk": (
+                    snapshot.current_open_risk + snapshot.reserved_open_risk
+                ),
                 "daily_loss": engine.daily_loss(snapshot),
                 "daily_loss_limit": engine.daily_loss_limit(snapshot),
                 "max_loss_limit": engine.max_loss_limit(snapshot),
@@ -1790,6 +1979,8 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
             scheme, separator, value = authorization.partition(" ")
             if separator and scheme.lower() == "bearer":
                 supplied = value
+        if len(supplied) > MAX_AUTH_TOKEN_LENGTH:
+            return False
         return hmac.compare_digest(supplied, expected)
 
     def _authorize_account(
@@ -1848,7 +2039,10 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
         return self._authorize_account(
             account_id=account_id,
             scope=scope,
-            allow_admin=path == "/v1/account-sync",
+            allow_admin=path in {
+                "/v1/account-sync",
+                "/v1/execution-result",
+            },
         )
 
     def _send_json(self, status: HTTPStatus, body: Mapping[str, Any]) -> None:
@@ -1862,6 +2056,15 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; frame-ancestors 'none'",
+        )
+        self.send_header(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=()",
+        )
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(encoded)
@@ -1907,6 +2110,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
             body = json.loads(
                 self.rfile.read(length),
                 object_pairs_hook=_json_object_without_duplicate_keys,
+                parse_constant=_reject_json_constant,
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise RequestError("request body must be valid JSON") from exc
@@ -1934,7 +2138,17 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(encoded)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'unsafe-inline'; "
+                "style-src 'unsafe-inline'; connect-src 'self'; "
+                "frame-ancestors 'none'",
+            )
+            self.send_header(
+                "Permissions-Policy",
+                "camera=(), microphone=(), geolocation=()",
+            )
             self.end_headers()
             self.wfile.write(encoded)
             self.risk_server.observe_response(
@@ -1955,9 +2169,13 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
             readiness = self.risk_server.readiness()
             database_up = bool(readiness["database_up"])
             unknown_executions = None
+            reservation_metrics: dict[str, Any] = {}
             if database_up and self.risk_server.state_store is not None:
                 unknown_executions = (
                     self.risk_server.state_store.unknown_execution_count()
+                )
+                reservation_metrics = (
+                    self.risk_server.state_store.risk_reservation_metrics()
                 )
             body = {
                 "ok": readiness["ready"] if path == "/ready" else True,
@@ -1978,10 +2196,30 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                 "persistent_state": self.risk_server.state_store is not None,
                 "database_up": database_up,
                 "unknown_execution_records": unknown_executions,
+                "state_integrity_ok": readiness["state_integrity_ok"],
+                "state_integrity_issue_count": readiness[
+                    "state_integrity_issue_count"
+                ],
+                "pending_execution_reservations": (
+                    reservation_metrics.get("pending")
+                ),
+                "unknown_execution_reservations": (
+                    reservation_metrics.get("unknown")
+                ),
+                "committed_execution_reservations": (
+                    reservation_metrics.get("committed")
+                ),
+                "unresolved_execution_reservations": (
+                    reservation_metrics.get("unresolved")
+                ),
+                "reserved_open_risk": reservation_metrics.get("reserved_risk"),
                 "account_credentials_required": (
                     self.risk_server.account_credentials_required
                 ),
                 "mtls_enabled": self.risk_server.mtls_enabled,
+                "tls_enabled": self.risk_server.tls_enabled,
+                "remote_bind": self.risk_server.remote_bind,
+                "insecure_remote_bind": self.risk_server.insecure_remote_bind,
                 "mtls_client_certificate_required": (
                     self.risk_server.require_client_cert
                 ),
@@ -2012,6 +2250,11 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(encoded)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; frame-ancestors 'none'",
+            )
             self.end_headers()
             self.wfile.write(encoded)
             self.risk_server.observe_response(
@@ -2125,6 +2368,48 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     {"ok": False, "error": str(exc)},
                 )
             return
+        if path == "/v1/admin/execution-reservations":
+            if not self._global_authorized():
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"ok": False, "error": "invalid administrator token"},
+                )
+                return
+            self.auth_subject = "admin"
+            if self.risk_server.state_store is None:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": "persistent state is disabled"},
+                )
+                return
+            query = parse_qs(urlsplit(self.path).query)
+            values = query.get("account_id", [])
+            try:
+                if len(values) > 1:
+                    raise RequestError(
+                        "account_id query parameter must not be repeated"
+                    )
+                reservation_account_id: str | None = (
+                    _account_id(values[0]) if values else None
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "reservations": (
+                            self.risk_server.state_store.list_risk_reservations(
+                                reservation_account_id,
+                                unresolved_only=True,
+                            )
+                        ),
+                    },
+                )
+            except RequestError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": str(exc)},
+                )
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:
@@ -2132,9 +2417,10 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
         try:
             request_id = self._request_id_from_headers()
         except RequestError as exc:
+            request_id = str(uuid4())
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
-                {"ok": False, "error": str(exc)},
+                {"ok": False, "error": str(exc), "request_id": request_id},
             )
             return
         if not self.risk_server.allow_request(self.client_address[0]):
@@ -2233,6 +2519,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                     payload,
                     self.risk_server.state_store,
                     self.risk_server.config,
+                    allow_phase_advance=self.auth_subject == "admin",
                 )
             elif path == "/v1/settlement-sync":
                 if self.risk_server.state_store is None:
@@ -2249,6 +2536,15 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                         "persistent state is disabled on this server"
                     )
                 body = execution_result_payload(
+                    payload,
+                    self.risk_server.state_store,
+                )
+            elif path == "/v1/execution-status":
+                if self.risk_server.state_store is None:
+                    raise RequestError(
+                        "persistent state is disabled on this server"
+                    )
+                body = execution_status_payload(
                     payload,
                     self.risk_server.state_store,
                 )
@@ -2600,27 +2896,52 @@ class RiskHTTPServer(ThreadingHTTPServer):
         tls_ca_path: str | Path | None = None,
         require_client_cert: bool = False,
         require_account_credentials: bool | None = None,
+        allow_insecure_remote_bind: bool = False,
     ):
         self.config_path = str(config_path)
         self.auth_token = auth_token
         self.max_body_bytes = max_body_bytes
-        if max_body_bytes <= 0:
-            raise ValueError("max_body_bytes must be positive")
+        if (
+            isinstance(max_body_bytes, bool)
+            or not isinstance(max_body_bytes, int)
+            or not 0 < max_body_bytes <= MAX_SERVER_BODY_BYTES
+        ):
+            raise ValueError(
+                "max_body_bytes must be an integer between 1 and "
+                f"{MAX_SERVER_BODY_BYTES}"
+            )
         self.allow_stateless_evaluate = allow_stateless_evaluate
         self.allow_stateless_position_size = allow_stateless_position_size
+        if not isinstance(allow_remote_bind, bool):
+            raise ValueError("allow_remote_bind must be a boolean")
+        if not isinstance(allow_insecure_remote_bind, bool):
+            raise ValueError("allow_insecure_remote_bind must be a boolean")
         self.read_timeout_seconds = read_timeout_seconds
-        if read_timeout_seconds <= 0:
-            raise ValueError("read_timeout_seconds must be positive")
+        if (
+            isinstance(read_timeout_seconds, bool)
+            or not isinstance(read_timeout_seconds, (int, float))
+            or not math.isfinite(float(read_timeout_seconds))
+            or read_timeout_seconds <= 0
+        ):
+            raise ValueError("read_timeout_seconds must be a finite positive number")
         loopback_bind = _is_loopback_host(server_address[0])
+        self.remote_bind = not loopback_bind
+        self.allow_remote_bind = allow_remote_bind
+        self.allow_insecure_remote_bind = allow_insecure_remote_bind
         if not loopback_bind and not allow_remote_bind:
             raise ValueError(
                 "non-loopback bind requires explicit allow_remote_bind=True; "
                 "prefer a loopback listener behind an authenticated TLS proxy"
             )
-        self.require_auth = bool(auth_token) or not loopback_bind
-        if self.require_auth and not auth_token:
+        self.require_auth = True
+        if (
+            not isinstance(auth_token, str)
+            or not auth_token
+            or len(auth_token) > MAX_AUTH_TOKEN_LENGTH
+        ):
             raise ValueError(
-                "auth_token is required when the API is not bound to loopback"
+                "auth_token must be a non-empty string of at most "
+                f"{MAX_AUTH_TOKEN_LENGTH} characters"
             )
         self.news_lock = threading.RLock()
         self.market_lock = threading.RLock()
@@ -2676,11 +2997,25 @@ class RiskHTTPServer(ThreadingHTTPServer):
             raise ValueError(
                 "tls_cert_path and tls_key_path must be supplied together"
             )
+        if tls_ca_path is not None and tls_cert_path is None:
+            raise ValueError(
+                "tls_ca_path requires tls_cert_path and tls_key_path"
+            )
         if self.require_client_cert and tls_cert_path is None:
             raise ValueError(
                 "client certificate validation requires TLS certificate and key"
             )
-        self.mtls_enabled = tls_cert_path is not None
+        self.tls_enabled = tls_cert_path is not None
+        # TLS and mTLS are separate capabilities. mTLS is enabled only when
+        # the listener requires and validates a client certificate.
+        self.mtls_enabled = self.require_client_cert
+        self.insecure_remote_bind = self.remote_bind and not self.tls_enabled
+        if self.insecure_remote_bind and not allow_insecure_remote_bind:
+            raise ValueError(
+                "non-loopback bind requires TLS; set "
+                "allow_insecure_remote_bind=True only for an isolated private "
+                "network"
+            )
         self._state_server_lock_path: Path | None = None
         try:
             if state_path:
@@ -2693,10 +3028,13 @@ class RiskHTTPServer(ThreadingHTTPServer):
                     state_path,
                     day_timezone=self.day_timezone,
                 )
+                self.state_store.reconcile_expired_reservations()
             super().__init__(server_address, RiskRequestHandler)
-            if self.mtls_enabled:
+            if self.tls_enabled:
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 context.minimum_version = ssl.TLSVersion.TLSv1_2
+                if hasattr(ssl, "OP_NO_COMPRESSION"):
+                    context.options |= ssl.OP_NO_COMPRESSION
                 context.load_cert_chain(
                     certfile=str(tls_cert_path),
                     keyfile=str(tls_key_path),
@@ -2863,6 +3201,8 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 )
 
     def calendar_health(self, calendar_type: str) -> dict[str, Any]:
+        if calendar_type not in {"news", "market"}:
+            raise ValueError("calendar_type must be news or market")
         now = datetime.now(timezone.utc)
         if calendar_type == "news":
             with self.news_lock:
@@ -2870,7 +3210,19 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 coverage_start = self.news_coverage_start
                 coverage_end = self.news_coverage_end
                 rule_version = self.news_calendar_rule_version
-            age = self.news_age_seconds()
+            age = (
+                max(
+                    0,
+                    int(
+                        (
+                            now
+                            - fetched_at.astimezone(timezone.utc)
+                        ).total_seconds()
+                    ),
+                )
+                if fetched_at is not None
+                else None
+            )
             max_age_seconds = int(
                 self.config["news_controls"]["max_calendar_age_seconds"]
             )
@@ -2890,7 +3242,19 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 coverage_start = self.market_coverage_start
                 coverage_end = self.market_coverage_end
                 rule_version = self.market_calendar_rule_version
-            age = self.market_age_seconds()
+            age = (
+                max(
+                    0,
+                    int(
+                        (
+                            now
+                            - fetched_at.astimezone(timezone.utc)
+                        ).total_seconds()
+                    ),
+                )
+                if fetched_at is not None
+                else None
+            )
             max_age_seconds = int(
                 self.config["market_close_controls"][
                     "max_schedule_age_seconds"
@@ -2915,10 +3279,16 @@ class RiskHTTPServer(ThreadingHTTPServer):
             and coverage_start <= required_start
             and coverage_end >= required_end
         )
+        future = bool(
+            fetched_at is not None
+            and fetched_at.astimezone(timezone.utc)
+            > now + timedelta(seconds=30)
+        )
         stale = (
             fetched_at is None
             or age is None
             or age > max_age_seconds
+            or future
             or not rule_version_match
             or not coverage_sufficient
         )
@@ -2926,6 +3296,7 @@ class RiskHTTPServer(ThreadingHTTPServer):
             "present": fetched_at is not None,
             "fetched_at": fetched_at.isoformat() if fetched_at else None,
             "age_seconds": age,
+            "future": future,
             "max_age_seconds": max_age_seconds,
             "stale": stale,
             "persistent": self.state_store is not None,
@@ -2958,19 +3329,54 @@ class RiskHTTPServer(ThreadingHTTPServer):
         news = self.calendar_health("news")
         market = self.calendar_health("market")
         reasons: list[str] = []
+        reservation_metrics: dict[str, Any] = {}
+        unknown_executions = 0
+        integrity_issues: list[str] = []
+        integrity_audit_available = database_up
         if not database_up:
             reasons.append("persistent state database is unavailable")
+        elif self.state_store is not None:
+            try:
+                self.state_store.reconcile_expired_reservations()
+                reservation_metrics = self.state_store.risk_reservation_metrics()
+                unknown_executions = self.state_store.unknown_execution_count()
+                integrity_issues = self.state_store.risk_state_integrity_issues()
+                if integrity_issues:
+                    reasons.append("persistent risk state integrity check failed")
+            except Exception:
+                integrity_audit_available = False
+                # Do not report semantic integrity as healthy merely because
+                # the audit itself failed before it could return issue rows.
+                integrity_issues = [
+                    "persistent risk state integrity audit unavailable"
+                ]
+                reasons.append("risk reservation state is unavailable")
         if news["stale"]:
             reasons.append("news calendar is missing, stale, or under-covered")
         if market["stale"]:
             reasons.append(
                 "market closure calendar is missing, stale, or under-covered"
             )
+        if unknown_executions > 0:
+            reasons.append(
+                "one or more execution outcomes are unknown"
+            )
         return {
             "ready": not reasons,
             "database_up": database_up,
             "news_calendar_ready": not news["stale"],
             "market_calendar_ready": not market["stale"],
+            "unknown_execution_records": unknown_executions,
+            "state_integrity_ok": (
+                integrity_audit_available
+                and not integrity_issues
+                and database_up
+            ),
+            "state_integrity_issue_count": len(integrity_issues),
+            "unresolved_execution_reservations": reservation_metrics.get(
+                "unresolved",
+                None,
+            ),
             "reasons": reasons,
         }
 
@@ -3108,6 +3514,26 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 "# TYPE ftmo_risk_ready_for_risk_increase gauge",
                 "ftmo_risk_ready_for_risk_increase "
                 f"{1 if readiness['ready'] else 0}",
+                "# HELP ftmo_risk_tls_enabled Whether the API listener uses TLS.",
+                "# TYPE ftmo_risk_tls_enabled gauge",
+                f"ftmo_risk_tls_enabled {1 if self.tls_enabled else 0}",
+                "# HELP ftmo_risk_mtls_enabled Whether the API listener requires client certificates.",
+                "# TYPE ftmo_risk_mtls_enabled gauge",
+                f"ftmo_risk_mtls_enabled {1 if self.mtls_enabled else 0}",
+                "# HELP ftmo_risk_remote_bind Whether the API listener is non-loopback.",
+                "# TYPE ftmo_risk_remote_bind gauge",
+                f"ftmo_risk_remote_bind {1 if self.remote_bind else 0}",
+                "# HELP ftmo_risk_insecure_remote_bind Whether non-loopback plain HTTP was explicitly enabled.",
+                "# TYPE ftmo_risk_insecure_remote_bind gauge",
+                f"ftmo_risk_insecure_remote_bind {1 if self.insecure_remote_bind else 0}",
+                "# HELP ftmo_risk_state_integrity_ok Whether semantic risk state checks pass.",
+                "# TYPE ftmo_risk_state_integrity_ok gauge",
+                "ftmo_risk_state_integrity_ok "
+                f"{1 if readiness['state_integrity_ok'] else 0}",
+                "# HELP ftmo_risk_state_integrity_issues Number of semantic risk state issues found.",
+                "# TYPE ftmo_risk_state_integrity_issues gauge",
+                "ftmo_risk_state_integrity_issues "
+                f"{readiness['state_integrity_issue_count']}",
             ]
         )
 
@@ -3127,6 +3553,13 @@ class RiskHTTPServer(ThreadingHTTPServer):
         )
         accounts: list[StoredAccount] = []
         unknown = 0
+        reservations: dict[str, Any] = {
+            "pending": 0,
+            "unknown": 0,
+            "committed": 0,
+            "unresolved": 0,
+            "reserved_risk": Decimal("0"),
+        }
         backup: dict[str, Any] = {}
         credential_metrics = {
             "active": 0,
@@ -3138,6 +3571,7 @@ class RiskHTTPServer(ThreadingHTTPServer):
             try:
                 accounts = self.state_store.all_accounts()
                 unknown = self.state_store.unknown_execution_count()
+                reservations = self.state_store.risk_reservation_metrics()
                 backup = self.state_store.backup_metrics()
                 credential_metrics = self.state_store.credential_metrics()
             except Exception:
@@ -3199,6 +3633,28 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 "# HELP ftmo_risk_unknown_execution_records Unknown executions.",
                 "# TYPE ftmo_risk_unknown_execution_records gauge",
                 f"ftmo_risk_unknown_execution_records {unknown}",
+                "# HELP ftmo_risk_execution_reservations Execution risk reservations by state.",
+                "# TYPE ftmo_risk_execution_reservations gauge",
+                (
+                    "ftmo_risk_execution_reservations"
+                    f'{{status="pending"}} {reservations["pending"]}'
+                ),
+                (
+                    "ftmo_risk_execution_reservations"
+                    f'{{status="unknown"}} {reservations["unknown"]}'
+                ),
+                (
+                    "ftmo_risk_execution_reservations"
+                    f'{{status="committed"}} {reservations["committed"]}'
+                ),
+                "# HELP ftmo_risk_reserved_open_risk Risk reserved by evaluated but unreconciled executions.",
+                "# TYPE ftmo_risk_reserved_open_risk gauge",
+                "ftmo_risk_reserved_open_risk "
+                f"{_decimal_json(reservations['reserved_risk'])}",
+                "# HELP ftmo_risk_unresolved_execution_reservations Pending or unknown execution reservations.",
+                "# TYPE ftmo_risk_unresolved_execution_reservations gauge",
+                "ftmo_risk_unresolved_execution_reservations "
+                f"{reservations['unresolved']}",
             ]
         )
         lines.extend(
@@ -3257,24 +3713,48 @@ class RiskHTTPServer(ThreadingHTTPServer):
     def write_audit(self, record: Mapping[str, Any]) -> None:
         if not self.audit_path:
             return
-        path = Path(self.audit_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = Path(
+            os.path.abspath(os.path.expanduser(str(self.audit_path)))
+        )
         line = json.dumps(
             _jsonable(dict(record)),
             ensure_ascii=True,
             separators=(",", ":"),
         )
         with self.audit_lock:
+            StateStore._assert_no_symlink_components(path, "audit log")
+            StateStore._assert_no_symlink_components(
+                path.parent,
+                "audit log directory",
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            StateStore._assert_no_symlink_components(path, "audit log")
+            StateStore._assert_directory(path.parent, "audit log directory")
+            StateStore._assert_regular_or_missing(path, "audit log")
             flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
-            descriptor = os.open(path, flags, 0o600)
-            if hasattr(os, "fchmod"):
-                os.fchmod(descriptor, 0o600)
-            else:
-                os.chmod(path, 0o600)
-            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+            descriptor = -1
+            try:
+                descriptor = os.open(path, flags, 0o600)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(descriptor, 0o600)
+                else:
+                    os.chmod(path, 0o600)
+                handle = os.fdopen(
+                    descriptor,
+                    "a",
+                    encoding="utf-8",
+                )
+                descriptor = -1
+                with handle:
+                    handle.write(line + "\n")
+            finally:
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
 
     def allow_request(self, client: str) -> bool:
         now = time.monotonic()
@@ -3311,6 +3791,7 @@ def make_server(
     tls_ca_path: str | Path | None = None,
     require_client_cert: bool = False,
     require_account_credentials: bool | None = None,
+    allow_insecure_remote_bind: bool = False,
 ) -> RiskHTTPServer:
     return RiskHTTPServer(
         (host, port),
@@ -3320,6 +3801,7 @@ def make_server(
         allow_stateless_evaluate=allow_stateless_evaluate,
         allow_stateless_position_size=allow_stateless_position_size,
         allow_remote_bind=allow_remote_bind,
+        allow_insecure_remote_bind=allow_insecure_remote_bind,
         read_timeout_seconds=read_timeout_seconds,
         tls_cert_path=tls_cert_path,
         tls_key_path=tls_key_path,
@@ -3353,6 +3835,14 @@ def main() -> None:
         help=(
             "Allow a non-loopback listener. Use only behind an authenticated "
             "TLS proxy or equivalent private transport."
+        ),
+    )
+    parser.add_argument(
+        "--allow-insecure-remote-bind",
+        action="store_true",
+        help=(
+            "Allow remote plain HTTP only on an isolated private network; "
+            "TLS is required otherwise."
         ),
     )
     parser.add_argument(
@@ -3403,6 +3893,7 @@ def main() -> None:
         allow_stateless_evaluate=args.allow_stateless_evaluate,
         allow_stateless_position_size=args.allow_stateless_position_size,
         allow_remote_bind=args.allow_remote_bind,
+        allow_insecure_remote_bind=args.allow_insecure_remote_bind,
         tls_cert_path=args.tls_cert or None,
         tls_key_path=args.tls_key or None,
         tls_ca_path=args.tls_ca or None,
@@ -3410,7 +3901,7 @@ def main() -> None:
     )
     print(
         f"FTMO risk API listening on "
-        f"{'https' if server.mtls_enabled else 'http'}://"
+        f"{'https' if server.tls_enabled else 'http'}://"
         f"{args.host}:{args.port} "
         f"(rule {server.rule_version})"
     )

@@ -5,34 +5,138 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import secrets
+import stat
 import sqlite3
+import tempfile
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 
-from src.state_store import StateStore
+from src.state_store import REQUIRED_STATE_TABLES, StateStore
+
+
+# Keep restore validation aligned with the runtime readiness contract.
+REQUIRED_LEGACY_TABLES = REQUIRED_STATE_TABLES
+
+
+def _absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def _assert_regular_or_missing(path: Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ValueError(f"unable to inspect {label}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"{label} must not be a symbolic link")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"{label} must be a regular file")
+
+
+def _assert_directory(path: Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"unable to inspect {label}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"{label} must not be a symbolic link")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"{label} must be a directory")
+
+
+def _displace_destination_sidecars(
+    destination: Path,
+) -> list[tuple[Path, Path]]:
+    displaced: list[tuple[Path, Path]] = []
+    try:
+        for suffix in ("-wal", "-shm"):
+            sidecar = destination.with_name(destination.name + suffix)
+            _assert_regular_or_missing(sidecar, f"destination {suffix} sidecar")
+            if not sidecar.exists():
+                continue
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{destination.name}.",
+                suffix=f"{suffix}.old",
+                dir=str(destination.parent),
+            )
+            os.close(descriptor)
+            temporary = Path(temporary_name)
+            temporary.unlink()
+            os.replace(sidecar, temporary)
+            displaced.append((sidecar, temporary))
+    except Exception:
+        _restore_destination_sidecars(displaced)
+        raise
+    return displaced
+
+
+def _restore_destination_sidecars(
+    displaced: list[tuple[Path, Path]],
+) -> None:
+    for original, temporary in reversed(displaced):
+        if not temporary.exists() or original.exists():
+            continue
+        os.replace(temporary, original)
+
+
+def _discard_displaced_sidecars(
+    displaced: list[tuple[Path, Path]],
+) -> None:
+    for _, temporary in displaced:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            # The new database is already installed; a cleanup failure must
+            # not turn a successful restore into a false failure.
+            pass
 
 
 def _quick_check(path: Path) -> None:
+    _assert_regular_or_missing(path, "SQLite database")
+    for suffix in ("-wal", "-shm"):
+        _assert_regular_or_missing(
+            path.with_name(path.name + suffix),
+            f"SQLite database {suffix} sidecar",
+        )
     with closing(sqlite3.connect(str(path), timeout=1)) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
         result = connection.execute("PRAGMA quick_check").fetchone()
         if not result or result[0] != "ok":
             raise ValueError("source quick_check failed")
+        foreign_key_errors = connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+        if foreign_key_errors:
+            raise ValueError("source foreign key check failed")
         tables = {
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        if "accounts" not in tables or "calendar_snapshots" not in tables:
-            raise ValueError("source is not an FTMO risk state database")
+        missing = sorted(REQUIRED_LEGACY_TABLES - tables)
+        if missing:
+            raise ValueError(
+                "source is missing required risk state tables: "
+                + ", ".join(missing)
+            )
 
 
 def _assert_destination_available(path: Path) -> None:
+    _assert_regular_or_missing(path, "destination")
     server_lock = path.with_name(path.name + ".server.lock")
+    _assert_regular_or_missing(server_lock, "destination server lock")
     if server_lock.exists():
         raise RuntimeError(
             "destination has an active server lock; stop the risk service first"
+        )
+    for suffix in ("-wal", "-shm"):
+        _assert_regular_or_missing(
+            path.with_name(path.name + suffix),
+            f"destination {suffix} sidecar",
         )
     if not path.exists():
         return
@@ -46,20 +150,87 @@ def _assert_destination_available(path: Path) -> None:
         ) from exc
 
 
+def _record_restore_failure(path: Path, detail: str) -> None:
+    """Record a failure only in an existing, unlocked risk database."""
+    lock_path = path.with_name(path.name + ".server.lock")
+    if (
+        path.is_symlink()
+        or lock_path.is_symlink()
+        or lock_path.exists()
+        or not path.is_file()
+    ):
+        return
+    try:
+        with closing(
+            sqlite3.connect(str(path), timeout=0.2)
+        ) as connection:
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'backup_runs'
+                """
+            ).fetchone()
+            if table is None:
+                return
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO backup_runs (
+                    operation, success, created_at, detail
+                ) VALUES ('restore', 0, ?, ?)
+                """,
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    detail[:500],
+                ),
+            )
+            connection.commit()
+    except Exception:
+        # Failure reporting must never touch or block the destination state.
+        return
+
+
 def restore(source: Path, destination: Path) -> Path:
-    source = source.expanduser().resolve()
-    destination = destination.expanduser().resolve()
+    source = _absolute_path(source)
+    destination = _absolute_path(destination)
     if source == destination:
         raise ValueError("source and destination must be different")
+    StateStore._assert_no_symlink_components(source, "source")
+    StateStore._assert_no_symlink_components(destination, "destination")
+    StateStore._assert_no_symlink_components(
+        source.parent,
+        "source directory",
+    )
+    StateStore._assert_no_symlink_components(
+        destination.parent,
+        "destination directory",
+    )
+    _assert_directory(source.parent, "source directory")
+    _assert_regular_or_missing(source, "source")
     if not source.is_file():
         raise FileNotFoundError(source)
     _quick_check(source)
     _assert_destination_available(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(
-        f".{destination.name}.{secrets.token_hex(8)}.restore"
-    )
+    StateStore._assert_no_symlink_components(destination, "destination")
+    _assert_directory(destination.parent, "destination directory")
+    temporary: Path | None = None
+    displaced_sidecars: list[tuple[Path, Path]] = []
+    replaced = False
     try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".restore",
+            dir=str(destination.parent),
+        )
+        temporary = Path(temporary_name)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            else:
+                os.chmod(temporary, 0o600)
+        finally:
+            os.close(descriptor)
         with closing(
             sqlite3.connect(str(source), timeout=1)
         ) as source_connection:
@@ -71,31 +242,34 @@ def restore(source: Path, destination: Path) -> Path:
                 target_connection.close()
         os.chmod(temporary, 0o600)
         _quick_check(temporary)
-        os.replace(temporary, destination)
-        destination.with_name(destination.name + "-wal").unlink(
-            missing_ok=True
-        )
-        destination.with_name(destination.name + "-shm").unlink(
-            missing_ok=True
-        )
-        os.chmod(destination, 0o600)
-        StateStore(destination).record_backup_event(
-            operation="restore",
-            success=True,
-            detail=str(source),
-        )
-        return destination
-    except Exception as exc:
-        if temporary.exists():
-            temporary.unlink()
+        migrated_store = StateStore(temporary)
         try:
-            StateStore(destination).record_backup_event(
+            if not migrated_store.database_healthy():
+                raise ValueError("restored state database health check failed")
+            migrated_store.record_backup_event(
                 operation="restore",
-                success=False,
-                detail=str(exc),
+                success=True,
+                detail=str(source),
             )
-        except Exception:
-            pass
+        finally:
+            migrated_store.close()
+        StateStore._checkpoint_file(temporary)
+        _quick_check(temporary)
+        StateStore._fsync_file(temporary)
+        displaced_sidecars = _displace_destination_sidecars(destination)
+        os.replace(temporary, destination)
+        replaced = True
+        _discard_displaced_sidecars(displaced_sidecars)
+        StateStore._fsync_directory(destination.parent)
+        return destination.resolve()
+    except Exception as exc:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        if not replaced:
+            _restore_destination_sidecars(displaced_sidecars)
+        else:
+            _discard_displaced_sidecars(displaced_sidecars)
+        _record_restore_failure(destination, str(exc))
         raise
 
 

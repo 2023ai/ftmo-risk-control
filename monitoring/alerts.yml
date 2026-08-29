@@ -10,6 +10,15 @@ groups:
           summary: FTMO risk SQLite state is unavailable
           description: Stop all risk-increasing trading until state is healthy.
 
+      - alert: FtmoRiskStateIntegrityFailed
+        expr: ftmo_risk_database_up == 1 and ftmo_risk_state_integrity_ok == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: FTMO risk state has semantic integrity errors
+          description: Stop new risk and inspect the decision, execution, reservation, and credential relationships before recovery.
+
       - alert: FtmoRiskNotReady
         expr: ftmo_risk_ready_for_risk_increase == 0
         for: 1m
@@ -18,6 +27,15 @@ groups:
         annotations:
           summary: FTMO risk service is not ready for new risk
           description: Persistent state or a required calendar is unavailable, stale, or under-covered.
+
+      - alert: FtmoRiskInsecureRemoteBind
+        expr: ftmo_risk_remote_bind == 1 and ftmo_risk_insecure_remote_bind == 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: FTMO risk API is using remote plain HTTP
+          description: Restrict the listener to an isolated private network or enable TLS before allowing production traffic.
 
       - alert: FtmoRiskNewsCalendarMissing
         expr: ftmo_risk_calendar_present{calendar="news"} == 0
@@ -38,13 +56,13 @@ groups:
           description: News data is stale or tied to an inactive rule version.
 
       - alert: FtmoRiskCalendarRuleVersionMismatch
-        expr: ftmo_risk_calendar_restore_total{result="rule_mismatch"} > 0
+        expr: increase(ftmo_risk_calendar_restore_total{result="rule_mismatch"}[5m]) > 0 or (ftmo_risk_calendar_present == 1 and ftmo_risk_calendar_rule_version_match == 0)
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: Persisted calendar uses an inactive rule version
-          description: The service refused to use a calendar snapshot until it is resynchronized.
+          summary: Calendar uses or attempted to restore an inactive rule version
+          description: Resynchronize the calendar with the rule version currently pinned by the service; a rejected restore may leave the calendar absent and is covered by the restore counter.
 
       - alert: FtmoRiskCalendarCoverageInsufficient
         expr: ftmo_risk_calendar_present == 1 and ftmo_risk_calendar_coverage_sufficient == 0
@@ -81,6 +99,15 @@ groups:
         annotations:
           summary: One or more execution outcomes are unknown
           description: Reconcile platform orders before releasing reservations.
+
+      - alert: FtmoRiskExecutionReservationStuck
+        expr: ftmo_risk_unresolved_execution_reservations > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Execution risk reservations remain unresolved
+          description: Check pending and unknown platform orders; unresolved reservations continue to consume risk budget.
 
       - alert: FtmoRiskCredentialExpiring
         expr: ftmo_risk_credentials_expiring_soon > 0

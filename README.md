@@ -74,7 +74,7 @@ export RISK_AUDIT_PATH='/var/log/ftmo-risk/audit.jsonl'
 python3 -m src.risk_api --config config/ftmo-v2.json
 ```
 
-`RISK_API_TOKEN` 是管理员令牌，只用于日历、监控、账户首次登记、资格汇总和凭证管理。生产平台不保存管理员令牌。管理员必须先用带已核对余额的 `/v1/account-sync` 登记账户基线，之后才能签发独立平台凭证；请求字段见 [API 契约](docs/api-contract.md#post-v1account-sync)：
+`RISK_API_TOKEN` 是管理员令牌，只用于日历、监控、账户首次登记、资格汇总和凭证管理。生产平台不保存管理员令牌。生产 API 必须使用持久化 SQLite `--state` 路径；`:memory:` 仅供直接 `StateStore` 单元测试使用。管理员必须先用带已核对余额的 `/v1/account-sync` 登记账户基线，之后才能签发独立平台凭证；请求字段见 [API 契约](docs/api-contract.md#post-v1account-sync)：
 
 ```bash
 curl -sS \

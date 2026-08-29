@@ -40,6 +40,9 @@ namespace FtmoRiskControl
         [Parameter("Estimated Costs", DefaultValue = 0)]
         public double EstimatedCostsPerTrade { get; set; }
 
+        [Parameter("Risk API Timeout (ms)", DefaultValue = 3000, MinValue = 250)]
+        public int RiskApiTimeoutMilliseconds { get; set; }
+
         [Parameter("News Guard Seconds", DefaultValue = 5, MinValue = 1)]
         public int NewsGuardIntervalSeconds { get; set; }
 
@@ -68,6 +71,26 @@ namespace FtmoRiskControl
                 Stop();
                 return;
             }
+            if (RiskApiTimeoutMilliseconds <= 0)
+            {
+                Print("RiskGuard: Risk API timeout must be positive");
+                Stop();
+                return;
+            }
+            if (!IsFinite(InitialCapital)
+                || !IsFinite(BootstrapDayStartBalance)
+                || !IsFinite(BootstrapHighestSettledBalance)
+                || !IsFinite(EstimatedCostsPerTrade)
+                || InitialCapital <= 0
+                || BootstrapDayStartBalance <= 0
+                || BootstrapHighestSettledBalance < InitialCapital
+                || EstimatedCostsPerTrade < 0
+                || NewsGuardIntervalSeconds <= 0)
+            {
+                Print("RiskGuard: numeric parameters are invalid");
+                Stop();
+                return;
+            }
             LoadUnknownExecutionLock();
 
             Timer.Start(NewsGuardIntervalSeconds);
@@ -86,6 +109,73 @@ namespace FtmoRiskControl
         private static string DecimalText(double value)
         {
             return value.ToString("0.########", CultureInfo.InvariantCulture);
+        }
+
+        private static bool IsFinite(double value)
+        {
+            return !double.IsNaN(value) && !double.IsInfinity(value);
+        }
+
+        private static bool IsBoolean(JsonElement root, string propertyName)
+        {
+            return root.TryGetProperty(propertyName, out var value)
+                && (value.ValueKind == JsonValueKind.True
+                    || value.ValueKind == JsonValueKind.False);
+        }
+
+        private static bool HasString(
+            JsonElement root,
+            string propertyName,
+            string expected)
+        {
+            return root.TryGetProperty(propertyName, out var value)
+                && value.ValueKind == JsonValueKind.String
+                && value.GetString() == expected;
+        }
+
+        private static bool IsTrue(JsonElement root, string propertyName)
+        {
+            return root.TryGetProperty(propertyName, out var value)
+                && value.ValueKind == JsonValueKind.True;
+        }
+
+        private static bool AccountSyncAccepted(
+            string response,
+            string accountId,
+            string requestId)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(response);
+                var root = document.RootElement;
+                return IsTrue(root, "ok")
+                    && HasString(root, "account_id", accountId)
+                    && HasString(root, "request_id", requestId);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool ExecutionReportAccepted(
+            string response,
+            string accountId,
+            string requestId)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(response);
+                var root = document.RootElement;
+                return IsTrue(root, "ok")
+                    && IsTrue(root, "execution_recorded")
+                    && HasString(root, "account_id", accountId)
+                    && HasString(root, "request_id", requestId);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private string Iso(DateTime value)
@@ -126,6 +216,16 @@ namespace FtmoRiskControl
             LocalStorage.Flush(LocalStorageScope.Type);
         }
 
+        private void ClearUnknownExecutionLock()
+        {
+            _unknownExecutionLock = false;
+            LocalStorage.SetString(
+                UnknownExecutionLockKey,
+                "0",
+                LocalStorageScope.Type);
+            LocalStorage.Flush(LocalStorageScope.Type);
+        }
+
         private string NextRequestId(string action)
         {
             return action + "-" + Guid.NewGuid().ToString("N");
@@ -142,7 +242,9 @@ namespace FtmoRiskControl
                     new Uri(RiskApiBaseUrl.TrimEnd('/') + path))
                 {
                     Method = HttpMethod.Post,
-                    Body = body
+                    Body = body,
+                    Timeout = TimeSpan.FromMilliseconds(
+                        RiskApiTimeoutMilliseconds)
                 };
                 request.Headers.Add("Content-Type", "application/json");
                 request.Headers.Add(
@@ -186,16 +288,27 @@ namespace FtmoRiskControl
                 var currentPrice = position.TradeType == TradeType.Buy
                     ? symbol.Bid
                     : symbol.Ask;
-                if (currentPrice <= 0 || symbol.PipSize <= 0)
+                if (!IsFinite(currentPrice)
+                    || !IsFinite(position.StopLoss.Value)
+                    || currentPrice <= 0
+                    || symbol.PipSize <= 0)
+                    return InitialCapital;
+                if ((position.TradeType == TradeType.Buy
+                        && position.StopLoss.Value >= currentPrice)
+                    || (position.TradeType == TradeType.Sell
+                        && position.StopLoss.Value <= currentPrice))
                     return InitialCapital;
                 var stopPips = Math.Abs(
                     currentPrice - position.StopLoss.Value)
                     / symbol.PipSize;
-                total += Math.Max(
-                    0,
-                    symbol.AmountRisked(
-                        position.VolumeInUnits,
-                        stopPips));
+                var positionRisk = symbol.AmountRisked(
+                    position.VolumeInUnits,
+                    stopPips);
+                if (!IsFinite(positionRisk) || positionRisk < 0)
+                    return InitialCapital;
+                total += positionRisk;
+                if (!IsFinite(total) || total < 0)
+                    return InitialCapital;
             }
             foreach (var order in PendingOrders)
             {
@@ -205,17 +318,27 @@ namespace FtmoRiskControl
                 var symbol = Symbols.GetSymbol(order.SymbolName);
                 if (symbol == null)
                     return InitialCapital;
-                if (symbol.PipSize <= 0)
+                if (!IsFinite(order.TargetPrice)
+                    || !IsFinite(order.StopLoss.Value)
+                    || symbol.PipSize <= 0)
+                    return InitialCapital;
+                if ((order.TradeType == TradeType.Buy
+                        && order.StopLoss.Value >= order.TargetPrice)
+                    || (order.TradeType == TradeType.Sell
+                        && order.StopLoss.Value <= order.TargetPrice))
                     return InitialCapital;
 
                 var stopPips = Math.Abs(
                     order.TargetPrice - order.StopLoss.Value)
                     / symbol.PipSize;
-                total += Math.Max(
-                    0,
-                    symbol.AmountRisked(
-                        order.VolumeInUnits,
-                        stopPips));
+                var orderRisk = symbol.AmountRisked(
+                    order.VolumeInUnits,
+                    stopPips);
+                if (!IsFinite(orderRisk) || orderRisk < 0)
+                    return InitialCapital;
+                total += orderRisk;
+                if (!IsFinite(total) || total < 0)
+                    return InitialCapital;
             }
             return total;
         }
@@ -240,10 +363,13 @@ namespace FtmoRiskControl
                 ["pending_orders_count"] = PendingOrders.Count,
                 ["as_of"] = Iso(Server.TimeInUtc)
             };
-            return SendRiskRequest(
+            var requestId = NextRequestId("sync");
+            var response = SendRiskRequest(
                 "/v1/account-sync",
                 JsonSerializer.Serialize(payload),
-                NextRequestId("sync")) != null;
+                requestId);
+            return response != null
+                && AccountSyncAccepted(response, AccountId, requestId);
         }
 
         private bool Evaluate(
@@ -272,10 +398,21 @@ namespace FtmoRiskControl
             try
             {
                 using var document = JsonDocument.Parse(response);
-                return document.RootElement
-                    .GetProperty("decision")
-                    .GetProperty("allowed")
-                    .GetBoolean();
+                var root = document.RootElement;
+                if (!IsTrue(root, "ok")
+                    || !HasString(root, "account_id", AccountId)
+                    || !HasString(root, "request_id", requestId)
+                    || !root.TryGetProperty("decision", out var decision)
+                    || decision.ValueKind != JsonValueKind.Object
+                    || !IsBoolean(decision, "allowed"))
+                    return false;
+                if (decision.TryGetProperty("code", out var code)
+                    && code.ValueKind == JsonValueKind.String
+                    && code.GetString() == "REJECT_UNKNOWN_EXECUTION")
+                {
+                    LockUnknownExecution();
+                }
+                return decision.GetProperty("allowed").GetBoolean();
             }
             catch (Exception exception)
             {
@@ -305,11 +442,22 @@ namespace FtmoRiskControl
                 ["platform_status"] = platformStatus ?? string.Empty,
                 ["platform_order_id"] = platformOrderId ?? string.Empty
             };
+            var body = JsonSerializer.Serialize(payload);
+            var reportRequestId = NextRequestId("execution");
             var response = SendRiskRequest(
                 "/v1/execution-result",
-                JsonSerializer.Serialize(payload),
-                NextRequestId("execution"));
-            if (response == null)
+                body,
+                reportRequestId);
+            if (!ExecutionReportAccepted(response, AccountId, requestId))
+            {
+                // The body keeps the original request_id, so this retry
+                // remains idempotent if the first response was lost.
+                response = SendRiskRequest(
+                    "/v1/execution-result",
+                    body,
+                    NextRequestId("execution-retry"));
+            }
+            if (!ExecutionReportAccepted(response, AccountId, requestId))
             {
                 LockUnknownExecution();
                 Print(
@@ -318,20 +466,77 @@ namespace FtmoRiskControl
             }
         }
 
+        private bool RefreshUnknownExecutionLock()
+        {
+            var payload = new Dictionary<string, object>
+            {
+                ["account_id"] = AccountId
+            };
+            var requestId = NextRequestId("execution-status");
+            var response = SendRiskRequest(
+                "/v1/execution-status",
+                JsonSerializer.Serialize(payload),
+                requestId);
+            if (string.IsNullOrWhiteSpace(response))
+                return false;
+
+            try
+            {
+                using var document = JsonDocument.Parse(response);
+                var root = document.RootElement;
+                if (!IsTrue(root, "ok")
+                    || !HasString(root, "account_id", AccountId)
+                    || !HasString(root, "request_id", requestId)
+                    || !IsBoolean(root, "risk_increase_blocked")
+                    || !IsBoolean(root, "reconciliation_complete"))
+                    return false;
+                var blocked = root.GetProperty("risk_increase_blocked").GetBoolean();
+                var reconciliationComplete = root
+                    .GetProperty("reconciliation_complete")
+                    .GetBoolean();
+                if (blocked || !reconciliationComplete)
+                {
+                    LockUnknownExecution();
+                    return true;
+                }
+                ClearUnknownExecutionLock();
+                return true;
+            }
+            catch (Exception exception)
+            {
+                Print(
+                    "RiskGuard: invalid execution status response: {0}",
+                    exception.Message);
+            }
+            return false;
+        }
+
         private static string TradeOutcome(TradeResult result)
         {
             if (result == null)
                 return "unknown";
             if (result.IsSuccessful)
                 return "success";
-            if (!result.Error.HasValue
-                || result.Error.Value == ErrorCode.Timeout
-                || result.Error.Value == ErrorCode.Disconnected
-                || result.Error.Value == ErrorCode.TechnicalError)
+            if (!result.Error.HasValue)
             {
                 return "unknown";
             }
-            return "failure";
+            switch (result.Error.Value)
+            {
+                case ErrorCode.BadVolume:
+                case ErrorCode.NoMoney:
+                case ErrorCode.MarketClosed:
+                case ErrorCode.EntityNotFound:
+                case ErrorCode.UnknownSymbol:
+                case ErrorCode.InvalidStopLossTakeProfit:
+                case ErrorCode.InvalidRequest:
+                case ErrorCode.NoTradingPermission:
+                    return "failure";
+                default:
+                    // Unknown and transport-like errors must retain the
+                    // reservation until the platform order is reconciled.
+                    return "unknown";
+            }
         }
 
         public TradeResult TryExecuteMarket(
@@ -343,17 +548,27 @@ namespace FtmoRiskControl
         {
             if (_unknownExecutionLock)
             {
-                Print(
-                    "RiskGuard: new risk blocked by unknown execution lock");
-                return null;
+                RefreshUnknownExecutionLock();
+                if (_unknownExecutionLock)
+                {
+                    Print(
+                        "RiskGuard: new risk blocked by unknown execution lock");
+                    return null;
+                }
             }
-            if (volumeInUnits <= 0 || stopLossPips <= 0)
+            if (!IsFinite(volumeInUnits)
+                || !IsFinite(stopLossPips)
+                || !IsFinite(takeProfitPips)
+                || volumeInUnits <= 0
+                || stopLossPips <= 0
+                || takeProfitPips < 0)
                 return null;
 
             var normalizedVolume = Symbol.NormalizeVolumeInUnits(
                 volumeInUnits,
                 RoundingMode.Down);
-            if (normalizedVolume < Symbol.VolumeInUnitsMin
+            if (!IsFinite(normalizedVolume)
+                || normalizedVolume < Symbol.VolumeInUnitsMin
                 || normalizedVolume > Symbol.VolumeInUnitsMax)
                 return null;
 
@@ -363,8 +578,14 @@ namespace FtmoRiskControl
             var stopPrice = tradeType == TradeType.Buy
                 ? entry - stopLossPips * Symbol.PipSize
                 : entry + stopLossPips * Symbol.PipSize;
+            if (!IsFinite(entry)
+                || !IsFinite(stopPrice)
+                || entry <= 0
+                || stopPrice <= 0
+                || Symbol.PipSize <= 0)
+                return null;
             var lossPerUnit = Symbol.AmountRisked(1, stopLossPips);
-            if (lossPerUnit <= 0)
+            if (!IsFinite(lossPerUnit) || lossPerUnit <= 0)
                 return null;
 
             var requestId = NextRequestId("open");
@@ -372,6 +593,7 @@ namespace FtmoRiskControl
             {
                 ["symbol"] = SymbolName,
                 ["action"] = "open",
+                ["side"] = tradeType == TradeType.Buy ? "buy" : "sell",
                 ["requested_at"] = Iso(Server.TimeInUtc),
                 ["volume"] = DecimalText(normalizedVolume),
                 ["entry_price"] = DecimalText(entry),
@@ -496,7 +718,9 @@ namespace FtmoRiskControl
             Position position,
             double volumeInUnits)
         {
-            if (position == null || volumeInUnits <= 0)
+            if (position == null
+                || !IsFinite(volumeInUnits)
+                || volumeInUnits <= 0)
                 return null;
 
             var positionSymbol = Symbols.GetSymbol(position.SymbolName);
@@ -557,6 +781,10 @@ namespace FtmoRiskControl
         {
             if (position == null)
                 return null;
+            if ((stopLossPrice.HasValue && !IsFinite(stopLossPrice.Value))
+                || (takeProfitPrice.HasValue
+                    && !IsFinite(takeProfitPrice.Value)))
+                return null;
             if (isRiskIncreasing && !stopLossPrice.HasValue)
                 return null;
 
@@ -573,7 +801,15 @@ namespace FtmoRiskControl
             var currentPrice = position.TradeType == TradeType.Buy
                 ? positionSymbol.Bid
                 : positionSymbol.Ask;
-            if (currentPrice <= 0)
+            if (!IsFinite(currentPrice)
+                || currentPrice <= 0
+                || positionSymbol.PipSize <= 0)
+                return null;
+            if (position.StopLoss.HasValue
+                && ((position.TradeType == TradeType.Buy
+                        && position.StopLoss.Value >= currentPrice)
+                    || (position.TradeType == TradeType.Sell
+                        && position.StopLoss.Value <= currentPrice)))
                 return null;
             if ((position.TradeType == TradeType.Buy
                     && stopLossPrice.Value >= currentPrice)
@@ -592,8 +828,17 @@ namespace FtmoRiskControl
                 position.VolumeInUnits,
                 Math.Abs(currentPrice - stopLossPrice.Value)
                     / positionSymbol.PipSize);
+            if (!IsFinite(currentRisk)
+                || !IsFinite(newRisk)
+                || currentRisk < 0
+                || newRisk < 0)
+                return null;
             var additionalRisk = Math.Max(0, newRisk - currentRisk);
-            var effectiveRiskIncreasing = additionalRisk > 0.01;
+            var effectiveRiskIncreasing = additionalRisk > 0.00000001;
+            if (effectiveRiskIncreasing && _unknownExecutionLock)
+            {
+                RefreshUnknownExecutionLock();
+            }
             if (effectiveRiskIncreasing && _unknownExecutionLock)
             {
                 Print(
@@ -607,6 +852,7 @@ namespace FtmoRiskControl
             {
                 ["symbol"] = position.SymbolName,
                 ["action"] = "modify",
+                ["side"] = position.TradeType == TradeType.Buy ? "buy" : "sell",
                 ["requested_at"] = Iso(Server.TimeInUtc),
                 ["stop_loss"] = DecimalText(stopLossPrice.Value),
                 ["additional_risk"] = DecimalText(additionalRisk),
@@ -689,8 +935,11 @@ namespace FtmoRiskControl
             return result;
         }
 
-        private JsonElement? GuardStatus(string path, string symbolName)
+        private JsonElement? GuardStatus(
+            string path,
+            string symbolName)
         {
+            var requestId = NextRequestId("status");
             var payload = new Dictionary<string, object>
             {
                 ["account_id"] = AccountId,
@@ -700,14 +949,38 @@ namespace FtmoRiskControl
             var response = SendRiskRequest(
                 path,
                 JsonSerializer.Serialize(payload),
-                NextRequestId("news"));
+                requestId);
             if (string.IsNullOrWhiteSpace(response))
                 return null;
 
             try
             {
                 using var document = JsonDocument.Parse(response);
-                return document.RootElement.Clone();
+                var root = document.RootElement;
+                if (!IsTrue(root, "ok")
+                    || !HasString(root, "account_id", AccountId)
+                    || !HasString(root, "request_id", requestId)
+                    || !HasString(root, "symbol", symbolName.ToUpperInvariant())
+                    || !root.TryGetProperty("open_blocked", out var openBlocked)
+                    || (openBlocked.ValueKind != JsonValueKind.True
+                        && openBlocked.ValueKind != JsonValueKind.False)
+                    || !root.TryGetProperty("force_flat", out var forceFlat)
+                    || (forceFlat.ValueKind != JsonValueKind.True
+                        && forceFlat.ValueKind != JsonValueKind.False)
+                    || !root.TryGetProperty(
+                        "cancel_pending",
+                        out var cancelPending)
+                    || (cancelPending.ValueKind != JsonValueKind.True
+                        && cancelPending.ValueKind != JsonValueKind.False)
+                    || !root.TryGetProperty(
+                        "emergency_alert",
+                        out var emergencyAlert)
+                    || (emergencyAlert.ValueKind != JsonValueKind.True
+                        && emergencyAlert.ValueKind != JsonValueKind.False))
+                {
+                    return null;
+                }
+                return root.Clone();
             }
             catch (Exception exception)
             {
@@ -725,20 +998,39 @@ namespace FtmoRiskControl
         private void RunNewsGuard()
         {
             if (!SyncAccount())
-                return;
+            {
+                Print(
+                    "RiskGuard: account sync failed; continuing defensive guard");
+            }
+            RefreshUnknownExecutionLock();
 
             var positions = new List<Position>();
             foreach (var position in Positions)
                 positions.Add(position);
+            var pendingOrders = new List<PendingOrder>();
+            foreach (var order in PendingOrders)
+                pendingOrders.Add(order);
+
+            var statusBySymbol =
+                new Dictionary<string, (JsonElement? News, JsonElement? Market)>(
+                    StringComparer.OrdinalIgnoreCase);
+            var symbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var position in positions)
+                symbols.Add(position.SymbolName);
+            foreach (var order in pendingOrders)
+                symbols.Add(order.SymbolName);
+            foreach (var symbol in symbols)
+            {
+                statusBySymbol[symbol] = (
+                    GuardStatus("/v1/news-status", symbol),
+                    GuardStatus("/v1/market-status", symbol));
+            }
 
             foreach (var position in positions)
             {
-                var newsStatus = GuardStatus(
-                    "/v1/news-status",
-                    position.SymbolName);
-                var marketStatus = GuardStatus(
-                    "/v1/market-status",
-                    position.SymbolName);
+                var status = statusBySymbol[position.SymbolName];
+                var newsStatus = status.News;
+                var marketStatus = status.Market;
                 var forceFlat =
                     (newsStatus.HasValue
                         && Flag(newsStatus.Value, "force_flat"))
@@ -761,18 +1053,11 @@ namespace FtmoRiskControl
                 }
             }
 
-            var pendingOrders = new List<PendingOrder>();
-            foreach (var order in PendingOrders)
-                pendingOrders.Add(order);
-
             foreach (var order in pendingOrders)
             {
-                var newsStatus = GuardStatus(
-                    "/v1/news-status",
-                    order.SymbolName);
-                var marketStatus = GuardStatus(
-                    "/v1/market-status",
-                    order.SymbolName);
+                var status = statusBySymbol[order.SymbolName];
+                var newsStatus = status.News;
+                var marketStatus = status.Market;
                 var cancelPending =
                     (newsStatus.HasValue
                         && Flag(newsStatus.Value, "cancel_pending"))

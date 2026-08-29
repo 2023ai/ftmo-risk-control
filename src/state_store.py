@@ -7,6 +7,8 @@ import hashlib
 import os
 import secrets
 import sqlite3
+import stat
+import tempfile
 import threading
 import time
 from contextlib import closing, contextmanager
@@ -26,6 +28,7 @@ from .risk_engine import (
     FrequencyState,
     RiskEngine,
     RuleProfile,
+    ZERO,
     ftmo_day_key,
 )
 
@@ -56,6 +59,218 @@ PLATFORM_CREDENTIAL_SCOPES = frozenset(
 CREDENTIAL_LAST_USED_WRITE_INTERVAL = timedelta(seconds=60)
 CALENDAR_HASH_VERSION = 2
 DATABASE_INTEGRITY_CHECK_INTERVAL_SECONDS = 60.0
+CURRENT_SCHEMA_VERSION = 1
+ACTIVE_RESERVATION_STATUSES = ("pending", "unknown", "committed")
+UNRESOLVED_RESERVATION_STATUSES = ("pending", "unknown")
+# A restore must contain every table that carries state which can affect a
+# future risk decision.  In particular, reservations cannot be recreated as
+# an empty table during startup migration without losing in-flight risk.
+REQUIRED_STATE_TABLES = frozenset(
+    {
+        "accounts",
+        "activity",
+        "daily_settlements",
+        "decisions",
+        "executions",
+        "risk_reservations",
+        "calendar_snapshots",
+        "account_credentials",
+        "closed_trades",
+        "qualification_history_status",
+        "qualification_trading_days",
+        "backup_runs",
+    }
+)
+REQUIRED_STATE_COLUMNS = {
+    "accounts": frozenset(
+        {
+            "account_id",
+            "account_type",
+            "phase",
+            "style",
+            "initial_capital",
+            "ftmo_day",
+            "day_start_balance",
+            "highest_settled_balance",
+            "balance",
+            "equity",
+            "current_open_risk",
+            "reserved_open_risk",
+            "open_positions_count",
+            "pending_orders_count",
+            "as_of",
+            "updated_at",
+            "data_uncertain",
+            "day_locked",
+            "breach_latched",
+        }
+    ),
+    "activity": frozenset(
+        {
+            "id",
+            "account_id",
+            "kind",
+            "symbol",
+            "occurred_at",
+            "request_id",
+            "detail",
+        }
+    ),
+    "daily_settlements": frozenset(
+        {
+            "account_id",
+            "ftmo_day",
+            "settled_balance",
+            "settled_at",
+            "source",
+            "confirmed",
+        }
+    ),
+    "decisions": frozenset(
+        {
+            "account_id",
+            "request_id",
+            "request_hash",
+            "action",
+            "symbol",
+            "allowed",
+            "reservation_risk",
+            "response_json",
+            "created_at",
+        }
+    ),
+    "executions": frozenset(
+        {
+            "account_id",
+            "request_id",
+            "request_hash",
+            "action",
+            "symbol",
+            "outcome",
+            "response_json",
+            "created_at",
+        }
+    ),
+    "risk_reservations": frozenset(
+        {
+            "account_id",
+            "request_id",
+            "request_hash",
+            "action",
+            "symbol",
+            "reserved_risk",
+            "status",
+            "created_at",
+            "updated_at",
+            "execution_at",
+        }
+    ),
+    "calendar_snapshots": frozenset(
+        {
+            "calendar_type",
+            "fetched_at",
+            "coverage_start",
+            "coverage_end",
+            "hash_version",
+            "content_hash",
+            "payload_json",
+            "rule_version",
+            "created_at",
+        }
+    ),
+    "account_credentials": frozenset(
+        {
+            "credential_id",
+            "account_id",
+            "secret_salt",
+            "secret_hash",
+            "not_before",
+            "expires_at",
+            "revoked_at",
+            "last_used_at",
+            "scopes_json",
+            "created_at",
+        }
+    ),
+    "closed_trades": frozenset(
+        {
+            "account_id",
+            "trade_id",
+            "phase",
+            "cycle_id",
+            "closed_at",
+            "ftmo_day",
+            "net_profit",
+            "symbol",
+            "source",
+            "request_id",
+            "created_at",
+        }
+    ),
+    "qualification_history_status": frozenset(
+        {
+            "account_id",
+            "phase",
+            "cycle_id",
+            "history_start_at",
+            "complete_through",
+            "source",
+            "updated_at",
+        }
+    ),
+    "qualification_trading_days": frozenset(
+        {
+            "account_id",
+            "phase",
+            "cycle_id",
+            "ftmo_day",
+            "first_opened_at",
+            "source",
+            "request_id",
+            "created_at",
+        }
+    ),
+    "backup_runs": frozenset(
+        {
+            "id",
+            "operation",
+            "success",
+            "created_at",
+            "detail",
+        }
+    ),
+}
+# An approval is an authorization for one submission attempt, not a reusable
+# trade ticket. Pending reservations that outlive the lease are promoted to
+# unknown so a lost client response cannot silently free risk.
+PENDING_RESERVATION_LEASE = timedelta(seconds=60)
+MAX_CREDENTIAL_SECRET_LENGTH = 512
+
+
+def _missing_required_schema_objects(
+    connection: sqlite3.Connection,
+) -> list[str]:
+    tables = {
+        str(row["name"])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    missing = sorted(REQUIRED_STATE_TABLES - tables)
+    for table, required_columns in REQUIRED_STATE_COLUMNS.items():
+        if table not in tables:
+            continue
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()
+        }
+        missing.extend(
+            f"{table}.{column}"
+            for column in sorted(required_columns - columns)
+        )
+    return missing
 
 
 def _calendar_content_hash(
@@ -132,7 +347,12 @@ class StateStore:
         path: str | Path,
         day_timezone: str = "Europe/Prague",
     ):
-        self.path = str(path)
+        raw_path = str(path)
+        self.path = (
+            raw_path
+            if raw_path == ":memory:"
+            else str(self._absolute_path(raw_path))
+        )
         self.day_timezone = day_timezone
         self._lock = threading.RLock()
         self._last_integrity_check_monotonic = float("-inf")
@@ -150,7 +370,24 @@ class StateStore:
                 check_same_thread=False,
             )
             self._memory_connection.row_factory = sqlite3.Row
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        else:
+            self._assert_no_symlink_components(
+                self.path,
+                "SQLite database",
+            )
+        database_parent = Path(self.path).parent
+        if self.path != ":memory:":
+            self._assert_no_symlink_components(
+                database_parent,
+                "SQLite database directory",
+            )
+        database_parent.mkdir(parents=True, exist_ok=True)
+        if self.path != ":memory:":
+            self._assert_no_symlink_components(
+                self.path,
+                "SQLite database",
+            )
+        self._assert_directory(database_parent, "SQLite database directory")
         self._secure_database_file()
         self._initialize()
 
@@ -173,12 +410,25 @@ class StateStore:
         if self.path == ":memory:":
             return
         for candidate in (self.path, self.path + "-wal", self.path + "-shm"):
-            if not os.path.exists(candidate):
+            try:
+                metadata = os.lstat(candidate)
+            except FileNotFoundError:
                 continue
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(
+                    f"SQLite sidecar must not be a symbolic link: {candidate}"
+                )
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(
+                    f"SQLite sidecar must be a regular file: {candidate}"
+                )
             flags = os.O_RDONLY
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
-            descriptor = os.open(candidate, flags)
+            try:
+                descriptor = os.open(candidate, flags)
+            except FileNotFoundError:
+                continue
             try:
                 if hasattr(os, "fchmod"):
                     os.fchmod(descriptor, 0o600)
@@ -190,6 +440,10 @@ class StateStore:
     def _connect(self) -> sqlite3.Connection:
         if self._memory_uri is not None and self._memory_connection is None:
             raise RuntimeError("state store is closed")
+        if self._memory_connection is None:
+            # Inspect before sqlite3.connect so a path swapped to a symlink
+            # cannot be opened before the safety check runs.
+            self._secure_database_sidecars()
         if self._memory_connection is not None:
             connection = self._memory_connection
         else:
@@ -227,6 +481,26 @@ class StateStore:
 
     def _initialize(self) -> None:
         with self._lock, self._connection() as connection:
+            schema_row = connection.execute(
+                "PRAGMA user_version"
+            ).fetchone()
+            schema_version = int(schema_row[0]) if schema_row else 0
+            if schema_version > CURRENT_SCHEMA_VERSION:
+                raise ValueError(
+                    "state database schema version is newer than this "
+                    f"service (found {schema_version}, supported "
+                    f"{CURRENT_SCHEMA_VERSION})"
+                )
+            if schema_version == CURRENT_SCHEMA_VERSION:
+                missing_schema_objects = _missing_required_schema_objects(
+                    connection
+                )
+                if missing_schema_objects:
+                    raise ValueError(
+                        "state database is marked with the current schema "
+                        "version but is missing required risk state objects: "
+                        + ", ".join(missing_schema_objects)
+                    )
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS accounts (
@@ -241,6 +515,7 @@ class StateStore:
                     balance TEXT NOT NULL,
                     equity TEXT NOT NULL,
                     current_open_risk TEXT NOT NULL,
+                    reserved_open_risk TEXT NOT NULL DEFAULT '0',
                     open_positions_count INTEGER,
                     pending_orders_count INTEGER,
                     as_of TEXT NOT NULL,
@@ -285,6 +560,7 @@ class StateStore:
                     action TEXT NOT NULL,
                     symbol TEXT NOT NULL,
                     allowed INTEGER NOT NULL,
+                    reservation_risk TEXT NOT NULL DEFAULT '0',
                     response_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(account_id, request_id),
@@ -303,6 +579,28 @@ class StateStore:
                     PRIMARY KEY(account_id, request_id),
                     FOREIGN KEY(account_id) REFERENCES accounts(account_id)
                 );
+
+                CREATE INDEX IF NOT EXISTS executions_account_outcome
+                    ON executions(account_id, outcome);
+
+                CREATE TABLE IF NOT EXISTS risk_reservations (
+                    account_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    reserved_risk TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'unknown', 'committed')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    execution_at TEXT,
+                    PRIMARY KEY(account_id, request_id),
+                    FOREIGN KEY(account_id) REFERENCES accounts(account_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS risk_reservations_account_status
+                    ON risk_reservations(account_id, status, updated_at);
 
                 CREATE TABLE IF NOT EXISTS calendar_snapshots (
                     calendar_type TEXT PRIMARY KEY,
@@ -417,6 +715,11 @@ class StateStore:
                     "ALTER TABLE accounts ADD COLUMN pending_orders_count "
                     "INTEGER"
                 )
+            if "reserved_open_risk" not in columns:
+                connection.execute(
+                    "ALTER TABLE accounts ADD COLUMN reserved_open_risk "
+                    "TEXT NOT NULL DEFAULT '0'"
+                )
             calendar_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -444,6 +747,17 @@ class StateStore:
                     "PRAGMA table_info(executions)"
                 ).fetchall()
             }
+            decision_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(decisions)"
+                ).fetchall()
+            }
+            if "reservation_risk" not in decision_columns:
+                connection.execute(
+                    "ALTER TABLE decisions ADD COLUMN reservation_risk "
+                    "TEXT NOT NULL DEFAULT '0'"
+                )
             if "action" not in execution_columns:
                 connection.execute(
                     "ALTER TABLE executions ADD COLUMN action TEXT NOT NULL "
@@ -484,11 +798,29 @@ class StateStore:
                 ON closed_trades(account_id, phase, cycle_id, ftmo_day)
                 """
             )
+            missing_schema_objects = _missing_required_schema_objects(
+                connection
+            )
+            if missing_schema_objects:
+                raise RuntimeError(
+                    "state database migration did not produce required risk "
+                    "state objects: "
+                    + ", ".join(missing_schema_objects)
+                )
+            connection.execute(
+                f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"
+            )
             connection.commit()
 
     @staticmethod
     def _credential_digest(secret: str, salt: bytes) -> bytes:
         return hashlib.sha256(salt + secret.encode("utf-8")).digest()
+
+    @staticmethod
+    def _utc_timestamp(value: datetime, field: str) -> datetime:
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise ValueError(f"{field} must be timezone-aware")
+        return value.astimezone(timezone.utc)
 
     @staticmethod
     def _credential_record_from_row(
@@ -512,6 +844,472 @@ class StateStore:
             scopes=tuple(json.loads(row["scopes_json"])),
             created_at=datetime.fromisoformat(row["created_at"]),
         )
+
+    @staticmethod
+    def _reservation_total_from_rows(rows: list[sqlite3.Row]) -> Decimal:
+        total = ZERO
+        for row in rows:
+            value = Decimal(row["reserved_risk"])
+            if not value.is_finite() or value < ZERO:
+                raise ValueError("persisted reservation risk is invalid")
+            total += value
+        return total
+
+    @staticmethod
+    def _assert_regular_or_missing(path: Path, label: str) -> None:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ValueError(f"unable to inspect {label}") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"{label} must not be a symbolic link")
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{label} must be a regular file")
+
+    @staticmethod
+    def _assert_directory(path: Path, label: str) -> None:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise ValueError(f"unable to inspect {label}") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"{label} must not be a symbolic link")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"{label} must be a directory")
+
+    @staticmethod
+    def _absolute_path(path: str | Path) -> Path:
+        return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+    @classmethod
+    def _assert_no_symlink_components(
+        cls,
+        path: str | Path,
+        label: str,
+    ) -> None:
+        """Reject user-controlled symlink components before file I/O.
+
+        macOS exposes a few system directories through stable aliases, most
+        notably ``/var`` and ``/tmp``.  Those aliases are allowed only when
+        they point to Apple's corresponding ``/private`` directory; every
+        other symlink in the requested path remains rejected.
+        """
+        allowed_system_aliases = {
+            Path("/var"): Path("/private/var"),
+            Path("/tmp"): Path("/private/tmp"),
+        }
+        absolute = cls._absolute_path(path)
+        current = Path(absolute.anchor) if absolute.anchor else Path(".")
+        start = 1 if absolute.anchor else 0
+        for part in absolute.parts[start:]:
+            current /= part
+            try:
+                metadata = current.lstat()
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                raise ValueError(f"unable to inspect {label} path") from exc
+            if stat.S_ISLNK(metadata.st_mode):
+                target = allowed_system_aliases.get(current)
+                if target is not None:
+                    link_target = Path(os.readlink(current))
+                    if not link_target.is_absolute():
+                        link_target = current.parent / link_target
+                    link_target = Path(os.path.abspath(str(link_target)))
+                    if link_target == target:
+                        continue
+                raise ValueError(
+                    f"{label} path component must not be a symbolic link: "
+                    f"{current}"
+                )
+            if current != absolute and not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError(
+                    f"{label} path component must be a directory: {current}"
+                )
+
+    @classmethod
+    def _checkpoint_file(cls, path: Path) -> None:
+        cls._assert_regular_or_missing(path, "SQLite database")
+        with closing(sqlite3.connect(str(path), timeout=5)) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.commit()
+        for suffix in ("-wal", "-shm"):
+            sidecar = path.with_name(path.name + suffix)
+            cls._assert_regular_or_missing(
+                sidecar,
+                f"SQLite database {suffix} sidecar",
+            )
+            sidecar.unlink(missing_ok=True)
+
+    @staticmethod
+    def _fsync_file(path: Path) -> None:
+        descriptor = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        # Directory fsync is supported on POSIX systems but not uniformly on
+        # every platform. The file itself is still durable when this is not
+        # available.
+        try:
+            descriptor = os.open(str(path), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            try:
+                os.fsync(descriptor)
+            except OSError:
+                return
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def _displace_destination_sidecars(
+        cls,
+        destination: Path,
+    ) -> list[tuple[Path, Path]]:
+        displaced: list[tuple[Path, Path]] = []
+        try:
+            for suffix in ("-wal", "-shm"):
+                sidecar = destination.with_name(destination.name + suffix)
+                cls._assert_regular_or_missing(
+                    sidecar,
+                    f"backup destination {suffix} sidecar",
+                )
+                if not sidecar.exists():
+                    continue
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{destination.name}.",
+                    suffix=f"{suffix}.old",
+                    dir=str(destination.parent),
+                )
+                os.close(descriptor)
+                temporary = Path(temporary_name)
+                temporary.unlink()
+                os.replace(sidecar, temporary)
+                displaced.append((sidecar, temporary))
+        except Exception:
+            cls._restore_destination_sidecars(displaced)
+            raise
+        return displaced
+
+    @staticmethod
+    def _restore_destination_sidecars(
+        displaced: list[tuple[Path, Path]],
+    ) -> None:
+        for original, temporary in reversed(displaced):
+            if not temporary.exists() or original.exists():
+                continue
+            os.replace(temporary, original)
+
+    @staticmethod
+    def _discard_destination_sidecars(
+        displaced: list[tuple[Path, Path]],
+    ) -> None:
+        for _, temporary in displaced:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _active_reservation_risk_connection(
+        self,
+        connection: sqlite3.Connection,
+        account_id: str,
+    ) -> Decimal:
+        placeholders = ",".join("?" for _ in ACTIVE_RESERVATION_STATUSES)
+        rows = connection.execute(
+            "SELECT reserved_risk FROM risk_reservations "
+            f"WHERE account_id = ? AND status IN ({placeholders})",
+            (account_id, *ACTIVE_RESERVATION_STATUSES),
+        ).fetchall()
+        return self._reservation_total_from_rows(rows)
+
+    def _refresh_reserved_risk_connection(
+        self,
+        connection: sqlite3.Connection,
+        account_id: str,
+    ) -> Decimal:
+        total = self._active_reservation_risk_connection(
+            connection,
+            account_id,
+        )
+        connection.execute(
+            "UPDATE accounts SET reserved_open_risk = ? "
+            "WHERE account_id = ?",
+            (str(total), account_id),
+        )
+        return total
+
+    def _release_committed_reservations_connection(
+        self,
+        connection: sqlite3.Connection,
+        account_id: str,
+        as_of: datetime,
+    ) -> None:
+        connection.execute(
+            """
+            DELETE FROM risk_reservations
+            WHERE account_id = ?
+              AND status = 'committed'
+              AND execution_at IS NOT NULL
+              AND execution_at <= ?
+            """,
+            (account_id, as_of.astimezone(timezone.utc).isoformat()),
+        )
+        self._refresh_reserved_risk_connection(connection, account_id)
+
+    @staticmethod
+    def _blocked_replay_response(
+        response_json: str,
+        *,
+        code: str,
+        reason: str,
+        execution_outcome: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            response = json.loads(response_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("persisted decision response is invalid") from exc
+        if not isinstance(response, dict):
+            raise ValueError("persisted decision response must be an object")
+        decision = response.get("decision")
+        if not isinstance(decision, dict):
+            raise ValueError("persisted decision response has no decision")
+        blocked_decision = dict(decision)
+        blocked_decision.update(
+            {
+                "code": code,
+                "allowed": False,
+                "reasons": [reason],
+            }
+        )
+        response["decision"] = blocked_decision
+        response["replayed"] = True
+        if execution_outcome is not None:
+            response["execution_outcome"] = execution_outcome
+        return response
+
+    def _promote_expired_pending_reservations_connection(
+        self,
+        connection: sqlite3.Connection,
+        account_id: str,
+        now: datetime,
+    ) -> int:
+        cutoff = (now - PENDING_RESERVATION_LEASE).isoformat()
+        rows = connection.execute(
+            """
+            SELECT account_id, request_id, request_hash, action, symbol,
+                   reserved_risk, created_at
+            FROM risk_reservations
+            WHERE account_id = ? AND status = 'pending' AND created_at <= ?
+            ORDER BY created_at, request_id
+            """,
+            (account_id, cutoff),
+        ).fetchall()
+        promoted = 0
+        for row in rows:
+            existing = connection.execute(
+                """
+                SELECT outcome
+                FROM executions
+                WHERE account_id = ? AND request_id = ?
+                """,
+                (row["account_id"], row["request_id"]),
+            ).fetchone()
+            if existing is not None and existing["outcome"] == "failure":
+                connection.execute(
+                    """
+                    DELETE FROM activity
+                    WHERE account_id = ? AND kind = ? AND request_id = ?
+                    """,
+                    (account_id, row["action"], row["request_id"]),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM risk_reservations
+                    WHERE account_id = ? AND request_id = ?
+                    """,
+                    (account_id, row["request_id"]),
+                )
+                promoted += 1
+                continue
+            if existing is not None and existing["outcome"] == "success":
+                connection.execute(
+                    """
+                    UPDATE risk_reservations
+                    SET status = 'committed', execution_at = ?, updated_at = ?
+                    WHERE account_id = ? AND request_id = ?
+                    """,
+                    (
+                        now.isoformat(),
+                        now.isoformat(),
+                        account_id,
+                        row["request_id"],
+                    ),
+                )
+                promoted += 1
+                continue
+
+            if existing is None:
+                response = {
+                    "ok": True,
+                    "account_id": account_id,
+                    "request_id": row["request_id"],
+                    "execution_recorded": True,
+                    "outcome": "unknown",
+                    "reservation_released": False,
+                    "reservation_committed": False,
+                    "resolved_unknown": False,
+                    "lease_expired": True,
+                }
+                connection.execute(
+                    """
+                    INSERT INTO executions (
+                        account_id, request_id, request_hash, action, symbol,
+                        outcome, response_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 'unknown', ?, ?)
+                    """,
+                    (
+                        account_id,
+                        row["request_id"],
+                        row["request_hash"],
+                        row["action"],
+                        row["symbol"],
+                        json.dumps(
+                            response,
+                            ensure_ascii=True,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        now.isoformat(),
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE risk_reservations
+                SET status = 'unknown', updated_at = ?
+                WHERE account_id = ? AND request_id = ?
+                """,
+                (now.isoformat(), account_id, row["request_id"]),
+            )
+            self._insert_activity_connection(
+                connection,
+                account_id=account_id,
+                kind="execution",
+                symbol=row["symbol"],
+                occurred_at=now,
+                request_id=row["request_id"],
+                detail="reservation lease expired before execution result",
+            )
+            promoted += 1
+        if rows:
+            self._refresh_reserved_risk_connection(connection, account_id)
+        return promoted
+
+    def _load_account_connection(
+        self,
+        connection: sqlite3.Connection,
+        account_id: str,
+        now: datetime,
+    ) -> tuple[sqlite3.Row | None, Decimal]:
+        self._promote_expired_pending_reservations_connection(
+            connection,
+            account_id,
+            now,
+        )
+        row = connection.execute(
+            "SELECT * FROM accounts WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            return None, ZERO
+        reserved_open_risk = self._active_reservation_risk_connection(
+            connection,
+            account_id,
+        )
+        stored_value = row["reserved_open_risk"]
+        try:
+            stored_reserved = Decimal(stored_value)
+        except (TypeError, ValueError, ArithmeticError):
+            stored_reserved = None
+        if stored_reserved != reserved_open_risk:
+            connection.execute(
+                "UPDATE accounts SET reserved_open_risk = ? "
+                "WHERE account_id = ?",
+                (str(reserved_open_risk), account_id),
+            )
+        return row, reserved_open_risk
+
+    def _unknown_execution_count_connection(
+        self,
+        connection: sqlite3.Connection,
+        account_id: str | None = None,
+    ) -> int:
+        if account_id is None:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM (
+                    SELECT account_id, request_id
+                    FROM executions
+                    WHERE outcome = 'unknown'
+                    UNION
+                    SELECT account_id, request_id
+                    FROM risk_reservations
+                    WHERE status = 'unknown'
+                )
+                """
+            ).fetchone()
+        else:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM (
+                    SELECT request_id
+                    FROM executions
+                    WHERE account_id = ? AND outcome = 'unknown'
+                    UNION
+                    SELECT request_id
+                    FROM risk_reservations
+                    WHERE account_id = ? AND status = 'unknown'
+                )
+                """,
+                (account_id, account_id),
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def reconcile_expired_reservations(
+        self,
+        account_id: str | None = None,
+    ) -> int:
+        """Promote abandoned pending executions to an auditable unknown state."""
+        now = datetime.now(timezone.utc)
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if account_id is None:
+                rows = connection.execute(
+                    "SELECT account_id FROM accounts ORDER BY account_id"
+                ).fetchall()
+                account_ids = [str(row["account_id"]) for row in rows]
+            else:
+                account_ids = [account_id]
+            promoted = sum(
+                self._promote_expired_pending_reservations_connection(
+                    connection,
+                    item,
+                    now,
+                )
+                for item in account_ids
+            )
+            connection.commit()
+        return promoted
 
     def save_calendar_snapshot(
         self,
@@ -739,19 +1537,22 @@ class StateStore:
             raise ValueError("account_id must be non-empty")
         if not scopes:
             raise ValueError("at least one credential scope is required")
-        if not not_before.tzinfo or not expires_at.tzinfo:
-            raise ValueError("credential timestamps must be timezone-aware")
+        not_before = self._utc_timestamp(not_before, "not_before")
+        expires_at = self._utc_timestamp(expires_at, "expires_at")
+        now = self._utc_timestamp(
+            now or datetime.now(timezone.utc),
+            "now",
+        )
         if expires_at <= not_before:
             raise ValueError("expires_at must be after not_before")
-        now = now or datetime.now(timezone.utc)
-        if not now.tzinfo:
-            raise ValueError("now must be timezone-aware")
+        if any(not isinstance(scope, str) or not scope.strip() for scope in scopes):
+            raise ValueError("credential scopes must contain non-empty strings")
         credential_id = uuid4().hex
         secret = f"rsk_{credential_id}.{secrets.token_urlsafe(32)}"
         salt = secrets.token_bytes(16)
         digest = self._credential_digest(secret, salt)
-        created_at = now.astimezone(timezone.utc)
-        scopes_tuple = tuple(sorted(set(scopes)))
+        created_at = now
+        scopes_tuple = tuple(sorted({scope.strip() for scope in scopes}))
         if any(scope not in ACCOUNT_CREDENTIAL_SCOPES for scope in scopes_tuple):
             raise ValueError("credential scopes contain an unsupported scope")
         with self._lock, self._connection() as connection:
@@ -767,8 +1568,8 @@ class StateStore:
                     account_id,
                     salt,
                     digest,
-                    not_before.astimezone(timezone.utc).isoformat(),
-                    expires_at.astimezone(timezone.utc).isoformat(),
+                    not_before.isoformat(),
+                    expires_at.isoformat(),
                     json.dumps(scopes_tuple, ensure_ascii=True),
                     created_at.isoformat(),
                 ),
@@ -790,7 +1591,13 @@ class StateStore:
         scope: str,
         now: datetime | None = None,
     ) -> CredentialRecord | None:
-        if not account_id or not secret or not scope:
+        if (
+            not account_id
+            or not isinstance(secret, str)
+            or not secret
+            or len(secret) > MAX_CREDENTIAL_SECRET_LENGTH
+            or not scope
+        ):
             return None
         prefix, separator, _ = secret.partition(".")
         if separator != "." or not prefix.startswith("rsk_"):
@@ -798,7 +1605,13 @@ class StateStore:
         credential_id = prefix[4:]
         if len(credential_id) != 32:
             return None
-        now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        try:
+            now = self._utc_timestamp(
+                now or datetime.now(timezone.utc),
+                "now",
+            )
+        except ValueError:
+            return None
         with self._lock, self._connection() as connection:
             row = connection.execute(
                 """
@@ -868,11 +1681,13 @@ class StateStore:
         overlap_seconds: int = 0,
         now: datetime | None = None,
     ) -> tuple[CredentialRecord, str]:
+        if isinstance(overlap_seconds, bool) or not isinstance(overlap_seconds, int):
+            raise ValueError("overlap_seconds must be an integer")
         if overlap_seconds < 0:
             raise ValueError("overlap_seconds cannot be negative")
-        now = now or datetime.now(timezone.utc)
-        if not_before.tzinfo is None or expires_at.tzinfo is None:
-            raise ValueError("credential timestamps must be timezone-aware")
+        now = self._utc_timestamp(now or datetime.now(timezone.utc), "now")
+        not_before = self._utc_timestamp(not_before, "not_before")
+        expires_at = self._utc_timestamp(expires_at, "expires_at")
         if expires_at <= not_before:
             raise ValueError("expires_at must be after not_before")
         new_credential_id = uuid4().hex
@@ -885,7 +1700,7 @@ class StateStore:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT account_id, scopes_json
+                SELECT account_id, scopes_json, revoked_at
                 FROM account_credentials
                 WHERE credential_id = ?
                 """,
@@ -893,15 +1708,44 @@ class StateStore:
             ).fetchone()
             if row is None:
                 raise KeyError(f"unknown credential_id: {credential_id}")
-            selected_scopes = tuple(
-                scopes or tuple(json.loads(row["scopes_json"]))
+            selected_scopes = (
+                tuple(json.loads(row["scopes_json"]))
+                if scopes is None
+                else tuple(scopes)
             )
+            if not selected_scopes:
+                raise ValueError("at least one credential scope is required")
+            if any(
+                not isinstance(scope, str) or not scope.strip()
+                for scope in selected_scopes
+            ):
+                raise ValueError(
+                    "credential scopes must contain non-empty strings"
+                )
             if any(
                 scope not in ACCOUNT_CREDENTIAL_SCOPES
                 for scope in selected_scopes
             ):
                 raise ValueError("credential scopes contain an unsupported scope")
-            old_revoked_at = now + timedelta(seconds=overlap_seconds)
+            requested_revoked_at = now + timedelta(seconds=overlap_seconds)
+            existing_revoked_at = (
+                datetime.fromisoformat(row["revoked_at"])
+                .astimezone(timezone.utc)
+                if row["revoked_at"]
+                else None
+            )
+            # Rotation must never reactivate a credential that was already
+            # revoked. A future revocation may be extended, but never moved
+            # earlier than the existing deadline.
+            if existing_revoked_at is not None and existing_revoked_at <= now:
+                effective_revoked_at = existing_revoked_at
+            elif existing_revoked_at is not None:
+                effective_revoked_at = max(
+                    existing_revoked_at,
+                    requested_revoked_at,
+                )
+            else:
+                effective_revoked_at = requested_revoked_at
             connection.execute(
                 """
                 INSERT INTO account_credentials (
@@ -914,13 +1758,13 @@ class StateStore:
                     row["account_id"],
                     salt,
                     digest,
-                    not_before.astimezone(timezone.utc).isoformat(),
-                    expires_at.astimezone(timezone.utc).isoformat(),
+                    not_before.isoformat(),
+                    expires_at.isoformat(),
                     json.dumps(
                         tuple(sorted(set(selected_scopes))),
                         ensure_ascii=True,
                     ),
-                    now.astimezone(timezone.utc).isoformat(),
+                    now.isoformat(),
                 ),
             )
             connection.execute(
@@ -928,12 +1772,12 @@ class StateStore:
                 UPDATE account_credentials
                 SET revoked_at = ?
                 WHERE credential_id = ?
-                  AND (revoked_at IS NULL OR revoked_at > ?)
+                  AND (revoked_at IS NULL OR revoked_at < ?)
                 """,
                 (
-                    old_revoked_at.astimezone(timezone.utc).isoformat(),
+                    effective_revoked_at.isoformat(),
                     credential_id,
-                    old_revoked_at.astimezone(timezone.utc).isoformat(),
+                    effective_revoked_at.isoformat(),
                 ),
             )
             connection.commit()
@@ -953,17 +1797,36 @@ class StateStore:
         credential_id: str,
         revoked_at: datetime | None = None,
     ) -> CredentialRecord:
-        revoked_at = (revoked_at or datetime.now(timezone.utc)).astimezone(
-            timezone.utc
+        revoked_at = self._utc_timestamp(
+            revoked_at or datetime.now(timezone.utc),
+            "revoked_at",
         )
         with self._lock, self._connection() as connection:
+            existing = connection.execute(
+                "SELECT revoked_at FROM account_credentials "
+                "WHERE credential_id = ?",
+                (credential_id,),
+            ).fetchone()
+            if existing is None:
+                raise KeyError(f"unknown credential_id: {credential_id}")
+            existing_revoked_at = (
+                datetime.fromisoformat(existing["revoked_at"])
+                if existing["revoked_at"]
+                else None
+            )
+            effective_revoked_at = revoked_at
+            if existing_revoked_at is not None:
+                effective_revoked_at = max(
+                    existing_revoked_at.astimezone(timezone.utc),
+                    revoked_at,
+                )
             connection.execute(
                 """
                 UPDATE account_credentials
                 SET revoked_at = ?
                 WHERE credential_id = ?
                 """,
-                (revoked_at.isoformat(), credential_id),
+                (effective_revoked_at.isoformat(), credential_id),
             )
             row = connection.execute(
                 "SELECT * FROM account_credentials WHERE credential_id = ?",
@@ -971,7 +1834,7 @@ class StateStore:
             ).fetchone()
             connection.commit()
         if row is None:
-            raise KeyError(f"unknown credential_id: {credential_id}")
+            raise RuntimeError("credential disappeared during revocation")
         return self._credential_record_from_row(row)
 
     def list_account_credentials(
@@ -1005,8 +1868,9 @@ class StateStore:
     ) -> dict[str, int]:
         if expiring_within_seconds < 0:
             raise ValueError("expiring_within_seconds cannot be negative")
-        now_utc = (now or datetime.now(timezone.utc)).astimezone(
-            timezone.utc
+        now_utc = self._utc_timestamp(
+            now or datetime.now(timezone.utc),
+            "now",
         )
         horizon = now_utc + timedelta(seconds=expiring_within_seconds)
         with self._lock, self._connection() as connection:
@@ -1441,11 +2305,53 @@ class StateStore:
         return dict(row) if row is not None else None
 
     def all_accounts(self) -> list[StoredAccount]:
+        now = datetime.now(timezone.utc)
         with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            account_rows = connection.execute(
+                "SELECT account_id, reserved_open_risk "
+                "FROM accounts ORDER BY account_id"
+            ).fetchall()
+            reservation_totals: dict[str, Decimal] = {}
+            for account_row in account_rows:
+                account_id = str(account_row["account_id"])
+                self._promote_expired_pending_reservations_connection(
+                    connection,
+                    account_id,
+                    now,
+                )
+                reservation_totals[account_id] = (
+                    self._active_reservation_risk_connection(
+                        connection,
+                        account_id,
+                    )
+                )
+                try:
+                    stored_reserved = Decimal(
+                        account_row["reserved_open_risk"]
+                    )
+                except (TypeError, ValueError, ArithmeticError):
+                    stored_reserved = None
+                if stored_reserved != reservation_totals[account_id]:
+                    connection.execute(
+                        "UPDATE accounts SET reserved_open_risk = ? "
+                        "WHERE account_id = ?",
+                        (str(reservation_totals[account_id]), account_id),
+                    )
             rows = connection.execute(
                 "SELECT * FROM accounts ORDER BY account_id"
             ).fetchall()
-        return [self._stored_account_from_row(row) for row in rows]
+            connection.commit()
+        return [
+            self._stored_account_from_row(
+                row,
+                reserved_open_risk=reservation_totals.get(
+                    str(row["account_id"]),
+                    ZERO,
+                ),
+            )
+            for row in rows
+        ]
 
     def database_healthy(self) -> bool:
         if self.path != ":memory:" and not Path(self.path).is_file():
@@ -1453,16 +2359,15 @@ class StateStore:
         try:
             with self._lock, self._connection() as connection:
                 row = connection.execute("SELECT 1").fetchone()
-                tables = {
-                    item["name"]
-                    for item in connection.execute(
-                        """
-                        SELECT name
-                        FROM sqlite_master
-                        WHERE type = 'table'
-                        """
-                    ).fetchall()
-                }
+                schema_row = connection.execute(
+                    "PRAGMA user_version"
+                ).fetchone()
+                schema_version = (
+                    int(schema_row[0]) if schema_row else None
+                )
+                missing_schema_objects = _missing_required_schema_objects(
+                    connection
+                )
                 monotonic_now = time.monotonic()
                 if (
                     monotonic_now - self._last_integrity_check_monotonic
@@ -1471,53 +2376,418 @@ class StateStore:
                     integrity = connection.execute(
                         "PRAGMA quick_check(1)"
                     ).fetchone()
+                    foreign_key_error = connection.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchone()
                     self._last_integrity_check_ok = bool(
-                        integrity and integrity[0] == "ok"
+                        integrity
+                        and integrity[0] == "ok"
+                        and foreign_key_error is None
                     )
                     self._last_integrity_check_monotonic = monotonic_now
-            required = {
-                "accounts",
-                "calendar_snapshots",
-                "account_credentials",
-                "activity",
-                "daily_settlements",
-                "decisions",
-                "executions",
-                "closed_trades",
-                "qualification_history_status",
-                "qualification_trading_days",
-                "backup_runs",
-            }
             return bool(
                 row
                 and row[0] == 1
+                and schema_version == CURRENT_SCHEMA_VERSION
                 and self._last_integrity_check_ok
-                and required <= tables
+                and not missing_schema_objects
             )
-        except (OSError, sqlite3.DatabaseError):
+        except (OSError, ValueError, RuntimeError, sqlite3.DatabaseError):
             self._last_integrity_check_ok = False
             return False
 
     def unknown_execution_count(self, account_id: str | None = None) -> int:
         with self._lock, self._connection() as connection:
-            if account_id is None:
-                row = connection.execute(
-                    """
-                    SELECT COUNT(*) AS count
-                    FROM executions
-                    WHERE outcome = 'unknown'
-                    """
-                ).fetchone()
+            return self._unknown_execution_count_connection(
+                connection,
+                account_id,
+            )
+
+    def risk_state_integrity_issues(self, *, limit: int = 100) -> list[str]:
+        """Return semantic consistency failures in execution state.
+
+        SQLite's structural checks cannot prove that a reservation still
+        matches its decision and execution records. This read-only audit is
+        intentionally fail-closed: callers should stop new risk when it
+        returns any issue instead of trying to repair records silently.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        with self._lock, self._connection() as connection:
+            reservation_rows = connection.execute(
+                """
+                SELECT r.account_id, r.request_id, r.request_hash,
+                       r.action, r.symbol, r.reserved_risk, r.status,
+                       r.execution_at,
+                       d.request_hash AS decision_hash,
+                       d.action AS decision_action,
+                       d.symbol AS decision_symbol,
+                       d.allowed AS decision_allowed,
+                       d.reservation_risk AS decision_reservation_risk,
+                       e.outcome AS execution_outcome,
+                       e.action AS execution_action,
+                       e.symbol AS execution_symbol
+                FROM risk_reservations r
+                LEFT JOIN decisions d
+                  ON d.account_id = r.account_id
+                 AND d.request_id = r.request_id
+                LEFT JOIN executions e
+                  ON e.account_id = r.account_id
+                 AND e.request_id = r.request_id
+                ORDER BY r.account_id, r.request_id
+                """
+            ).fetchall()
+            execution_rows = connection.execute(
+                """
+                SELECT e.account_id, e.request_id, e.action, e.symbol,
+                       e.outcome,
+                       d.action AS decision_action,
+                       d.symbol AS decision_symbol,
+                       r.status AS reservation_status,
+                       e.request_hash AS execution_request_hash
+                FROM executions e
+                LEFT JOIN decisions d
+                  ON d.account_id = e.account_id
+                 AND d.request_id = e.request_id
+                LEFT JOIN risk_reservations r
+                  ON r.account_id = e.account_id
+                 AND r.request_id = e.request_id
+                ORDER BY e.account_id, e.request_id
+                """
+            ).fetchall()
+            decision_rows = connection.execute(
+                """
+                SELECT d.account_id, d.request_id, d.action, d.symbol,
+                       d.allowed, d.reservation_risk,
+                       e.outcome AS execution_outcome,
+                       r.status AS reservation_status,
+                       r.reserved_risk AS linked_reservation_risk
+                FROM decisions d
+                LEFT JOIN executions e
+                  ON e.account_id = d.account_id
+                 AND e.request_id = d.request_id
+                LEFT JOIN risk_reservations r
+                  ON r.account_id = d.account_id
+                 AND r.request_id = d.request_id
+                ORDER BY d.account_id, d.request_id
+                """
+            ).fetchall()
+            credential_rows = connection.execute(
+                """
+                SELECT c.credential_id, c.account_id
+                FROM account_credentials c
+                LEFT JOIN accounts a ON a.account_id = c.account_id
+                WHERE a.account_id IS NULL
+                ORDER BY c.credential_id
+                """
+            ).fetchall()
+            account_rows = connection.execute(
+                """
+                SELECT account_id, reserved_open_risk
+                FROM accounts
+                ORDER BY account_id
+                """
+            ).fetchall()
+
+        issues: list[str] = []
+        active_totals: dict[str, Decimal] = {}
+
+        def add(message: str) -> None:
+            if len(issues) < limit:
+                issues.append(message)
+
+        for row in reservation_rows:
+            account_id = str(row["account_id"])
+            request_id = str(row["request_id"])
+            status = str(row["status"])
+            if status in ACTIVE_RESERVATION_STATUSES:
+                try:
+                    risk = Decimal(row["reserved_risk"])
+                except (TypeError, ValueError, ArithmeticError):
+                    risk = None
+                if risk is None or not risk.is_finite() or risk <= ZERO:
+                    add(
+                        f"reservation {account_id}/{request_id} has invalid "
+                        "reserved risk"
+                    )
+                else:
+                    active_totals[account_id] = (
+                        active_totals.get(account_id, ZERO) + risk
+                    )
+            if status not in ACTIVE_RESERVATION_STATUSES:
+                add(f"reservation {account_id}/{request_id} has invalid status")
+            if str(row["action"]) not in {"open", "modify"}:
+                add(f"reservation {account_id}/{request_id} has invalid action")
+            if not str(row["symbol"]).strip():
+                add(f"reservation {account_id}/{request_id} has an empty symbol")
+            if row["decision_hash"] is None:
+                add(
+                    f"reservation {account_id}/{request_id} has no decision"
+                )
             else:
-                row = connection.execute(
+                if (
+                    row["request_hash"] != row["decision_hash"]
+                    or row["action"] != row["decision_action"]
+                    or row["symbol"] != row["decision_symbol"]
+                    or not bool(row["decision_allowed"])
+                ):
+                    add(
+                        f"reservation {account_id}/{request_id} does not "
+                        "match its allowed decision"
+                    )
+            if row["execution_outcome"] is None:
+                if status in {"unknown", "committed"}:
+                    add(
+                        f"{status} reservation {account_id}/{request_id} "
+                        "has no execution record"
+                    )
+            else:
+                if (
+                    row["execution_action"] != row["action"]
+                    or row["execution_symbol"] != row["symbol"]
+                ):
+                    add(
+                        f"reservation {account_id}/{request_id} does not "
+                        "match its execution identity"
+                    )
+                if status == "pending":
+                    add(
+                        f"pending reservation {account_id}/{request_id} "
+                        "already has an execution record"
+                    )
+                elif status == "unknown" and row["execution_outcome"] != "unknown":
+                    add(
+                        f"unknown reservation {account_id}/{request_id} "
+                        "has a non-unknown execution outcome"
+                    )
+                elif status == "committed" and (
+                    row["execution_outcome"] != "success"
+                    or row["execution_at"] is None
+                ):
+                    add(
+                        f"committed reservation {account_id}/{request_id} "
+                        "is missing a successful execution"
+                    )
+
+            if status in {"pending", "unknown"} and row["execution_at"] is not None:
+                add(
+                    f"{status} reservation {account_id}/{request_id} has an "
+                    "unexpected execution timestamp"
+                )
+
+        for row in execution_rows:
+            account_id = str(row["account_id"])
+            request_id = str(row["request_id"])
+            outcome = str(row["outcome"])
+            if outcome not in {"success", "failure", "unknown"}:
+                add(f"execution {account_id}/{request_id} has invalid outcome")
+            if row["decision_action"] is None:
+                add(f"execution {account_id}/{request_id} has no decision")
+            elif (
+                row["action"] != row["decision_action"]
+                or row["symbol"] != row["decision_symbol"]
+            ):
+                add(
+                    f"execution {account_id}/{request_id} does not match "
+                    "its decision"
+                )
+            if (
+                not isinstance(row["execution_request_hash"], str)
+                or not row["execution_request_hash"].strip()
+            ):
+                add(
+                    f"execution {account_id}/{request_id} has an empty "
+                    "request hash"
+                )
+            if (
+                outcome == "unknown"
+                and row["action"] in {"open", "modify"}
+                and row["reservation_status"] is None
+            ):
+                add(
+                    f"unknown execution {account_id}/{request_id} has no "
+                    "risk reservation"
+                )
+
+        for row in decision_rows:
+            account_id = str(row["account_id"])
+            request_id = str(row["request_id"])
+            action = str(row["action"])
+            symbol = str(row["symbol"])
+            if action not in {"open", "close", "modify", "cancel"}:
+                add(f"decision {account_id}/{request_id} has invalid action")
+            if not symbol.strip():
+                add(f"decision {account_id}/{request_id} has an empty symbol")
+            try:
+                decision_risk = Decimal(row["reservation_risk"])
+            except (TypeError, ValueError, ArithmeticError):
+                decision_risk = None
+            if (
+                decision_risk is None
+                or not decision_risk.is_finite()
+                or decision_risk < ZERO
+            ):
+                add(
+                    f"decision {account_id}/{request_id} has invalid "
+                    "reservation risk"
+                )
+                decision_risk = ZERO
+            try:
+                allowed = int(row["allowed"])
+            except (TypeError, ValueError):
+                allowed = -1
+            if allowed not in {0, 1}:
+                add(f"decision {account_id}/{request_id} has invalid allowed flag")
+
+            if allowed == 1 and action in {"open", "modify"}:
+                execution_outcome = row["execution_outcome"]
+                reservation_status = row["reservation_status"]
+                if action == "open" and (
+                    reservation_status is None
+                    and execution_outcome not in {"success", "failure"}
+                ):
+                    add(
+                        f"allowed open decision {account_id}/{request_id} "
+                        "has no execution reservation"
+                    )
+                elif decision_risk > ZERO and reservation_status is None and (
+                    execution_outcome not in {"success", "failure"}
+                ):
+                    add(
+                        f"risk-increasing decision {account_id}/{request_id} "
+                        "has no execution reservation"
+                    )
+                if reservation_status is not None:
+                    try:
+                        linked_risk = Decimal(row["linked_reservation_risk"])
+                    except (TypeError, ValueError, ArithmeticError):
+                        linked_risk = None
+                    if (
+                        linked_risk is None
+                        or not linked_risk.is_finite()
+                        or linked_risk != decision_risk
+                    ):
+                        add(
+                            f"decision {account_id}/{request_id} does not "
+                            "match its reservation risk"
+                        )
+            elif decision_risk > ZERO and action not in {"open", "modify"}:
+                add(
+                    f"decision {account_id}/{request_id} reserves risk for a "
+                    "non-risk-increasing action"
+                )
+
+        for row in credential_rows:
+            add(
+                f"credential {row['credential_id']} references missing "
+                f"account {row['account_id']}"
+            )
+
+        for row in account_rows:
+            account_id = str(row["account_id"])
+            try:
+                stored_risk = Decimal(row["reserved_open_risk"])
+            except (TypeError, ValueError, ArithmeticError):
+                stored_risk = None
+            expected_risk = active_totals.get(account_id, ZERO)
+            if (
+                stored_risk is None
+                or not stored_risk.is_finite()
+                or stored_risk < ZERO
+                or stored_risk != expected_risk
+            ):
+                add(
+                    f"account {account_id} reserved_open_risk cache does "
+                    "not match active reservations"
+                )
+
+        return issues
+
+    def risk_reservation_metrics(
+        self,
+        account_id: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            if account_id is None:
+                rows = connection.execute(
+                    "SELECT status, reserved_risk FROM risk_reservations"
+                ).fetchall()
+            else:
+                rows = connection.execute(
                     """
-                    SELECT COUNT(*) AS count
-                    FROM executions
-                    WHERE account_id = ? AND outcome = 'unknown'
+                    SELECT status, reserved_risk
+                    FROM risk_reservations
+                    WHERE account_id = ?
                     """,
                     (account_id,),
-                ).fetchone()
-        return int(row["count"]) if row is not None else 0
+                ).fetchall()
+        counts = {"pending": 0, "unknown": 0, "committed": 0}
+        total = ZERO
+        for row in rows:
+            status = str(row["status"])
+            if status not in counts:
+                raise ValueError("persisted reservation status is invalid")
+            value = Decimal(row["reserved_risk"])
+            if not value.is_finite() or value < ZERO:
+                raise ValueError("persisted reservation risk is invalid")
+            counts[status] += 1
+            total += value
+        return {
+            "pending": counts["pending"],
+            "unknown": counts["unknown"],
+            "committed": counts["committed"],
+            "unresolved": counts["pending"] + counts["unknown"],
+            "reserved_risk": total,
+        }
+
+    def list_risk_reservations(
+        self,
+        account_id: str | None = None,
+        *,
+        unresolved_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connection() as connection:
+            clauses: list[str] = []
+            values: list[str] = []
+            if account_id is not None:
+                clauses.append("account_id = ?")
+                values.append(account_id)
+            if unresolved_only:
+                placeholders = ",".join("?" for _ in UNRESOLVED_RESERVATION_STATUSES)
+                clauses.append(f"status IN ({placeholders})")
+                values.extend(UNRESOLVED_RESERVATION_STATUSES)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = connection.execute(
+                """
+                SELECT account_id, request_id, request_hash, action, symbol,
+                       reserved_risk, status, created_at, updated_at,
+                       execution_at
+                FROM risk_reservations
+                """
+                + where
+                + " ORDER BY updated_at, account_id, request_id",
+                values,
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            risk = Decimal(row["reserved_risk"])
+            if not risk.is_finite() or risk < ZERO:
+                raise ValueError("persisted reservation risk is invalid")
+            result.append(
+                {
+                    "account_id": row["account_id"],
+                    "request_id": row["request_id"],
+                    "request_hash": row["request_hash"],
+                    "action": row["action"],
+                    "symbol": row["symbol"],
+                    "reserved_risk": str(risk),
+                    "status": row["status"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "execution_at": row["execution_at"],
+                }
+            )
+        return result
 
     def record_backup_event(
         self,
@@ -1602,15 +2872,55 @@ class StateStore:
     def backup_to(self, output_path: str | Path) -> Path:
         if self.path == ":memory:":
             raise ValueError("in-memory state cannot be backed up by path")
-        destination = Path(output_path).expanduser().resolve()
-        source = Path(self.path).expanduser().resolve()
+        destination = self._absolute_path(output_path)
+        source = self._absolute_path(self.path)
+        self._assert_no_symlink_components(source, "state database")
+        self._assert_no_symlink_components(destination, "backup destination")
+        self._assert_no_symlink_components(
+            destination.parent,
+            "backup destination directory",
+        )
+        self._assert_regular_or_missing(source, "state database")
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        if not self.database_healthy():
+            raise ValueError(
+                "state database is not healthy; refusing to create a backup"
+            )
         if destination == source:
             raise ValueError("backup destination cannot equal state database")
+        self._assert_regular_or_missing(destination, "backup destination")
+        for suffix in ("-wal", "-shm"):
+            self._assert_regular_or_missing(
+                destination.with_name(destination.name + suffix),
+                f"backup destination {suffix} sidecar",
+            )
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = destination.with_name(
-            f".{destination.name}.{secrets.token_hex(8)}.tmp"
+        self._assert_no_symlink_components(
+            destination,
+            "backup destination",
         )
+        self._assert_directory(
+            destination.parent,
+            "backup destination directory",
+        )
+        temp_path: Path | None = None
+        replaced = False
+        displaced_sidecars: list[tuple[Path, Path]] = []
         try:
+            descriptor, temp_name = tempfile.mkstemp(
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+                dir=str(destination.parent),
+            )
+            temp_path = Path(temp_name)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(descriptor, 0o600)
+                else:
+                    os.chmod(temp_path, 0o600)
+            finally:
+                os.close(descriptor)
             with self._lock, self._connection() as source_connection:
                 backup_connection = sqlite3.connect(str(temp_path))
                 try:
@@ -1619,31 +2929,60 @@ class StateStore:
                     backup_connection.commit()
                 finally:
                     backup_connection.close()
+            self._checkpoint_file(temp_path)
             os.chmod(temp_path, 0o600)
             with closing(sqlite3.connect(str(temp_path))) as verification:
+                verification.execute("PRAGMA foreign_keys=ON")
                 check = verification.execute("PRAGMA quick_check").fetchone()
                 if not check or check[0] != "ok":
                     raise ValueError("backup quick_check failed")
+                if verification.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchall():
+                    raise ValueError("backup foreign key check failed")
+            self._fsync_file(temp_path)
+            self._assert_regular_or_missing(
+                destination,
+                "backup destination",
+            )
+            displaced_sidecars = self._displace_destination_sidecars(
+                destination
+            )
             os.replace(temp_path, destination)
-            os.chmod(destination, 0o600)
+            replaced = True
+            self._discard_destination_sidecars(displaced_sidecars)
+            self._fsync_directory(destination.parent)
+        except Exception as exc:
+            if not replaced and temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if not replaced:
+                self._restore_destination_sidecars(displaced_sidecars)
+            else:
+                self._discard_destination_sidecars(displaced_sidecars)
+            if not replaced:
+                try:
+                    self.record_backup_event(
+                        operation="backup",
+                        success=False,
+                        detail=str(exc),
+                    )
+                except Exception:
+                    pass
+            raise
+        try:
             self.record_backup_event(
                 operation="backup",
                 success=True,
                 detail=str(destination),
             )
-            return destination
-        except Exception as exc:
-            try:
-                if temp_path.exists():
-                    temp_path.unlink()
-                self.record_backup_event(
-                    operation="backup",
-                    success=False,
-                    detail=str(exc),
-                )
-            except Exception:
-                pass
-            raise
+        except Exception:
+            # The backup artifact is already atomically installed. Telemetry
+            # failure must not make a successful backup look like a failed one.
+            pass
+        return destination.resolve()
 
     def sync_account(
         self,
@@ -1709,6 +3048,7 @@ class StateStore:
             raise ValueError("profile does not match the synchronized account")
         current_day = ftmo_day_key(received_at, self.day_timezone)
         updated_at = received_at.astimezone(timezone.utc)
+        as_of_utc = as_of.astimezone(timezone.utc)
 
         with self._lock, self._connection() as connection:
             row = connection.execute(
@@ -1760,7 +3100,6 @@ class StateStore:
                 if row["style"] != style.value:
                     raise ValueError("style cannot change after bootstrap")
                 stored_as_of = datetime.fromisoformat(row["as_of"])
-                as_of_utc = as_of.astimezone(timezone.utc)
                 stored_as_of_utc = stored_as_of.astimezone(timezone.utc)
                 if (
                     as_of_utc < stored_as_of_utc
@@ -1795,6 +3134,14 @@ class StateStore:
                 }
                 if phase_order[phase.value] < phase_order[row["phase"]]:
                     raise ValueError("account phase cannot move backwards")
+                if (
+                    account_type == AccountType.TWO_STEP
+                    and phase_order[phase.value] - phase_order[row["phase"]]
+                    > 1
+                ):
+                    raise ValueError(
+                        "two-step account phase cannot skip verification"
+                    )
                 day_start_balance = Decimal(row["day_start_balance"])
                 highest_settled_balance = Decimal(
                     row["highest_settled_balance"]
@@ -1885,16 +3232,32 @@ class StateStore:
                 elif observed_status == "LOCKED":
                     day_locked = True
 
+            reserved_open_risk = ZERO
+            if row is not None:
+                # Do this only after the incoming snapshot has passed all
+                # ordering and phase checks.  A stale rejected sync must not
+                # consume a valid execution reservation.
+                self._release_committed_reservations_connection(
+                    connection,
+                    account_id,
+                    as_of_utc,
+                )
+                reserved_open_risk = self._active_reservation_risk_connection(
+                    connection,
+                    account_id,
+                )
+
             connection.execute(
                 """
                 INSERT INTO accounts (
                     account_id, account_type, phase, style, initial_capital,
                     ftmo_day, day_start_balance, highest_settled_balance,
-                    balance, equity, current_open_risk, open_positions_count,
+                    balance, equity, current_open_risk, reserved_open_risk,
+                    open_positions_count,
                     pending_orders_count,
                     as_of, updated_at,
                     data_uncertain, day_locked, breach_latched
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id) DO UPDATE SET
                     phase = excluded.phase,
                     style = excluded.style,
@@ -1904,6 +3267,7 @@ class StateStore:
                     balance = excluded.balance,
                     equity = excluded.equity,
                     current_open_risk = excluded.current_open_risk,
+                    reserved_open_risk = excluded.reserved_open_risk,
                     open_positions_count = excluded.open_positions_count,
                     pending_orders_count = excluded.pending_orders_count,
                     as_of = excluded.as_of,
@@ -1924,6 +3288,7 @@ class StateStore:
                     str(balance),
                     str(equity),
                     str(current_open_risk),
+                    str(reserved_open_risk),
                     open_positions_count,
                     pending_orders_count,
                     as_of.isoformat(),
@@ -1941,6 +3306,7 @@ class StateStore:
         self,
         row: sqlite3.Row,
         now: datetime | None = None,
+        reserved_open_risk: Decimal | None = None,
     ) -> StoredAccount:
         now = now or datetime.now(timezone.utc)
         as_of = datetime.fromisoformat(row["as_of"])
@@ -1950,6 +3316,14 @@ class StateStore:
                 (now - as_of.astimezone(timezone.utc)).total_seconds()
             ),
         )
+        if reserved_open_risk is None:
+            reserved_open_risk = Decimal(
+                row["reserved_open_risk"]
+                if "reserved_open_risk" in row.keys()
+                else "0"
+            )
+        if not reserved_open_risk.is_finite() or reserved_open_risk < ZERO:
+            raise ValueError("persisted reserved open risk is invalid")
         return StoredAccount(
             account_id=row["account_id"],
             account_type=AccountType(row["account_type"]),
@@ -1965,6 +3339,7 @@ class StateStore:
                 balance=Decimal(row["balance"]),
                 equity=Decimal(row["equity"]),
                 current_open_risk=Decimal(row["current_open_risk"]),
+                reserved_open_risk=reserved_open_risk,
                 as_of=as_of,
                 data_age_seconds=age,
                 data_uncertain=bool(row["data_uncertain"]),
@@ -1984,14 +3359,22 @@ class StateStore:
         )
 
     def get_account(self, account_id: str) -> StoredAccount:
+        now = datetime.now(timezone.utc)
         with self._lock, self._connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM accounts WHERE account_id = ?",
-                (account_id,),
-            ).fetchone()
+            connection.execute("BEGIN IMMEDIATE")
+            row, reserved_open_risk = self._load_account_connection(
+                connection,
+                account_id,
+                now,
+            )
+            connection.commit()
         if row is None:
             raise KeyError(f"unknown account_id: {account_id}")
-        return self._stored_account_from_row(row)
+        return self._stored_account_from_row(
+            row,
+            now=now,
+            reserved_open_risk=reserved_open_risk,
+        )
 
     def _frequency_from_connection(
         self,
@@ -2078,15 +3461,27 @@ class StateStore:
         occurred_at: datetime,
         evaluator: Callable[[StoredAccount, FrequencyState], Mapping[str, Any]],
         block_on_unknown_execution: bool = False,
+        reservation_risk: Decimal = ZERO,
     ) -> dict[str, Any]:
         """Evaluate and reserve frequency state atomically for one request."""
 
+        if (
+            not isinstance(reservation_risk, Decimal)
+            or not reservation_risk.is_finite()
+            or reservation_risk < ZERO
+        ):
+            raise ValueError("reservation_risk must be a finite non-negative decimal")
         now = datetime.now(timezone.utc)
         with self._lock, self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._promote_expired_pending_reservations_connection(
+                connection,
+                account_id,
+                now,
+            )
             existing = connection.execute(
                 """
-                SELECT request_hash, response_json
+                SELECT request_hash, response_json, allowed, created_at
                 FROM decisions
                 WHERE account_id = ? AND request_id = ?
                 """,
@@ -2097,7 +3492,63 @@ class StateStore:
                     raise ValueError(
                         "request_id has already been used with different content"
                     )
-                return json.loads(existing["response_json"])
+                execution = connection.execute(
+                    """
+                    SELECT outcome
+                    FROM executions
+                    WHERE account_id = ? AND request_id = ?
+                    """,
+                    (account_id, request_id),
+                ).fetchone()
+                if execution is not None:
+                    outcome = str(execution["outcome"])
+                    if outcome == "unknown":
+                        response = self._blocked_replay_response(
+                            existing["response_json"],
+                            code="REJECT_UNKNOWN_EXECUTION",
+                            reason=(
+                                "an execution outcome is unresolved; reconcile "
+                                "the platform order before retrying"
+                            ),
+                            execution_outcome=outcome,
+                        )
+                    elif outcome in {"success", "failure"}:
+                        response = self._blocked_replay_response(
+                            existing["response_json"],
+                            code="REJECT_REQUEST_REPLAY",
+                            reason=(
+                                "request_id has already been reconciled; use a "
+                                "new request_id for another submission"
+                            ),
+                            execution_outcome=outcome,
+                        )
+                    else:
+                        raise ValueError(
+                            "persisted execution outcome is invalid"
+                        )
+                    connection.commit()
+                    return response
+                try:
+                    response = json.loads(existing["response_json"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        "persisted decision response is invalid"
+                    ) from exc
+                if not isinstance(response, dict):
+                    raise ValueError(
+                        "persisted decision response must be an object"
+                    )
+                if bool(existing["allowed"]):
+                    response = self._blocked_replay_response(
+                        existing["response_json"],
+                        code="REJECT_REQUEST_REPLAY",
+                        reason=(
+                            "request_id already has an approval; reconcile the "
+                            "platform execution result before retrying"
+                        ),
+                    )
+                connection.commit()
+                return response
 
             row = connection.execute(
                 "SELECT * FROM accounts WHERE account_id = ?",
@@ -2105,7 +3556,18 @@ class StateStore:
             ).fetchone()
             if row is None:
                 raise KeyError(f"unknown account_id: {account_id}")
+            reserved_open_risk = self._refresh_reserved_risk_connection(
+                connection,
+                account_id,
+            )
             account = self._stored_account_from_row(row, now=now)
+            account = replace(
+                account,
+                snapshot=replace(
+                    account.snapshot,
+                    reserved_open_risk=reserved_open_risk,
+                ),
+            )
             if account.ftmo_day != ftmo_day_key(
                 occurred_at,
                 self.day_timezone,
@@ -2128,10 +3590,17 @@ class StateStore:
                 unknown_row = connection.execute(
                     """
                     SELECT COUNT(*) AS count
-                    FROM executions
-                    WHERE account_id = ? AND outcome = 'unknown'
+                    FROM (
+                        SELECT request_id
+                        FROM executions
+                        WHERE account_id = ? AND outcome = 'unknown'
+                        UNION
+                        SELECT request_id
+                        FROM risk_reservations
+                        WHERE account_id = ? AND status = 'unknown'
+                    )
                     """,
-                    (account_id,),
+                    (account_id, account_id),
                 ).fetchone()
                 unknown_count = (
                     int(unknown_row["count"])
@@ -2147,6 +3616,46 @@ class StateStore:
                         "the platform order before adding risk",
                     ]
                     response["unknown_execution_count"] = unknown_count
+            allowed = bool(response.get("decision", {}).get("allowed"))
+            if allowed and reservation_risk > ZERO:
+                connection.execute(
+                    """
+                    INSERT INTO risk_reservations (
+                        account_id, request_id, request_hash, action, symbol,
+                        reserved_risk, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (
+                        account_id,
+                        request_id,
+                        request_hash,
+                        action,
+                        symbol.upper(),
+                        str(reservation_risk),
+                        now.isoformat(),
+                        now.isoformat(),
+                    ),
+                )
+                reserved_total = self._refresh_reserved_risk_connection(
+                    connection,
+                    account_id,
+                )
+                response["risk_reservation"] = {
+                    "status": "pending",
+                    "reserved_risk": str(reservation_risk),
+                }
+                account_payload = response.get("account")
+                if isinstance(account_payload, dict):
+                    current_open_risk = account_payload.get(
+                        "current_open_risk",
+                        "0",
+                    )
+                    account_payload["reserved_open_risk"] = str(
+                        reserved_total
+                    )
+                    account_payload["effective_open_risk"] = str(
+                        Decimal(str(current_open_risk)) + reserved_total
+                    )
             response_json = json.dumps(
                 response,
                 ensure_ascii=True,
@@ -2157,8 +3666,8 @@ class StateStore:
                 """
                 INSERT INTO decisions (
                     account_id, request_id, request_hash, action, symbol,
-                    allowed, response_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    allowed, reservation_risk, response_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account_id,
@@ -2166,7 +3675,8 @@ class StateStore:
                     request_hash,
                     action,
                     symbol.upper(),
-                    int(bool(response.get("decision", {}).get("allowed"))),
+                    int(allowed),
+                    str(reservation_risk),
                     response_json,
                     now.isoformat(),
                 ),
@@ -2180,7 +3690,7 @@ class StateStore:
                 request_id=request_id,
                 detail=str(response.get("decision", {}).get("code", "")),
             )
-            if response.get("decision", {}).get("allowed"):
+            if allowed:
                 if action == "open":
                     self._insert_activity_connection(
                         connection,
@@ -2218,6 +3728,10 @@ class StateStore:
     ) -> dict[str, Any]:
         """Record an execution result idempotently."""
 
+        if outcome not in {"success", "failure", "unknown"}:
+            raise ValueError("outcome must be success, failure, or unknown")
+        normalized_symbol = symbol.upper()
+        execution_at = datetime.now(timezone.utc)
         with self._lock, self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
@@ -2232,12 +3746,17 @@ class StateStore:
             if existing is not None:
                 if (
                     existing["action"] != action
-                    or existing["symbol"] != symbol.upper()
+                    or existing["symbol"] != normalized_symbol
                 ):
                     raise ValueError(
                         "execution request_id has already been used for a "
                         "different action or symbol"
                     )
+                if existing["outcome"] == "unknown" and outcome == "unknown":
+                    # Unknown is sticky and non-releasing. A late report after
+                    # lease reconciliation may carry different diagnostics,
+                    # but it must return the existing locked result.
+                    return json.loads(existing["response_json"])
                 if existing["outcome"] == "unknown" and outcome in {
                     "success",
                     "failure",
@@ -2263,7 +3782,7 @@ class StateStore:
                 raise ValueError(
                     "execution result does not reference a known evaluation"
                 )
-            if decision["action"] != action or decision["symbol"] != symbol.upper():
+            if decision["action"] != action or decision["symbol"] != normalized_symbol:
                 raise ValueError(
                     "execution result does not match the evaluated request"
                 )
@@ -2272,12 +3791,27 @@ class StateStore:
                     "execution result cannot be recorded for a rejected request"
                 )
 
+            reservation = connection.execute(
+                """
+                SELECT reserved_risk, status
+                FROM risk_reservations
+                WHERE account_id = ? AND request_id = ?
+                """,
+                (account_id, request_id),
+            ).fetchone()
             reservation_kind = (
                 action
                 if outcome == "failure" and action in {"open", "modify"}
                 else None
             )
-            reservation_released = reservation_kind is not None
+            reservation_released = (
+                reservation is not None and reservation_kind is not None
+            )
+            reservation_committed = (
+                reservation is not None
+                and outcome == "success"
+                and action in {"open", "modify"}
+            )
             if reservation_kind is not None:
                 connection.execute(
                     """
@@ -2286,6 +3820,37 @@ class StateStore:
                     """,
                     (account_id, reservation_kind, request_id),
                 )
+            if reservation_released:
+                connection.execute(
+                    "DELETE FROM risk_reservations "
+                    "WHERE account_id = ? AND request_id = ?",
+                    (account_id, request_id),
+                )
+            elif reservation_committed:
+                connection.execute(
+                    """
+                    UPDATE risk_reservations
+                    SET status = 'committed', execution_at = ?, updated_at = ?
+                    WHERE account_id = ? AND request_id = ?
+                    """,
+                    (
+                        execution_at.isoformat(),
+                        execution_at.isoformat(),
+                        account_id,
+                        request_id,
+                    ),
+                )
+            elif reservation is not None and outcome == "unknown":
+                connection.execute(
+                    """
+                    UPDATE risk_reservations
+                    SET status = 'unknown', updated_at = ?
+                    WHERE account_id = ? AND request_id = ?
+                    """,
+                    (execution_at.isoformat(), account_id, request_id),
+                )
+            if reservation is not None:
+                self._refresh_reserved_risk_connection(connection, account_id)
             response = {
                 "ok": True,
                 "account_id": account_id,
@@ -2293,6 +3858,7 @@ class StateStore:
                 "execution_recorded": True,
                 "outcome": outcome,
                 "reservation_released": reservation_released,
+                "reservation_committed": reservation_committed,
                 "resolved_unknown": resolving_unknown,
             }
             response_json = json.dumps(
@@ -2313,7 +3879,7 @@ class StateStore:
                         request_hash,
                         outcome,
                         response_json,
-                        datetime.now(timezone.utc).isoformat(),
+                        execution_at.isoformat(),
                         account_id,
                         request_id,
                     ),
@@ -2340,10 +3906,10 @@ class StateStore:
                         request_id,
                         request_hash,
                         action,
-                        symbol.upper(),
+                        normalized_symbol,
                         outcome,
                         response_json,
-                        datetime.now(timezone.utc).isoformat(),
+                        execution_at.isoformat(),
                     ),
                 )
             self._insert_activity_connection(

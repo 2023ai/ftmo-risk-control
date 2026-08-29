@@ -1,6 +1,8 @@
 import os
 import stat
+import sqlite3
 import tempfile
+from contextlib import closing
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -90,6 +92,60 @@ class BackupRestoreTests(unittest.TestCase):
                 restore(self.backup, self.destination)
         finally:
             server.server_close()
+
+    def test_restore_rejects_incomplete_backup_without_creating_destination(self):
+        incomplete = self.directory / "incomplete.db"
+        with closing(sqlite3.connect(incomplete)) as connection:
+            connection.execute(
+                "CREATE TABLE accounts (account_id TEXT PRIMARY KEY)"
+            )
+            connection.execute(
+                "CREATE TABLE calendar_snapshots (calendar_type TEXT PRIMARY KEY)"
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "required risk state tables"):
+            restore(incomplete, self.destination)
+        self.assertFalse(self.destination.exists())
+
+    def test_restore_rejects_backup_without_risk_reservations(self):
+        incomplete = self.directory / "missing-reservations.db"
+        with closing(sqlite3.connect(self.backup)) as source_connection, closing(
+            sqlite3.connect(incomplete)
+        ) as target_connection:
+            source_connection.backup(target_connection)
+            target_connection.commit()
+        with closing(sqlite3.connect(incomplete)) as connection:
+            connection.execute("DROP TABLE risk_reservations")
+            connection.commit()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "risk_reservations",
+        ):
+            restore(incomplete, self.destination)
+        self.assertFalse(self.destination.exists())
+
+    def test_restore_rejects_symbolic_link_destination(self):
+        outside = self.directory / "outside.db"
+        outside.write_bytes(b"do not replace")
+        os.symlink(outside, self.destination)
+
+        with self.assertRaisesRegex(ValueError, "symbolic link"):
+            restore(self.backup, self.destination)
+        self.assertEqual(outside.read_bytes(), b"do not replace")
+
+    def test_restore_rejects_symbolic_link_parent_directory(self):
+        real_parent = self.directory / "real-destination"
+        real_parent.mkdir()
+        linked_parent = self.directory / "linked-destination"
+        os.symlink(real_parent, linked_parent)
+        target = linked_parent / "destination.db"
+
+        with self.assertRaisesRegex(ValueError, "symbolic link"):
+            restore(self.backup, target)
+        self.assertFalse(target.exists())
+        self.assertEqual(list(real_parent.iterdir()), [])
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from src.risk_engine import (
     RuleProfile,
     ftmo_day_key,
 )
-from src.state_store import StateStore
+from src.state_store import CURRENT_SCHEMA_VERSION, StateStore
 
 
 UTC = timezone.utc
@@ -34,6 +34,35 @@ class StateStoreTests(unittest.TestCase):
     def test_database_permissions_are_owner_only(self):
         mode = stat.S_IMODE(os.stat(self.path).st_mode)
         self.assertEqual(mode, 0o600)
+
+    def test_database_path_expands_user_and_is_absolute(self):
+        self.store.close()
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            try:
+                os.chdir(cwd)
+                with patch.dict(os.environ, {"HOME": home}):
+                    store = StateStore("~/.ftmo/risk.db")
+                    try:
+                        expected = Path(home) / ".ftmo" / "risk.db"
+                        self.assertTrue(Path(store.path).is_absolute())
+                        self.assertEqual(Path(store.path), Path(os.path.abspath(expected)))
+                        self.assertTrue(expected.is_file())
+                        self.assertFalse((Path(cwd) / "~").exists())
+                    finally:
+                        store.close()
+            finally:
+                os.chdir(original_cwd)
+
+    def test_database_rejects_symbolic_link_parent_directory(self):
+        self.store.close()
+        real_parent = Path(self.tempdir.name) / "real-state"
+        real_parent.mkdir()
+        linked_parent = Path(self.tempdir.name) / "linked-state"
+        os.symlink(real_parent, linked_parent)
+        with self.assertRaisesRegex(ValueError, "symbolic link"):
+            StateStore(linked_parent / "risk.db")
+        self.assertEqual(list(real_parent.iterdir()), [])
 
     def test_database_integrity_scan_is_cached_for_one_minute(self):
         with patch(
@@ -55,6 +84,56 @@ class StateStoreTests(unittest.TestCase):
                 self.store._last_integrity_check_monotonic,
                 161.0,
             )
+
+    def test_current_schema_missing_required_table_is_rejected(self):
+        self.store.close()
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("DROP TABLE risk_reservations")
+            connection.execute(
+                f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"
+            )
+            connection.commit()
+        with self.assertRaisesRegex(ValueError, "risk_reservations"):
+            StateStore(self.path)
+
+    def test_current_schema_missing_required_column_is_rejected(self):
+        self.store.close()
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("DROP TABLE accounts")
+            connection.execute(
+                "CREATE TABLE accounts (account_id TEXT PRIMARY KEY)"
+            )
+            connection.execute(
+                f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"
+            )
+            connection.commit()
+        with self.assertRaisesRegex(ValueError, "accounts.account_type"):
+            StateStore(self.path)
+
+    def test_newer_schema_version_is_rejected(self):
+        self.store.close()
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION + 1}"
+            )
+            connection.commit()
+        with self.assertRaisesRegex(ValueError, "newer than this service"):
+            StateStore(self.path)
+
+    def test_database_health_rejects_schema_version_tampering(self):
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("PRAGMA user_version = 0")
+            connection.commit()
+        self.assertFalse(self.store.database_healthy())
+
+    def test_backup_rejects_unhealthy_schema(self):
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("PRAGMA user_version = 0")
+            connection.commit()
+        output = Path(self.tempdir.name) / "backups" / "unhealthy.db"
+        with self.assertRaisesRegex(ValueError, "not healthy"):
+            self.store.backup_to(output)
+        self.assertFalse(output.exists())
 
     def test_calendar_snapshot_survives_restart(self):
         fetched_at = self.now.replace(microsecond=0)
@@ -311,6 +390,38 @@ class StateStoreTests(unittest.TestCase):
             )
         )
 
+    def test_credential_timestamp_inputs_must_be_timezone_aware(self):
+        self.sync()
+        naive = datetime(2026, 8, 29, 12, 0, 0)
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            self.store.create_account_credential(
+                account_id="mt5-10001",
+                scopes=("trade:evaluate",),
+                not_before=naive,
+                expires_at=self.now + timedelta(hours=1),
+                now=self.now,
+            )
+        record, _ = self.store.create_account_credential(
+            account_id="mt5-10001",
+            scopes=("trade:evaluate",),
+            not_before=self.now,
+            expires_at=self.now + timedelta(hours=1),
+            now=self.now,
+        )
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            self.store.revoke_account_credential(
+                record.credential_id,
+                revoked_at=naive,
+            )
+        self.assertIsNone(
+            self.store.authenticate_account_credential(
+                account_id="mt5-10001",
+                secret="invalid",
+                scope="trade:evaluate",
+                now=naive,
+            )
+        )
+
     def test_legacy_admin_wildcard_credential_is_not_authorized(self):
         record, secret = self.store.create_account_credential(
             account_id="legacy-wildcard",
@@ -380,6 +491,211 @@ class StateStoreTests(unittest.TestCase):
             )
         )
 
+    def test_credential_revocation_never_moves_backwards(self):
+        record, secret = self.store.create_account_credential(
+            account_id="revocation-account",
+            scopes=("trade:evaluate",),
+            not_before=self.now,
+            expires_at=self.now + timedelta(hours=1),
+            now=self.now,
+        )
+        self.store.revoke_account_credential(
+            record.credential_id,
+            revoked_at=self.now + timedelta(minutes=10),
+        )
+        self.store.revoke_account_credential(
+            record.credential_id,
+            revoked_at=self.now + timedelta(minutes=1),
+        )
+        self.assertIsNotNone(
+            self.store.authenticate_account_credential(
+                account_id="revocation-account",
+                secret=secret,
+                scope="trade:evaluate",
+                now=self.now + timedelta(minutes=5),
+            )
+        )
+        self.assertIsNone(
+            self.store.authenticate_account_credential(
+                account_id="revocation-account",
+                secret=secret,
+                scope="trade:evaluate",
+                now=self.now + timedelta(minutes=11),
+            )
+        )
+
+    def test_rotation_never_shortens_a_future_revocation(self):
+        record, secret = self.store.create_account_credential(
+            account_id="rotation-revocation-account",
+            scopes=("trade:evaluate",),
+            not_before=self.now,
+            expires_at=self.now + timedelta(hours=1),
+            now=self.now,
+        )
+        self.store.revoke_account_credential(
+            record.credential_id,
+            revoked_at=self.now + timedelta(minutes=10),
+        )
+        self.store.rotate_account_credential(
+            credential_id=record.credential_id,
+            scopes=None,
+            not_before=self.now + timedelta(minutes=5),
+            expires_at=self.now + timedelta(hours=1),
+            overlap_seconds=0,
+            now=self.now + timedelta(minutes=5),
+        )
+        self.assertIsNotNone(
+            self.store.authenticate_account_credential(
+                account_id="rotation-revocation-account",
+                secret=secret,
+                scope="trade:evaluate",
+                now=self.now + timedelta(minutes=9),
+            )
+        )
+        self.assertIsNone(
+            self.store.authenticate_account_credential(
+                account_id="rotation-revocation-account",
+                secret=secret,
+                scope="trade:evaluate",
+                now=self.now + timedelta(minutes=10),
+            )
+        )
+
+    def test_rotation_does_not_reactivate_an_already_revoked_credential(self):
+        record, secret = self.store.create_account_credential(
+            account_id="already-revoked-account",
+            scopes=("trade:evaluate",),
+            not_before=self.now,
+            expires_at=self.now + timedelta(hours=1),
+            now=self.now,
+        )
+        self.store.revoke_account_credential(
+            record.credential_id,
+            revoked_at=self.now - timedelta(seconds=1),
+        )
+        self.store.rotate_account_credential(
+            credential_id=record.credential_id,
+            scopes=None,
+            not_before=self.now,
+            expires_at=self.now + timedelta(hours=1),
+            overlap_seconds=60,
+            now=self.now,
+        )
+        self.assertIsNone(
+            self.store.authenticate_account_credential(
+                account_id="already-revoked-account",
+                secret=secret,
+                scope="trade:evaluate",
+                now=self.now,
+            )
+        )
+
+    def test_rotation_rejects_explicit_empty_scope_list(self):
+        record, _ = self.store.create_account_credential(
+            account_id="empty-rotation-scope",
+            scopes=("trade:evaluate",),
+            not_before=self.now,
+            expires_at=self.now + timedelta(hours=1),
+            now=self.now,
+        )
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            self.store.rotate_account_credential(
+                credential_id=record.credential_id,
+                scopes=[],
+                not_before=self.now,
+                expires_at=self.now + timedelta(hours=1),
+                now=self.now,
+            )
+
+    def test_integrity_audit_detects_missing_allowed_open_reservation(self):
+        self.sync()
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """
+                INSERT INTO decisions (
+                    account_id, request_id, request_hash, action, symbol,
+                    allowed, reservation_risk, response_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "mt5-10001",
+                    "orphan-allowed-open",
+                    "a" * 64,
+                    "open",
+                    "EURUSD",
+                    1,
+                    "100",
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "decision": {
+                                "code": "ALLOW",
+                                "allowed": True,
+                            },
+                        }
+                    ),
+                    self.now.isoformat(),
+                ),
+            )
+            connection.commit()
+        issues = self.store.risk_state_integrity_issues()
+        self.assertTrue(
+            any("has no execution reservation" in item for item in issues)
+        )
+
+    def test_integrity_audit_detects_reservation_risk_mismatch(self):
+        self.sync()
+        self.store.evaluate_and_reserve(
+            account_id="mt5-10001",
+            request_id="risk-mismatch",
+            request_hash="b" * 64,
+            action="open",
+            symbol="EURUSD",
+            occurred_at=self.now,
+            evaluator=lambda account, frequency: {
+                "ok": True,
+                "decision": {
+                    "code": "ALLOW",
+                    "allowed": True,
+                    "reasons": [],
+                },
+            },
+            reservation_risk=Decimal("100"),
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                "UPDATE decisions SET reservation_risk = '200' "
+                "WHERE account_id = 'mt5-10001' "
+                "AND request_id = 'risk-mismatch'"
+            )
+            connection.commit()
+        issues = self.store.risk_state_integrity_issues()
+        self.assertTrue(
+            any("does not match its reservation risk" in item for item in issues)
+        )
+
+    def test_rejected_risk_increasing_decision_does_not_fail_integrity_audit(self):
+        self.sync()
+        response = self.store.evaluate_and_reserve(
+            account_id="mt5-10001",
+            request_id="rejected-risk-request",
+            request_hash="c" * 64,
+            action="open",
+            symbol="EURUSD",
+            occurred_at=self.now,
+            evaluator=lambda account, frequency: {
+                "ok": True,
+                "decision": {
+                    "code": "REJECT_UNKNOWN_EXECUTION",
+                    "allowed": False,
+                    "reasons": ["unknown execution"],
+                },
+            },
+            reservation_risk=Decimal("100"),
+        )
+        self.assertFalse(response["decision"]["allowed"])
+        self.assertEqual(self.store.risk_state_integrity_issues(), [])
+
     def test_online_backup_is_owner_only_and_readable(self):
         self.sync()
         output = Path(self.tempdir.name) / "backups" / "risk.db"
@@ -390,6 +706,53 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(restored.snapshot.equity, Decimal("99800"))
         metrics = self.store.backup_metrics()
         self.assertEqual(metrics["backup_success"], 1)
+
+    def test_backup_rejects_symbolic_link_destination(self):
+        self.sync()
+        outside = Path(self.tempdir.name) / "outside.db"
+        outside.write_bytes(b"do not replace")
+        destination = Path(self.tempdir.name) / "backup-link.db"
+        os.symlink(outside, destination)
+        with self.assertRaisesRegex(ValueError, "symbolic link"):
+            self.store.backup_to(destination)
+        self.assertEqual(outside.read_bytes(), b"do not replace")
+
+    def test_backup_rejects_symbolic_link_parent_directory(self):
+        self.sync()
+        real_parent = Path(self.tempdir.name) / "real-parent"
+        real_parent.mkdir()
+        linked_parent = Path(self.tempdir.name) / "linked-parent"
+        os.symlink(real_parent, linked_parent)
+        with self.assertRaisesRegex(ValueError, "symbolic link"):
+            self.store.backup_to(linked_parent / "backup.db")
+        self.assertEqual(list(real_parent.iterdir()), [])
+
+    def test_backup_restores_existing_sidecars_when_replace_fails(self):
+        self.sync()
+        output = Path(self.tempdir.name) / "backups" / "rollback.db"
+        output.parent.mkdir()
+        output.write_bytes(b"old database")
+        wal = Path(str(output) + "-wal")
+        shm = Path(str(output) + "-shm")
+        wal.write_bytes(b"old wal")
+        shm.write_bytes(b"old shm")
+        real_replace = os.replace
+
+        def replace_or_fail(source, destination):
+            if Path(destination) == output:
+                raise OSError("simulated atomic replace failure")
+            return real_replace(source, destination)
+
+        with patch("src.state_store.os.replace", side_effect=replace_or_fail):
+            with self.assertRaisesRegex(OSError, "atomic replace"):
+                self.store.backup_to(output)
+        self.assertEqual(output.read_bytes(), b"old database")
+        self.assertEqual(wal.read_bytes(), b"old wal")
+        self.assertEqual(shm.read_bytes(), b"old shm")
+        self.assertEqual(
+            list(output.parent.glob(f".{output.name}.*.tmp")),
+            [],
+        )
 
     def test_backup_age_uses_last_success_after_failed_attempt(self):
         output = Path(self.tempdir.name) / "backups" / "risk.db"
@@ -403,6 +766,44 @@ class StateStoreTests(unittest.TestCase):
         self.assertIsNotNone(metrics["last_backup_at"])
         self.assertFalse(metrics["last_backup_success"])
         self.assertIsNotNone(metrics["last_backup_attempt_at"])
+
+    def test_backup_telemetry_failure_does_not_hide_installed_backup(self):
+        self.sync()
+        output = Path(self.tempdir.name) / "backups" / "telemetry.db"
+        with patch.object(
+            self.store,
+            "record_backup_event",
+            side_effect=RuntimeError("telemetry unavailable"),
+        ):
+            result = self.store.backup_to(output)
+        self.assertEqual(result, output.resolve())
+        self.assertTrue(output.is_file())
+
+    def test_backup_temp_file_is_cleaned_when_install_fails(self):
+        self.sync()
+        output = Path(self.tempdir.name) / "backups" / "setup.db"
+        with patch(
+            "src.state_store.os.replace",
+            side_effect=OSError("no replace"),
+        ):
+            with self.assertRaises(OSError):
+                self.store.backup_to(output)
+        leftovers = list(output.parent.glob(f".{output.name}.*.tmp"))
+        self.assertEqual(leftovers, [])
+
+    def test_database_health_fails_closed_for_unsafe_sidecar(self):
+        self.sync()
+        self.store.close()
+        outside = Path(self.tempdir.name) / "outside-wal"
+        outside.write_text("not sqlite wal", encoding="ascii")
+        sidecar = Path(str(self.path) + "-wal")
+        sidecar.unlink(missing_ok=True)
+        os.symlink(outside, sidecar)
+        self.assertFalse(self.store.database_healthy())
+
+    def test_normal_execution_state_has_no_integrity_issues(self):
+        self.sync()
+        self.assertEqual(self.store.risk_state_integrity_issues(), [])
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -770,6 +1171,231 @@ class StateStoreTests(unittest.TestCase):
             bootstrap_highest_settled_balance=None,
         )
         self.assertEqual(funded.phase, AccountPhase.FTMO_ACCOUNT)
+
+    def test_two_step_phase_cannot_skip_verification(self):
+        self.sync(account_type=AccountType.TWO_STEP)
+        with self.assertRaisesRegex(ValueError, "skip verification"):
+            self.sync(
+                account_type=AccountType.TWO_STEP,
+                phase=AccountPhase.FTMO_ACCOUNT,
+                bootstrap_day_start_balance=None,
+                bootstrap_highest_settled_balance=None,
+            )
+
+    def test_expired_pending_reservation_becomes_unknown(self):
+        self.sync()
+        self.store.evaluate_and_reserve(
+            account_id="mt5-10001",
+            request_id="lease-r1",
+            request_hash="a" * 64,
+            action="open",
+            symbol="EURUSD",
+            occurred_at=self.now,
+            evaluator=lambda account, frequency: {
+                "ok": True,
+                "decision": {
+                    "code": "ALLOW",
+                    "allowed": True,
+                    "reasons": [],
+                },
+            },
+            block_on_unknown_execution=True,
+            reservation_risk=Decimal("100"),
+        )
+        expired_at = (
+            datetime.now(UTC) - timedelta(minutes=2)
+        ).isoformat()
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """
+                UPDATE risk_reservations
+                SET created_at = ?, updated_at = ?
+                WHERE account_id = 'mt5-10001' AND request_id = 'lease-r1'
+                """,
+                (expired_at, expired_at),
+            )
+            connection.commit()
+
+        self.assertEqual(
+            self.store.reconcile_expired_reservations("mt5-10001"),
+            1,
+        )
+        self.assertEqual(self.store.unknown_execution_count("mt5-10001"), 1)
+        reservation = self.store.list_risk_reservations(
+            "mt5-10001",
+            unresolved_only=True,
+        )
+        self.assertEqual(reservation[0]["status"], "unknown")
+        resolved = self.store.record_execution(
+            account_id="mt5-10001",
+            request_id="lease-r1",
+            request_hash="b" * 64,
+            action="open",
+            symbol="EURUSD",
+            occurred_at=datetime.now(UTC),
+            outcome="failure",
+            detail="reconciled as rejected",
+        )
+        self.assertTrue(resolved["reservation_released"])
+        self.assertEqual(self.store.unknown_execution_count("mt5-10001"), 0)
+
+    def test_late_unknown_report_after_lease_expiry_remains_idempotently_locked(self):
+        self.sync()
+        self.store.evaluate_and_reserve(
+            account_id="mt5-10001",
+            request_id="late-unknown-r1",
+            request_hash="a" * 64,
+            action="open",
+            symbol="EURUSD",
+            occurred_at=self.now,
+            evaluator=lambda account, frequency: {
+                "ok": True,
+                "decision": {
+                    "code": "ALLOW",
+                    "allowed": True,
+                    "reasons": [],
+                },
+            },
+            block_on_unknown_execution=True,
+            reservation_risk=Decimal("100"),
+        )
+        expired_at = (
+            datetime.now(UTC) - timedelta(minutes=2)
+        ).isoformat()
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """
+                UPDATE risk_reservations
+                SET created_at = ?, updated_at = ?
+                WHERE account_id = 'mt5-10001' AND request_id = 'late-unknown-r1'
+                """,
+                (expired_at, expired_at),
+            )
+            connection.commit()
+        self.assertEqual(
+            self.store.reconcile_expired_reservations("mt5-10001"),
+            1,
+        )
+
+        late = self.store.record_execution(
+            account_id="mt5-10001",
+            request_id="late-unknown-r1",
+            request_hash="b" * 64,
+            action="open",
+            symbol="EURUSD",
+            occurred_at=datetime.now(UTC),
+            outcome="unknown",
+            detail="late timeout with a different diagnostic status",
+        )
+        self.assertEqual(late["outcome"], "unknown")
+        self.assertFalse(late["reservation_released"])
+        self.assertEqual(
+            self.store.unknown_execution_count("mt5-10001"),
+            1,
+        )
+        self.assertEqual(
+            self.store.list_risk_reservations(
+                "mt5-10001",
+                unresolved_only=True,
+            )[0]["status"],
+            "unknown",
+        )
+
+    def test_account_read_reconciles_materialized_reservation_cache(self):
+        self.sync()
+        self.store.evaluate_and_reserve(
+            account_id="mt5-10001",
+            request_id="cache-r1",
+            request_hash="e" * 64,
+            action="open",
+            symbol="EURUSD",
+            occurred_at=self.now,
+            evaluator=lambda account, frequency: {
+                "ok": True,
+                "decision": {
+                    "code": "ALLOW",
+                    "allowed": True,
+                    "reasons": [],
+                },
+            },
+            reservation_risk=Decimal("100"),
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                "UPDATE accounts SET reserved_open_risk = '0' "
+                "WHERE account_id = 'mt5-10001'"
+            )
+            connection.commit()
+        account = self.store.get_account("mt5-10001")
+        self.assertEqual(
+            account.snapshot.reserved_open_risk,
+            Decimal("100"),
+        )
+
+    def test_stale_sync_cannot_release_committed_reservation(self):
+        self.sync()
+        self.store.evaluate_and_reserve(
+            account_id="mt5-10001",
+            request_id="ordering-r1",
+            request_hash="c" * 64,
+            action="open",
+            symbol="EURUSD",
+            occurred_at=self.now,
+            evaluator=lambda account, frequency: {
+                "ok": True,
+                "decision": {
+                    "code": "ALLOW",
+                    "allowed": True,
+                    "reasons": [],
+                },
+            },
+            reservation_risk=Decimal("100"),
+        )
+        self.store.record_execution(
+            account_id="mt5-10001",
+            request_id="ordering-r1",
+            request_hash="d" * 64,
+            action="open",
+            symbol="EURUSD",
+            occurred_at=datetime.now(UTC),
+            outcome="success",
+            detail="filled",
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            execution_at = connection.execute(
+                """
+                SELECT created_at FROM executions
+                WHERE account_id = 'mt5-10001' AND request_id = 'ordering-r1'
+                """
+            ).fetchone()[0]
+            stored_as_of = (
+                datetime.fromisoformat(execution_at) + timedelta(seconds=10)
+            ).isoformat()
+            connection.execute(
+                """
+                UPDATE accounts SET as_of = ? WHERE account_id = 'mt5-10001'
+                """,
+                (stored_as_of,),
+            )
+            connection.commit()
+        stale_as_of = datetime.fromisoformat(execution_at) + timedelta(seconds=1)
+        with self.assertRaisesRegex(ValueError, "move backwards"):
+            self.store.sync_account(
+                account_id="mt5-10001",
+                account_type=AccountType.ONE_STEP,
+                phase=AccountPhase.EVALUATION,
+                style=AccountStyle.STANDARD,
+                initial_capital=Decimal("100000"),
+                balance=Decimal("100000"),
+                equity=Decimal("100000"),
+                current_open_risk=Decimal("0"),
+                as_of=stale_as_of,
+                received_at=datetime.now(UTC),
+            )
+        self.assertEqual(
+            self.store.risk_reservation_metrics("mt5-10001")["committed"],
+            1,
+        )
 
     def test_failed_execution_can_release_open_reservation(self):
         self.sync()

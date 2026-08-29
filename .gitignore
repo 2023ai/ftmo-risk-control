@@ -23,3 +23,6 @@ backups/
 *.cer
 platform/mt5/*.ex5
 platform/mt5/*.log
+*.ex4
+*.tmp
+*.restore
