@@ -135,6 +135,39 @@ class StateStoreTests(unittest.TestCase):
             self.store.backup_to(output)
         self.assertFalse(output.exists())
 
+    def test_rule_config_fingerprint_cannot_change_within_one_version(self):
+        first = "a" * 64
+        second = "b" * 64
+
+        self.assertTrue(
+            self.store.pin_rule_config_fingerprint(
+                rule_version="test-rules-v1",
+                config_fingerprint=first,
+                now=self.now,
+            )
+        )
+        self.assertTrue(
+            self.store.pin_rule_config_fingerprint(
+                rule_version="test-rules-v1",
+                config_fingerprint=first,
+                now=self.now + timedelta(seconds=1),
+            )
+        )
+        self.assertFalse(
+            self.store.pin_rule_config_fingerprint(
+                rule_version="test-rules-v1",
+                config_fingerprint=second,
+                now=self.now + timedelta(seconds=2),
+            )
+        )
+        self.assertTrue(
+            self.store.pin_rule_config_fingerprint(
+                rule_version="test-rules-v2",
+                config_fingerprint=second,
+                now=self.now + timedelta(seconds=3),
+            )
+        )
+
     def test_calendar_snapshot_survives_restart(self):
         fetched_at = self.now.replace(microsecond=0)
         payload = [

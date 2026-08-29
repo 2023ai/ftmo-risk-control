@@ -27,6 +27,7 @@ X-Account-Credential: <one-account-secret>
   "ok": true,
   "service": "ftmo-risk-api",
   "rule_version": "ftmo-v5-2026-08-26",
+  "rule_config_consistent": true,
   "ready_for_risk_increase": true,
   "readiness_reasons": [],
   "news_data_age_seconds": 0,
@@ -41,7 +42,7 @@ X-Account-Credential: <one-account-secret>
 }
 ```
 
-新闻和休市字段还包含最近持久化时间、年龄、配置阈值、覆盖起止时间、当前所需覆盖窗口、是否过期和规则版本。规则版本不匹配的持久化快照不会被加载。
+新闻和休市字段还包含最近持久化时间、年龄、配置阈值、覆盖起止时间、当前所需覆盖窗口、是否过期和规则版本。规则版本不匹配的持久化快照不会被加载。`rule_config_consistent=false` 表示同一 `rule_version` 已被检测到不同的风险规则配置；服务仍返回健康与排障信息，但新增风险评估返回 `REJECT_RULE_DRIFT`，`/ready` 返回 `503`。
 
 `tls_enabled` 表示监听器是否使用服务器 TLS；`mtls_enabled` 和 `mtls_client_certificate_required` 只在服务端要求并验证客户端证书时为 `true`。普通 HTTPS/TLS 不等于 mTLS。
 

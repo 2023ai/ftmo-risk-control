@@ -59,7 +59,7 @@ PLATFORM_CREDENTIAL_SCOPES = frozenset(
 CREDENTIAL_LAST_USED_WRITE_INTERVAL = timedelta(seconds=60)
 CALENDAR_HASH_VERSION = 2
 DATABASE_INTEGRITY_CHECK_INTERVAL_SECONDS = 60.0
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 ACTIVE_RESERVATION_STATUSES = ("pending", "unknown", "committed")
 UNRESOLVED_RESERVATION_STATUSES = ("pending", "unknown")
 # A restore must contain every table that carries state which can affect a
@@ -78,6 +78,7 @@ REQUIRED_STATE_TABLES = frozenset(
         "closed_trades",
         "qualification_history_status",
         "qualification_trading_days",
+        "rule_config_fingerprints",
         "backup_runs",
     }
 )
@@ -228,6 +229,13 @@ REQUIRED_STATE_COLUMNS = {
             "source",
             "request_id",
             "created_at",
+        }
+    ),
+    "rule_config_fingerprints": frozenset(
+        {
+            "rule_version",
+            "config_fingerprint",
+            "recorded_at",
         }
     ),
     "backup_runs": frozenset(
@@ -673,6 +681,12 @@ class StateStore:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(account_id, phase, cycle_id, ftmo_day),
                     FOREIGN KEY(account_id) REFERENCES accounts(account_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS rule_config_fingerprints (
+                    rule_version TEXT PRIMARY KEY,
+                    config_fingerprint TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS backup_runs (
@@ -1523,6 +1537,64 @@ class StateStore:
                 created_at=datetime.fromisoformat(row["created_at"]),
             )
         return result
+
+    def pin_rule_config_fingerprint(
+        self,
+        *,
+        rule_version: str,
+        config_fingerprint: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """Pin one risk-rule fingerprint to each declared rule version.
+
+        A config revision must use a new rule_version. Returning ``False``
+        keeps the API available for inspection while forcing its risk gate to
+        fail closed.
+        """
+
+        if not isinstance(rule_version, str) or not rule_version.strip():
+            raise ValueError("rule_version must be non-empty")
+        if (
+            not isinstance(config_fingerprint, str)
+            or len(config_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in config_fingerprint)
+        ):
+            raise ValueError("config_fingerprint must be a SHA-256 hex digest")
+        recorded_at = self._utc_timestamp(
+            now or datetime.now(timezone.utc),
+            "now",
+        )
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT config_fingerprint
+                FROM rule_config_fingerprints
+                WHERE rule_version = ?
+                """,
+                (rule_version,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO rule_config_fingerprints (
+                        rule_version, config_fingerprint, recorded_at
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (
+                        rule_version,
+                        config_fingerprint,
+                        recorded_at.isoformat(),
+                    ),
+                )
+                connection.commit()
+                return True
+            matches = compare_digest(
+                str(existing["config_fingerprint"]),
+                config_fingerprint,
+            )
+            connection.commit()
+            return matches
 
     def create_account_credential(
         self,

@@ -963,6 +963,49 @@ class SecurityContractTests(unittest.TestCase):
             finally:
                 server.server_close()
 
+    def test_reused_rule_version_with_different_risk_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "config.json")
+            state_path = os.path.join(directory, "risk.db")
+            with open("config/ftmo-v2.json", encoding="utf-8") as source:
+                config = json.load(source)
+            with open(config_path, "w", encoding="utf-8") as target:
+                json.dump(config, target)
+            first = make_server(
+                "127.0.0.1",
+                0,
+                config_path,
+                auth_token="test-token",
+                state_path=state_path,
+            )
+            first.server_close()
+
+            config["internal_controls"]["single_trade_risk_pct"] = "0.0024"
+            with open(config_path, "w", encoding="utf-8") as target:
+                json.dump(config, target)
+            second = make_server(
+                "127.0.0.1",
+                0,
+                config_path,
+                auth_token="test-token",
+                state_path=state_path,
+            )
+            try:
+                self.assertFalse(second.rule_config_consistent)
+                readiness = second.readiness()
+                self.assertFalse(readiness["ready"])
+                self.assertIn(
+                    "active rule configuration differs from the fingerprint "
+                    "previously pinned to this rule version",
+                    readiness["reasons"],
+                )
+                self.assertIn(
+                    "ftmo_risk_rule_config_consistent 0",
+                    second.metrics_text(),
+                )
+            finally:
+                second.server_close()
+
     def test_audit_file_permissions_are_owner_only(self):
         with tempfile.TemporaryDirectory() as directory:
             server = make_server(
@@ -1165,6 +1208,26 @@ class StatefulRiskAPITests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["decision"]["code"], "ALLOW")
         self.assertEqual(body["request_id"], "stateful-r1")
+
+    def test_rule_config_drift_rejects_risk_increasing_evaluation(self):
+        account_id = "stateful-rule-drift"
+        self.sync_account(account_id)
+        original = self.server.rule_config_consistent
+        self.server.rule_config_consistent = False
+        try:
+            _, body = self.request(
+                "/v1/evaluate",
+                {
+                    "account_id": account_id,
+                    "request": _open_request(datetime.now(UTC).isoformat()),
+                },
+                request_id="stateful-rule-drift-r1",
+            )
+        finally:
+            self.server.rule_config_consistent = original
+
+        self.assertFalse(body["decision"]["allowed"])
+        self.assertEqual(body["decision"]["code"], "REJECT_RULE_DRIFT")
 
     def test_status_responses_echo_account_symbol_and_request_identity(self):
         account_id = "status-identity"

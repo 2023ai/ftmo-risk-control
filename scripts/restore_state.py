@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import stat
@@ -12,11 +13,20 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.state_store import REQUIRED_STATE_TABLES, StateStore
+from src.state_store import CURRENT_SCHEMA_VERSION, REQUIRED_STATE_TABLES, StateStore
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on non-POSIX deployments
+    fcntl = None  # type: ignore[assignment]
 
 
-# Keep restore validation aligned with the runtime readiness contract.
-REQUIRED_LEGACY_TABLES = REQUIRED_STATE_TABLES
+# A V1 backup is migratable: its only allowed missing V2 object is the rule
+# fingerprint table. The temporary restored copy is then opened by StateStore,
+# which performs the complete migration and schema validation before install.
+MIGRATABLE_PREVIOUS_SCHEMA_TABLES = (
+    REQUIRED_STATE_TABLES - {"rule_config_fingerprints"}
+)
 
 
 def _absolute_path(path: Path) -> Path:
@@ -111,13 +121,24 @@ def _quick_check(path: Path) -> None:
         ).fetchall()
         if foreign_key_errors:
             raise ValueError("source foreign key check failed")
+        schema_row = connection.execute("PRAGMA user_version").fetchone()
+        schema_version = int(schema_row[0]) if schema_row else 0
+        if schema_version > CURRENT_SCHEMA_VERSION:
+            raise ValueError(
+                "source schema version is newer than this service"
+            )
         tables = {
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        missing = sorted(REQUIRED_LEGACY_TABLES - tables)
+        required_tables = (
+            REQUIRED_STATE_TABLES
+            if schema_version == CURRENT_SCHEMA_VERSION
+            else MIGRATABLE_PREVIOUS_SCHEMA_TABLES
+        )
+        missing = sorted(required_tables - tables)
         if missing:
             raise ValueError(
                 "source is missing required risk state tables: "
@@ -125,11 +146,40 @@ def _quick_check(path: Path) -> None:
             )
 
 
+def _server_lock_is_active(lock_path: Path) -> bool:
+    """Check a POSIX advisory lock without trusting PID-file staleness."""
+
+    _assert_regular_or_missing(lock_path, "destination server lock")
+    if not lock_path.exists():
+        return False
+    if fcntl is None:
+        # The fallback runtime has only the PID-file protocol. Treat any lock
+        # file as active so restore remains fail-closed.
+        return True
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                return True
+            raise
+        return False
+    finally:
+        if acquired:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _assert_destination_available(path: Path) -> None:
     _assert_regular_or_missing(path, "destination")
     server_lock = path.with_name(path.name + ".server.lock")
-    _assert_regular_or_missing(server_lock, "destination server lock")
-    if server_lock.exists():
+    if _server_lock_is_active(server_lock):
         raise RuntimeError(
             "destination has an active server lock; stop the risk service first"
         )
@@ -156,9 +206,13 @@ def _record_restore_failure(path: Path, detail: str) -> None:
     if (
         path.is_symlink()
         or lock_path.is_symlink()
-        or lock_path.exists()
         or not path.is_file()
     ):
+        return
+    try:
+        if _server_lock_is_active(lock_path):
+            return
+    except (OSError, ValueError):
         return
     try:
         with closing(

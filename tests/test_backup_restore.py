@@ -93,6 +93,24 @@ class BackupRestoreTests(unittest.TestCase):
         finally:
             server.server_close()
 
+    def test_restore_accepts_an_inactive_advisory_server_lock(self):
+        server = make_server(
+            "127.0.0.1",
+            0,
+            "config/ftmo-v2.json",
+            auth_token="admin-token",
+            state_path=self.destination,
+        )
+        server.server_close()
+
+        restored_path = restore(self.backup, self.destination)
+
+        self.assertEqual(restored_path, self.destination.resolve())
+        self.assertEqual(
+            StateStore(restored_path).get_account("restore-account").snapshot.balance,
+            Decimal("101000"),
+        )
+
     def test_restore_rejects_incomplete_backup_without_creating_destination(self):
         incomplete = self.directory / "incomplete.db"
         with closing(sqlite3.connect(incomplete)) as connection:
@@ -125,6 +143,29 @@ class BackupRestoreTests(unittest.TestCase):
         ):
             restore(incomplete, self.destination)
         self.assertFalse(self.destination.exists())
+
+    def test_restore_migrates_a_v1_backup_without_rule_fingerprints(self):
+        legacy = self.directory / "v1-backup.db"
+        with closing(sqlite3.connect(self.backup)) as source_connection, closing(
+            sqlite3.connect(legacy)
+        ) as target_connection:
+            source_connection.backup(target_connection)
+            target_connection.commit()
+        with closing(sqlite3.connect(legacy)) as connection:
+            connection.execute("DROP TABLE rule_config_fingerprints")
+            connection.execute("PRAGMA user_version = 1")
+            connection.commit()
+
+        restored_path = restore(legacy, self.destination)
+
+        restored = StateStore(restored_path)
+        self.assertTrue(restored.database_healthy())
+        self.assertTrue(
+            restored.pin_rule_config_fingerprint(
+                rule_version="restore-v2-rules",
+                config_fingerprint="a" * 64,
+            )
+        )
 
     def test_restore_rejects_symbolic_link_destination(self):
         outside = self.directory / "outside.db"

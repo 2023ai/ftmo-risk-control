@@ -8,6 +8,7 @@ authenticated gateway is explicitly deployed.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import hmac
 import json
@@ -20,7 +21,7 @@ import ssl
 import stat
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import EnumMeta
@@ -30,6 +31,11 @@ from pathlib import Path
 from typing import Any, Mapping, cast
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on non-POSIX deployments
+    fcntl = None  # type: ignore[assignment]
 
 from .risk_engine import (
     AccountPhase,
@@ -84,6 +90,34 @@ class AuthorizationError(RequestError):
 
 class ForbiddenError(AuthorizationError):
     """The caller is authenticated but lacks the requested scope."""
+
+
+@dataclass
+class StateServerLock:
+    """Ownership of the state database lock for one API process."""
+
+    path: Path
+    descriptor: int | None
+    inode: tuple[int, int] | None
+    remove_on_release: bool = False
+
+    def release(self) -> None:
+        descriptor = self.descriptor
+        self.descriptor = None
+        if descriptor is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+        if not self.remove_on_release or self.inode is None:
+            return
+        try:
+            metadata = self.path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (metadata.st_dev, metadata.st_ino) == self.inode:
+            self.path.unlink(missing_ok=True)
 
 
 def _json_object_without_duplicate_keys(
@@ -779,6 +813,27 @@ def _canonical_hash(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _risk_rule_fingerprint(config: Mapping[str, Any]) -> str:
+    """Hash the config fields that change trading or qualification rules."""
+
+    fields = (
+        "ftmo_day_timezone",
+        "accounts",
+        "internal_controls",
+        "news_controls",
+        "frequency_controls",
+        "market_close_controls",
+        "qualification_controls",
+    )
+    encoded = json.dumps(
+        {field: config[field] for field in fields},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _prometheus_label(value: Any) -> str:
     """Escape a value for a Prometheus double-quoted label."""
     return (
@@ -814,7 +869,7 @@ def _process_alive(pid: int) -> bool:
     return True
 
 
-def _acquire_state_server_lock(state_path: str | Path) -> Path:
+def _state_lock_path(state_path: str | Path) -> Path:
     if str(state_path) == ":memory:":
         raise ValueError(
             "risk API requires a persistent state_path; ':memory:' is "
@@ -840,6 +895,16 @@ def _acquire_state_server_lock(state_path: str | Path) -> Path:
         lock_path,
         "state database lock",
     )
+    return lock_path
+
+
+def _acquire_pid_state_server_lock(lock_path: Path) -> StateServerLock:
+    """Fallback PID lock for runtimes without POSIX advisory locks.
+
+    The stale-lock cleanup compares inode identity before unlinking so a
+    concurrent process cannot have its newly created lock removed.
+    """
+
     for _ in range(2):
         try:
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -881,11 +946,21 @@ def _acquire_state_server_lock(state_path: str | Path) -> Path:
                 raise ValueError(
                     f"state database is already owned by server process {pid}"
                 )
+            try:
+                latest = lock_path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (latest.st_dev, latest.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                continue
             lock_path.unlink(missing_ok=True)
             continue
         try:
             if hasattr(os, "fchmod"):
                 os.fchmod(descriptor, 0o600)
+            metadata = os.fstat(descriptor)
             with os.fdopen(descriptor, "w", encoding="ascii") as handle:
                 handle.write(str(os.getpid()))
                 handle.flush()
@@ -893,8 +968,51 @@ def _acquire_state_server_lock(state_path: str | Path) -> Path:
         except Exception:
             lock_path.unlink(missing_ok=True)
             raise
-        return lock_path
+        return StateServerLock(
+            path=lock_path,
+            descriptor=None,
+            inode=(metadata.st_dev, metadata.st_ino),
+            remove_on_release=True,
+        )
     raise ValueError("unable to acquire state database server lock")
+
+
+def _acquire_state_server_lock(state_path: str | Path) -> StateServerLock:
+    lock_path = _state_lock_path(state_path)
+    if fcntl is None:
+        return _acquire_pid_state_server_lock(lock_path)
+
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("state database lock must be a regular file")
+        if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+            raise ValueError("state database lock must be owned by this user")
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise ValueError(
+                    "state database is already owned by server process"
+                ) from exc
+            raise
+        os.ftruncate(descriptor, 0)
+        os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
+        os.fsync(descriptor)
+        return StateServerLock(
+            path=lock_path,
+            descriptor=descriptor,
+            inode=(metadata.st_dev, metadata.st_ino),
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
 
 
 def account_sync_payload(
@@ -1053,6 +1171,7 @@ def evaluate_stored_payload(
     default_news_age_seconds: int | None,
     default_market_closures: list[MarketClosure],
     default_market_age_seconds: int | None,
+    rule_config_consistent: bool,
 ) -> dict[str, Any]:
     account_id = _account_id(_required(payload, "account_id"))
     request = _trade_request(_required(payload, "request"))
@@ -1121,6 +1240,20 @@ def evaluate_stored_payload(
             default_market_age_seconds=default_market_age_seconds,
             day_timezone=state_store.day_timezone,
         )
+        if request.is_risk_increasing and not rule_config_consistent:
+            decision = response.get("decision")
+            if not isinstance(decision, dict):
+                raise ValueError("risk evaluation did not return a decision")
+            decision.update(
+                {
+                    "code": DecisionCode.REJECT_RULE_DRIFT.value,
+                    "allowed": False,
+                    "reasons": [
+                        "the active rule configuration differs from the "
+                        "fingerprint previously pinned to this rule version",
+                    ],
+                }
+            )
         response["account_id"] = account_id
         return response
 
@@ -2181,6 +2314,12 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                 "ok": readiness["ready"] if path == "/ready" else True,
                 "service": "ftmo-risk-api",
                 "rule_version": self.risk_server.rule_version,
+                "rule_config_fingerprint": (
+                    self.risk_server.rule_config_fingerprint
+                ),
+                "rule_config_consistent": (
+                    self.risk_server.rule_config_consistent
+                ),
                 "ready_for_risk_increase": readiness["ready"],
                 "readiness_reasons": readiness["reasons"],
                 "news_data_age_seconds": (
@@ -2467,6 +2606,7 @@ class RiskRequestHandler(BaseHTTPRequestHandler):
                         cached_news_age,
                         cached_closures,
                         cached_market_age,
+                        self.risk_server.rule_config_consistent,
                     )
                 else:
                     if not self.risk_server.allow_stateless_evaluate:
@@ -2974,6 +3114,8 @@ class RiskHTTPServer(ThreadingHTTPServer):
         validate_config(config)
         self.config = config
         self.rule_version = str(config["rule_version"])
+        self.rule_config_fingerprint = _risk_rule_fingerprint(config)
+        self.rule_config_consistent = True
         self.day_timezone = str(
             config.get("ftmo_day_timezone", "Europe/Prague")
         )
@@ -3016,17 +3158,23 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 "allow_insecure_remote_bind=True only for an isolated private "
                 "network"
             )
-        self._state_server_lock_path: Path | None = None
+        self._state_server_lock: StateServerLock | None = None
         try:
             if state_path:
                 # Lock before opening SQLite so a competing process cannot
                 # touch the state file while it is failing startup.
-                self._state_server_lock_path = _acquire_state_server_lock(
+                self._state_server_lock = _acquire_state_server_lock(
                     state_path
                 )
                 self.state_store = StateStore(
                     state_path,
                     day_timezone=self.day_timezone,
+                )
+                self.rule_config_consistent = (
+                    self.state_store.pin_rule_config_fingerprint(
+                        rule_version=self.rule_version,
+                        config_fingerprint=self.rule_config_fingerprint,
+                    )
                 )
                 self.state_store.reconcile_expired_reservations()
             super().__init__(server_address, RiskRequestHandler)
@@ -3067,12 +3215,12 @@ class RiskHTTPServer(ThreadingHTTPServer):
             raise
 
     def _release_state_server_lock(self) -> None:
-        if self._state_server_lock_path is None:
+        if self._state_server_lock is None:
             return
         try:
-            self._state_server_lock_path.unlink(missing_ok=True)
+            self._state_server_lock.release()
         finally:
-            self._state_server_lock_path = None
+            self._state_server_lock = None
 
     def server_close(self) -> None:
         try:
@@ -3335,6 +3483,11 @@ class RiskHTTPServer(ThreadingHTTPServer):
         integrity_audit_available = database_up
         if not database_up:
             reasons.append("persistent state database is unavailable")
+        elif not self.rule_config_consistent:
+            reasons.append(
+                "active rule configuration differs from the fingerprint "
+                "previously pinned to this rule version"
+            )
         elif self.state_store is not None:
             try:
                 self.state_store.reconcile_expired_reservations()
@@ -3364,6 +3517,7 @@ class RiskHTTPServer(ThreadingHTTPServer):
         return {
             "ready": not reasons,
             "database_up": database_up,
+            "rule_config_consistent": self.rule_config_consistent,
             "news_calendar_ready": not news["stale"],
             "market_calendar_ready": not market["stale"],
             "unknown_execution_records": unknown_executions,
@@ -3514,6 +3668,10 @@ class RiskHTTPServer(ThreadingHTTPServer):
                 "# TYPE ftmo_risk_ready_for_risk_increase gauge",
                 "ftmo_risk_ready_for_risk_increase "
                 f"{1 if readiness['ready'] else 0}",
+                "# HELP ftmo_risk_rule_config_consistent Whether the active risk-rule fingerprint matches its declared rule version.",
+                "# TYPE ftmo_risk_rule_config_consistent gauge",
+                "ftmo_risk_rule_config_consistent "
+                f"{1 if self.rule_config_consistent else 0}",
                 "# HELP ftmo_risk_tls_enabled Whether the API listener uses TLS.",
                 "# TYPE ftmo_risk_tls_enabled gauge",
                 f"ftmo_risk_tls_enabled {1 if self.tls_enabled else 0}",

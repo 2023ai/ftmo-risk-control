@@ -153,7 +153,7 @@ python3 scripts/restore_state.py \
 - 新闻数据必须保存来源、发布时间、影响品种、覆盖时间和规则版本。
 - 长休市日历必须来自实际 FTMO/经纪商品种交易时间，示例文件不能直接用于实盘。
 - 所有时间统一使用带时区的 ISO 8601 时间。
-- 规则变更必须增加 `rule_version`，不得静默覆盖历史审计记录。
+- 规则变更必须增加 `rule_version`，不得静默覆盖历史审计记录；服务会持久化风险规则指纹，同一版本出现不同风险配置时自动停止新增风险。
 - Minimum Trading Days 使用 Prague/CE(S)T 开仓日：当天至少开过一个仓位计 1 天，持仓跨日不重复计数。
 - `ALLOW` 只表示当前交易请求通过风控，不表示账户已经满足 Profit Target、Minimum Trading Days 或 Best Day Rule。看板额外要求同步的账户余额达到目标、`open_positions_count` 和 `pending_orders_count` 都为零；挂单清零是本系统的保守完整性门槛，不是对 FTMO 官方资格审核的替代。
 - 平台同步时间戳必须带毫秒精度或单调递增；同一时间戳上传冲突账户快照会被拒绝。

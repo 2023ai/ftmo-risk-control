@@ -5,7 +5,7 @@
 ## 自动测试
 
 ```text
-214 tests passed
+219 tests passed
 ResourceWarning treated as error
 Python source compilation passed
 JSON configuration validation passed
@@ -36,8 +36,10 @@ mypy passed
 - 日历 V2 安全元数据哈希，事件内容或覆盖边界被改动时拒绝恢复。
 - 旧版日历哈希不能通过补写覆盖边界升级为可信快照。
 - SQLite 在线备份、`0600`、完整性校验、恢复和运行中服务锁拒绝。
-- SQLite `PRAGMA user_version`、必需表/字段校验和不健康状态拒绝备份。
+- SQLite `PRAGMA user_version`、必需表/字段校验和不健康状态拒绝备份；V1 备份在临时副本完成受控迁移后可恢复到当前 schema。
 - 服务锁在打开 SQLite 前取得，拒绝第二个服务进程与不安全的锁文件触碰状态库。
+- POSIX 服务锁使用进程持有的排他锁；遗留锁文件不会阻塞已停机状态的受控恢复。
+- 同一 `rule_version` 不能静默绑定不同的风险规则配置；冲突时 `/ready` 和新增风险评估 fail-closed，并输出 Prometheus 指标和 critical 告警。
 - 每账户凭证绑定、作用域、跨账户拒绝、轮换重叠、过期、撤销和只显示一次的秘密。
 - 管理员首次登记账户基线、默认平台凭证最小权限、孤儿凭证无法建立账户。
 - JSON 重复对象键拒绝，避免同一请求的字段歧义。

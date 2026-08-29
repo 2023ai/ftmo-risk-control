@@ -19,6 +19,15 @@ groups:
           summary: FTMO risk state has semantic integrity errors
           description: Stop new risk and inspect the decision, execution, reservation, and credential relationships before recovery.
 
+      - alert: FtmoRiskRuleConfigurationDrift
+        expr: ftmo_risk_rule_config_consistent == 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: FTMO risk rule configuration changed without a new rule version
+          description: Keep new risk blocked, restore the approved configuration or publish the reviewed policy under a new rule_version.
+
       - alert: FtmoRiskNotReady
         expr: ftmo_risk_ready_for_risk_increase == 0
         for: 1m
