@@ -46,6 +46,11 @@ class Action(str, Enum):
     CANCEL = "cancel"
 
 
+class TradeSide(str, Enum):
+    BUY = "buy"
+    SELL = "sell"
+
+
 class DecisionCode(str, Enum):
     ALLOW = "ALLOW"
     REJECT_OFFICIAL_BREACH = "REJECT_OFFICIAL_BREACH"
@@ -56,7 +61,9 @@ class DecisionCode(str, Enum):
     REJECT_FREQUENCY = "REJECT_FREQUENCY"
     REJECT_RISK = "REJECT_RISK"
     REJECT_DATA_STALE = "REJECT_DATA_STALE"
+    REJECT_RULE_DRIFT = "REJECT_RULE_DRIFT"
     REJECT_UNKNOWN_EXECUTION = "REJECT_UNKNOWN_EXECUTION"
+    REJECT_REQUEST_REPLAY = "REJECT_REQUEST_REPLAY"
 
 
 @dataclass(frozen=True)
@@ -226,6 +233,10 @@ class AccountSnapshot:
     equity: Decimal
     as_of: datetime
     current_open_risk: Decimal = ZERO
+    # Risk approved by the API but not yet fully reconciled with a platform
+    # account sync. Keeping it separate prevents a stale platform snapshot
+    # from making the next order look safer than it is.
+    reserved_open_risk: Decimal = ZERO
     data_age_seconds: int = 0
     data_uncertain: bool = False
     day_locked: bool = False
@@ -313,6 +324,7 @@ class TradeRequest:
     additional_risk: Decimal = ZERO
     is_risk_increasing: bool = True
     idea_id: str = ""
+    side: Optional[TradeSide] = None
 
     @property
     def is_open(self) -> bool:
@@ -408,6 +420,10 @@ class RiskEngine:
             return snapshot.initial_capital
         return snapshot.highest_settled_balance
 
+    @staticmethod
+    def effective_open_risk(snapshot: AccountSnapshot) -> Decimal:
+        return snapshot.current_open_risk + snapshot.reserved_open_risk
+
     def status(self, snapshot: AccountSnapshot) -> str:
         if snapshot.breach_latched:
             return "BREACH"
@@ -438,18 +454,18 @@ class RiskEngine:
             ZERO,
             daily_internal_allowance
             - daily_consumed
-            - snapshot.current_open_risk,
+            - self.effective_open_risk(snapshot),
         )
         max_buffer = max(
             ZERO,
             snapshot.equity
             - self.internal_max_loss_stop_limit(snapshot)
-            - snapshot.current_open_risk,
+            - self.effective_open_risk(snapshot),
         )
         open_buffer = max(
             ZERO,
             snapshot.initial_capital * self.profile.max_open_risk_pct
-            - snapshot.current_open_risk,
+            - self.effective_open_risk(snapshot),
         )
         base_budget = max(
             ZERO,
@@ -545,6 +561,23 @@ class RiskEngine:
                 DecisionCode.REJECT_RISK,
                 ("open requests must be risk-increasing",),
             )
+        if request.is_open and request.side is not None:
+            if request.entry_price is None or request.stop_loss is None:
+                return Decision(
+                    DecisionCode.REJECT_STOP_LOSS,
+                    ("side-aware opening requests require entry and stop loss",),
+                )
+            if (
+                request.side == TradeSide.BUY
+                and request.stop_loss >= request.entry_price
+            ) or (
+                request.side == TradeSide.SELL
+                and request.stop_loss <= request.entry_price
+            ):
+                return Decision(
+                    DecisionCode.REJECT_STOP_LOSS,
+                    ("stop loss is on the wrong side of the entry",),
+                )
         if request.action in {Action.CLOSE, Action.CANCEL} and request.is_risk_increasing:
             return Decision(
                 DecisionCode.REJECT_RISK,
@@ -569,6 +602,11 @@ class RiskEngine:
             return Decision(
                 DecisionCode.REJECT_RISK,
                 ("risk inputs cannot be negative",),
+            )
+        if snapshot.reserved_open_risk < ZERO:
+            return Decision(
+                DecisionCode.REJECT_RISK,
+                ("reserved open risk cannot be negative",),
             )
         if not request.is_risk_increasing and request.additional_risk > ZERO:
             return Decision(
@@ -790,12 +828,14 @@ class RiskEngine:
             if (
                 self.profile.phase == AccountPhase.FTMO_ACCOUNT
                 and self.profile.style == AccountStyle.STANDARD
+                and request.action in {Action.OPEN, Action.CLOSE, Action.MODIFY}
                 and hard_start <= delta <= hard_end
             ):
                 return Decision(
                     DecisionCode.REJECT_NEWS,
                     (
-                        f"{event.event_id} is inside the FTMO hard news window",
+                        f"{event.event_id} is inside the FTMO hard news window; "
+                        "opening, closing, and modification are blocked",
                     ),
                 )
 
@@ -1181,12 +1221,15 @@ def validate_config(config: Mapping[str, Any]) -> None:
     for security_field in (
         "credential_default_ttl_seconds",
         "credential_max_ttl_seconds",
-        "credential_rotation_overlap_seconds",
     ):
         _validate_positive_int(
             security.get(security_field),
             f"security.{security_field}",
         )
+    _validate_nonnegative_int(
+        security.get("credential_rotation_overlap_seconds"),
+        "security.credential_rotation_overlap_seconds",
+    )
     if int(security["credential_default_ttl_seconds"]) > int(
         security["credential_max_ttl_seconds"]
     ):

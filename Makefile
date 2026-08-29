@@ -1,4 +1,4 @@
-.PHONY: test check lint run
+.PHONY: test check lint hygiene run
 
 test:
 	python3 -W error::ResourceWarning -m unittest discover -s tests -v
@@ -9,7 +9,11 @@ check:
 	python3 -m json.tool config/news-events.example.json >/dev/null
 	python3 -m json.tool config/market-closures.example.json >/dev/null
 	python3 -m json.tool config/qualification-history.example.json >/dev/null
+	python3 scripts/check_repo_hygiene.py
 	git diff --check
+
+hygiene:
+	python3 scripts/check_repo_hygiene.py
 
 lint:
 	ruff check src tests scripts

@@ -1,16 +1,20 @@
 import json
 import os
+import sqlite3
+import ssl
 import stat
 import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from http import HTTPStatus
+from pathlib import Path
 
 from src.risk_api import RequestError, evaluate_payload, make_server
 from src.risk_engine import (
@@ -44,6 +48,7 @@ def _open_request(when="2026-08-22T12:00:00+00:00"):
     return {
         "symbol": "EURUSD",
         "action": "open",
+        "side": "buy",
         "requested_at": when,
         "volume": "1",
         "entry_price": "1.1000",
@@ -569,6 +574,62 @@ class RiskAPITests(unittest.TestCase):
         self.assertEqual(context.exception.code, 400)
         context.exception.close()
 
+    def test_unbounded_decimal_magnitude_is_bad_request(self):
+        payload = {
+            "account_type": "two_step",
+            "phase": "evaluation",
+            "style": "standard",
+            "snapshot": {
+                **_snapshot(),
+                "equity": "1e1000",
+            },
+            "request": _open_request(),
+        }
+        with self.assertRaises(HTTPError) as context:
+            self.request("POST", "/v1/evaluate", payload)
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
+
+    def test_open_requires_side_and_rejects_wrong_side_stop_loss(self):
+        missing_side = _open_request()
+        missing_side.pop("side")
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/evaluate",
+                {
+                    "account_type": "two_step",
+                    "phase": "evaluation",
+                    "style": "standard",
+                    "snapshot": _snapshot(),
+                    "request": missing_side,
+                    "news_data_age_seconds": 0,
+                    "market_data_age_seconds": 0,
+                },
+            )
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
+
+        status, body = self.request(
+                "POST",
+                "/v1/evaluate",
+                {
+                    "account_type": "two_step",
+                    "phase": "evaluation",
+                    "style": "standard",
+                    "snapshot": _snapshot(),
+                    "request": {
+                        **_open_request(),
+                        "side": "sell",
+                    },
+                    "news_data_age_seconds": 0,
+                    "market_data_age_seconds": 0,
+                },
+            )
+        self.assertEqual(status, 200)
+        self.assertFalse(body["decision"]["allowed"])
+        self.assertEqual(body["decision"]["code"], "REJECT_STOP_LOSS")
+
     def test_duplicate_calendar_ids_are_rejected(self):
         event = {
             "event_id": "DUPLICATE",
@@ -598,6 +659,47 @@ class RiskAPITests(unittest.TestCase):
                             "event_id": "BAD-PATTERN",
                             "release_time": datetime.now(UTC).isoformat(),
                             "affected_symbols": ["EUR*USD"],
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
+
+    def test_calendar_event_without_symbol_mapping_is_rejected(self):
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/news-sync",
+                {
+                    "fetched_at": datetime.now(UTC).isoformat(),
+                    "events": [
+                        {
+                            "event_id": "UNMAPPED",
+                            "release_time": datetime.now(UTC).isoformat(),
+                            "affected_symbols": [],
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
+
+    def test_market_closure_without_symbol_mapping_is_rejected(self):
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/market-sync",
+                {
+                    "fetched_at": datetime.now(UTC).isoformat(),
+                    "closures": [
+                        {
+                            "closure_id": "UNMAPPED-CLOSURE",
+                            "start_time": datetime.now(UTC).isoformat(),
+                            "end_time": (
+                                datetime.now(UTC) + timedelta(hours=3)
+                            ).isoformat(),
+                            "affected_symbols": [],
                         }
                     ],
                 },
@@ -644,14 +746,35 @@ class SecurityContractTests(unittest.TestCase):
             )
 
     def test_remote_bind_can_be_explicitly_enabled(self):
+        with self.assertRaisesRegex(ValueError, "TLS"):
+            make_server(
+                "0.0.0.0",
+                0,
+                "config/ftmo-v2.json",
+                auth_token="test-token",
+                allow_remote_bind=True,
+            )
+
+    def test_insecure_remote_bind_requires_second_explicit_opt_in(self):
         server = make_server(
             "0.0.0.0",
             0,
             "config/ftmo-v2.json",
             auth_token="test-token",
             allow_remote_bind=True,
+            allow_insecure_remote_bind=True,
         )
         server.server_close()
+
+    def test_ca_path_without_tls_certificate_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "tls_ca_path"):
+            make_server(
+                "127.0.0.1",
+                0,
+                "config/ftmo-v2.json",
+                auth_token="test-token",
+                tls_ca_path="test-ca.pem",
+            )
 
     def test_mtls_requires_server_certificate_and_key(self):
         with self.assertRaises(ValueError):
@@ -662,6 +785,88 @@ class SecurityContractTests(unittest.TestCase):
                 auth_token="test-token",
                 tls_ca_path="test-ca.pem",
                 require_client_cert=True,
+            )
+
+    def test_tls_and_mtls_status_are_distinct(self):
+        contexts = []
+
+        class FakeSSLContext:
+            def __init__(self, *args, **kwargs):
+                self.options = 0
+                self.minimum_version = None
+                self.verify_mode = None
+                contexts.append(self)
+
+            def load_cert_chain(self, certfile, keyfile):
+                return None
+
+            def load_verify_locations(self, cafile):
+                return None
+
+            def wrap_socket(self, sock, server_side=False):
+                return sock
+
+        with tempfile.TemporaryDirectory() as directory:
+            cert = Path(directory) / "server.crt"
+            key = Path(directory) / "server.key"
+            ca = Path(directory) / "client-ca.crt"
+            for path in (cert, key, ca):
+                path.write_text("test", encoding="ascii")
+
+            for require_client_cert in (False, True):
+                with patch(
+                    "src.risk_api.ssl.SSLContext",
+                    FakeSSLContext,
+                ):
+                    server = make_server(
+                        "127.0.0.1",
+                        0,
+                        "config/ftmo-v2.json",
+                        auth_token="test-token",
+                        tls_cert_path=cert,
+                        tls_key_path=key,
+                        tls_ca_path=ca if require_client_cert else None,
+                        require_client_cert=require_client_cert,
+                    )
+                try:
+                    self.assertTrue(server.tls_enabled)
+                    self.assertEqual(
+                        server.mtls_enabled,
+                        require_client_cert,
+                    )
+                    self.assertEqual(
+                        server.require_client_cert,
+                        require_client_cert,
+                    )
+                    self.assertEqual(
+                        contexts[-1].verify_mode,
+                        (
+                            ssl.CERT_REQUIRED
+                            if require_client_cert
+                            else ssl.CERT_NONE
+                        ),
+                    )
+                    metrics = server.metrics_text()
+                    self.assertIn(
+                        "ftmo_risk_tls_enabled 1",
+                        metrics,
+                    )
+                    self.assertIn(
+                        "ftmo_risk_mtls_enabled "
+                        + ("1" if require_client_cert else "0"),
+                        metrics,
+                    )
+                finally:
+                    server.server_close()
+
+    def test_api_rejects_in_memory_state_path(self):
+        with self.assertRaisesRegex(ValueError, "persistent state_path"):
+            make_server(
+                "127.0.0.1",
+                0,
+                "config/ftmo-v2.json",
+                auth_token="test-token",
+                state_path=":memory:",
             )
 
     def test_stateless_position_size_is_disabled_by_default(self):
@@ -701,6 +906,39 @@ class SecurityContractTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_invalid_request_id_still_returns_request_id(self):
+        server = make_server(
+            "127.0.0.1",
+            0,
+            "config/ftmo-v2.json",
+            auth_token="test-token",
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        host, port = server.server_address
+        request = Request(
+            f"http://{host}:{port}/v1/news-sync",
+            data=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "X-Risk-Token": "test-token",
+                "X-Request-Id": "invalid request id",
+            },
+            method="POST",
+        )
+        try:
+            with self.assertRaises(HTTPError) as context:
+                urlopen(request, timeout=2)
+            self.assertEqual(context.exception.code, 400)
+            body = json.loads(context.exception.read())
+            self.assertTrue(body["request_id"])
+            self.assertNotEqual(body["request_id"], "invalid request id")
+            context.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_server_pins_validated_config_at_startup(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = os.path.join(directory, "config.json")
@@ -725,6 +963,49 @@ class SecurityContractTests(unittest.TestCase):
             finally:
                 server.server_close()
 
+    def test_reused_rule_version_with_different_risk_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "config.json")
+            state_path = os.path.join(directory, "risk.db")
+            with open("config/ftmo-v2.json", encoding="utf-8") as source:
+                config = json.load(source)
+            with open(config_path, "w", encoding="utf-8") as target:
+                json.dump(config, target)
+            first = make_server(
+                "127.0.0.1",
+                0,
+                config_path,
+                auth_token="test-token",
+                state_path=state_path,
+            )
+            first.server_close()
+
+            config["internal_controls"]["single_trade_risk_pct"] = "0.0024"
+            with open(config_path, "w", encoding="utf-8") as target:
+                json.dump(config, target)
+            second = make_server(
+                "127.0.0.1",
+                0,
+                config_path,
+                auth_token="test-token",
+                state_path=state_path,
+            )
+            try:
+                self.assertFalse(second.rule_config_consistent)
+                readiness = second.readiness()
+                self.assertFalse(readiness["ready"])
+                self.assertIn(
+                    "active rule configuration differs from the fingerprint "
+                    "previously pinned to this rule version",
+                    readiness["reasons"],
+                )
+                self.assertIn(
+                    "ftmo_risk_rule_config_consistent 0",
+                    second.metrics_text(),
+                )
+            finally:
+                second.server_close()
+
     def test_audit_file_permissions_are_owner_only(self):
         with tempfile.TemporaryDirectory() as directory:
             server = make_server(
@@ -741,6 +1022,49 @@ class SecurityContractTests(unittest.TestCase):
                 self.assertEqual(mode, 0o600)
             finally:
                 server.server_close()
+
+    def test_audit_rejects_symbolic_link_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            outside = Path(directory) / "outside.jsonl"
+            outside.write_text("do not replace\\n", encoding="ascii")
+            audit_path = Path(directory) / "audit.jsonl"
+            os.symlink(outside, audit_path)
+            server = make_server(
+                "127.0.0.1",
+                0,
+                "config/ftmo-v2.json",
+                auth_token="test-token",
+            )
+            server.audit_path = str(audit_path)
+            try:
+                with self.assertRaisesRegex(ValueError, "symbolic link"):
+                    server.write_audit({"ok": True})
+            finally:
+                server.server_close()
+            self.assertEqual(
+                outside.read_text(encoding="ascii"),
+                "do not replace\\n",
+            )
+
+    def test_audit_rejects_symbolic_link_parent_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            real_parent = Path(directory) / "real-audit"
+            real_parent.mkdir()
+            linked_parent = Path(directory) / "linked-audit"
+            os.symlink(real_parent, linked_parent)
+            server = make_server(
+                "127.0.0.1",
+                0,
+                "config/ftmo-v2.json",
+                auth_token="test-token",
+            )
+            server.audit_path = str(linked_parent / "audit.jsonl")
+            try:
+                with self.assertRaisesRegex(ValueError, "symbolic link"):
+                    server.write_audit({"ok": True})
+            finally:
+                server.server_close()
+            self.assertEqual(list(real_parent.iterdir()), [])
 
     def test_existing_state_lock_is_checked_before_opening_database(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -885,6 +1209,127 @@ class StatefulRiskAPITests(unittest.TestCase):
         self.assertEqual(body["decision"]["code"], "ALLOW")
         self.assertEqual(body["request_id"], "stateful-r1")
 
+    def test_rule_config_drift_rejects_risk_increasing_evaluation(self):
+        account_id = "stateful-rule-drift"
+        self.sync_account(account_id)
+        original = self.server.rule_config_consistent
+        self.server.rule_config_consistent = False
+        try:
+            _, body = self.request(
+                "/v1/evaluate",
+                {
+                    "account_id": account_id,
+                    "request": _open_request(datetime.now(UTC).isoformat()),
+                },
+                request_id="stateful-rule-drift-r1",
+            )
+        finally:
+            self.server.rule_config_consistent = original
+
+        self.assertFalse(body["decision"]["allowed"])
+        self.assertEqual(body["decision"]["code"], "REJECT_RULE_DRIFT")
+
+    def test_status_responses_echo_account_symbol_and_request_identity(self):
+        account_id = "status-identity"
+        self.sync_account(account_id)
+        _, news = self.request(
+            "/v1/news-status",
+            {
+                "account_id": account_id,
+                "symbol": "EURUSD",
+                "now": datetime.now(UTC).isoformat(),
+            },
+            request_id="status-news-r1",
+        )
+        self.assertEqual(news["account_id"], account_id)
+        self.assertEqual(news["symbol"], "EURUSD")
+        self.assertEqual(news["request_id"], "status-news-r1")
+        self.assertIsInstance(news["open_blocked"], bool)
+
+        _, execution_status = self.request(
+            "/v1/execution-status",
+            {"account_id": account_id},
+            request_id="status-execution-r1",
+        )
+        self.assertEqual(execution_status["account_id"], account_id)
+        self.assertEqual(
+            execution_status["request_id"],
+            "status-execution-r1",
+        )
+        self.assertIsInstance(
+            execution_status["risk_increase_blocked"],
+            bool,
+        )
+
+    def test_risk_reservation_is_counted_until_execution_is_reconciled(self):
+        account_id = "stateful-risk-reservation"
+        self.sync_account(account_id)
+        first_id = "reservation-r1"
+        second_id = "reservation-r2"
+        for request_id in (first_id, second_id):
+            _, body = self.request(
+                "/v1/evaluate",
+                {
+                    "account_id": account_id,
+                    "request": _open_request(datetime.now(UTC).isoformat()),
+                },
+                request_id=request_id,
+            )
+            self.assertEqual(body["decision"]["code"], "ALLOW")
+            self.assertEqual(
+                body["risk_reservation"]["status"],
+                "pending",
+            )
+
+        metrics = self.server.state_store.risk_reservation_metrics(account_id)
+        self.assertEqual(metrics["pending"], 2)
+        self.assertEqual(metrics["reserved_risk"], Decimal("216"))
+        self.assertEqual(
+            self.server.state_store.get_account(account_id)
+            .snapshot.reserved_open_risk,
+            Decimal("216"),
+        )
+
+        self.request(
+            "/v1/execution-result",
+            {
+                "account_id": account_id,
+                "request_id": first_id,
+                "outcome": "success",
+                "action": "open",
+                "symbol": "EURUSD",
+                "occurred_at": datetime.now(UTC).isoformat(),
+                "platform_status": "filled",
+            },
+        )
+        metrics = self.server.state_store.risk_reservation_metrics(account_id)
+        self.assertEqual(metrics["committed"], 1)
+        self.assertEqual(metrics["pending"], 1)
+
+        sync_at = datetime.now(UTC) + timedelta(seconds=1)
+        self.server.state_store.sync_account(
+            account_id=account_id,
+            account_type=AccountType.TWO_STEP,
+            phase=AccountPhase.EVALUATION,
+            style=AccountStyle.STANDARD,
+            initial_capital=Decimal("100000"),
+            balance=Decimal("100000"),
+            equity=Decimal("100000"),
+            current_open_risk=Decimal("100"),
+            open_positions_count=1,
+            pending_orders_count=0,
+            as_of=sync_at,
+            received_at=sync_at,
+        )
+        metrics = self.server.state_store.risk_reservation_metrics(account_id)
+        self.assertEqual(metrics["committed"], 0)
+        self.assertEqual(metrics["pending"], 1)
+        self.assertEqual(
+            self.server.state_store.get_account(account_id)
+            .snapshot.reserved_open_risk,
+            Decimal("108"),
+        )
+
     def test_observed_daily_lock_persists_after_equity_recovers(self):
         account_id = "stateful-daily-lock"
         now = datetime.now(UTC)
@@ -995,7 +1440,7 @@ class StatefulRiskAPITests(unittest.TestCase):
         )
         self.assertEqual(body["decision"]["code"], "ALLOW")
 
-    def test_same_request_id_replays_the_original_decision(self):
+    def test_same_request_id_replay_is_blocked_before_execution(self):
         account_id = "stateful-idempotent"
         self.sync_account(account_id)
         request_id = "idempotent-r1"
@@ -1013,10 +1458,89 @@ class StatefulRiskAPITests(unittest.TestCase):
             payload,
             request_id=request_id,
         )
-        self.assertEqual(first["decision"], second["decision"])
+        self.assertTrue(first["decision"]["allowed"])
+        self.assertFalse(second["decision"]["allowed"])
+        self.assertEqual(
+            second["decision"]["code"],
+            "REJECT_REQUEST_REPLAY",
+        )
+        self.assertTrue(second["replayed"])
         self.assertEqual(
             len(self.server.state_store.frequency(account_id).open_times),
             1,
+        )
+
+    def test_request_id_cannot_replay_after_execution_is_reconciled(self):
+        account_id = "stateful-consumed-request"
+        self.sync_account(account_id)
+        request_id = "consumed-request-r1"
+        payload = {
+            "account_id": account_id,
+            "request": _open_request(datetime.now(UTC).isoformat()),
+        }
+        _, first = self.request(
+            "/v1/evaluate",
+            payload,
+            request_id=request_id,
+        )
+        self.assertTrue(first["decision"]["allowed"])
+        self.request(
+            "/v1/execution-result",
+            {
+                "account_id": account_id,
+                "request_id": request_id,
+                "outcome": "success",
+                "action": "open",
+                "symbol": "EURUSD",
+                "occurred_at": datetime.now(UTC).isoformat(),
+                "platform_status": "filled",
+            },
+        )
+        _, replay = self.request(
+            "/v1/evaluate",
+            payload,
+            request_id=request_id,
+        )
+        self.assertFalse(replay["decision"]["allowed"])
+        self.assertEqual(
+            replay["decision"]["code"],
+            "REJECT_REQUEST_REPLAY",
+        )
+
+    def test_unknown_execution_replay_stays_blocked(self):
+        account_id = "stateful-unknown-replay"
+        self.sync_account(account_id)
+        request_id = "unknown-replay-r1"
+        payload = {
+            "account_id": account_id,
+            "request": _open_request(datetime.now(UTC).isoformat()),
+        }
+        self.request(
+            "/v1/evaluate",
+            payload,
+            request_id=request_id,
+        )
+        self.request(
+            "/v1/execution-result",
+            {
+                "account_id": account_id,
+                "request_id": request_id,
+                "outcome": "unknown",
+                "action": "open",
+                "symbol": "EURUSD",
+                "occurred_at": datetime.now(UTC).isoformat(),
+                "platform_status": "timeout",
+            },
+        )
+        _, replay = self.request(
+            "/v1/evaluate",
+            payload,
+            request_id=request_id,
+        )
+        self.assertFalse(replay["decision"]["allowed"])
+        self.assertEqual(
+            replay["decision"]["code"],
+            "REJECT_UNKNOWN_EXECUTION",
         )
 
     def test_request_id_reuse_with_different_content_is_rejected(self):
@@ -1494,6 +2018,40 @@ class StatefulRiskAPITests(unittest.TestCase):
         self.assertTrue(body["closure_active"])
         self.assertTrue(body["cancel_pending"])
 
+    def test_active_market_closure_force_flats_standard_account(self):
+        account_id = "stateful-active-standard-close"
+        self.sync_account(account_id, phase="ftmo_account")
+        now = datetime.now(UTC)
+        self.request(
+            "/v1/market-sync",
+            {
+                "fetched_at": now.isoformat(),
+                "closures": [
+                    {
+                        "closure_id": "active-standard-break",
+                        "start_time": (
+                            now - timedelta(minutes=1)
+                        ).isoformat(),
+                        "end_time": (
+                            now + timedelta(hours=3)
+                        ).isoformat(),
+                        "affected_symbols": ["EURUSD"],
+                    }
+                ],
+            },
+        )
+        _, body = self.request(
+            "/v1/market-status",
+            {
+                "account_id": account_id,
+                "symbol": "EURUSD",
+                "now": now.isoformat(),
+            },
+        )
+        self.assertTrue(body["closure_active"])
+        self.assertTrue(body["force_flat"])
+        self.assertTrue(body["cancel_pending"])
+
     def test_stateful_evaluation_rejects_market_close_window(self):
         account_id = "stateful-market-evaluate"
         self.sync_account(account_id, phase="ftmo_account")
@@ -1603,6 +2161,7 @@ class CredentialQualificationAPITests(unittest.TestCase):
         admin=False,
         credential=None,
         bearer=False,
+        request_id=None,
     ):
         headers = {}
         data = None
@@ -1617,6 +2176,8 @@ class CredentialQualificationAPITests(unittest.TestCase):
                 headers["X-Risk-Token"] = "admin-token"
         if credential is not None:
             headers["X-Account-Credential"] = credential
+        if request_id is not None:
+            headers["X-Request-Id"] = request_id
         request = Request(
             self.base_url + path,
             data=data,
@@ -1689,6 +2250,22 @@ class CredentialQualificationAPITests(unittest.TestCase):
         self.assertTrue(body["ready_for_risk_increase"])
         self.assertEqual(body["readiness_reasons"], [])
 
+    def test_ready_fails_closed_when_integrity_audit_raises(self):
+        self.bootstrap_account("integrity-audit-error")
+        with patch.object(
+            self.server.state_store,
+            "risk_state_integrity_issues",
+            side_effect=RuntimeError("audit unavailable"),
+        ):
+            readiness = self.server.readiness()
+        self.assertFalse(readiness["ready"])
+        self.assertFalse(readiness["state_integrity_ok"])
+        self.assertEqual(readiness["state_integrity_issue_count"], 1)
+        self.assertIn(
+            "risk reservation state is unavailable",
+            readiness["reasons"],
+        )
+
     def test_credential_list_rejects_invalid_or_repeated_account_query(self):
         for query in (
             "account_id=invalid%2Faccount",
@@ -1703,6 +2280,189 @@ class CredentialQualificationAPITests(unittest.TestCase):
                     )
                 self.assertEqual(context.exception.code, 400)
                 context.exception.close()
+
+    def test_platform_credential_cannot_change_account_phase(self):
+        credential, _ = self.bootstrap_account(
+            "phase-guard",
+            account_type="two_step",
+            phase="evaluation",
+        )
+        payload = {
+            "account_id": "phase-guard",
+            "account_type": "two_step",
+            "phase": "verification",
+            "style": "standard",
+            "initial_capital": "100000",
+            "day_start_balance": "100000",
+            "highest_settled_balance": "100000",
+            "balance": "100000",
+            "equity": "100000",
+            "current_open_risk": "0",
+            "open_positions_count": 0,
+            "pending_orders_count": 0,
+            "as_of": datetime.now(UTC).isoformat(),
+        }
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/account-sync",
+                payload,
+                credential=credential,
+            )
+        self.assertEqual(context.exception.code, 403)
+        context.exception.close()
+
+        status, body = self.request(
+            "POST",
+            "/v1/account-sync",
+            payload,
+            admin=True,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["snapshot"]["data_uncertain"], False)
+
+    def test_admin_can_resolve_an_unknown_execution(self):
+        account_id = "admin-resolution"
+        credential, _ = self.bootstrap_account(account_id)
+        request_id = "admin-resolution-r1"
+        self.request(
+            "POST",
+            "/v1/evaluate",
+            {
+                "account_id": account_id,
+                "request": _open_request(datetime.now(UTC).isoformat()),
+            },
+            credential=credential,
+            request_id=request_id,
+        )
+        _, unknown = self.request(
+            "POST",
+            "/v1/execution-result",
+            {
+                "account_id": account_id,
+                "request_id": request_id,
+                "outcome": "unknown",
+                "action": "open",
+                "symbol": "EURUSD",
+                "occurred_at": datetime.now(UTC).isoformat(),
+                "platform_status": "timeout",
+            },
+            credential=credential,
+        )
+        self.assertFalse(unknown["reservation_released"])
+        _, reservations = self.request(
+            "GET",
+            f"/v1/admin/execution-reservations?account_id={account_id}",
+            admin=True,
+        )
+        self.assertEqual(len(reservations["reservations"]), 1)
+        _, resolved = self.request(
+            "POST",
+            "/v1/execution-result",
+            {
+                "account_id": account_id,
+                "request_id": request_id,
+                "outcome": "failure",
+                "action": "open",
+                "symbol": "EURUSD",
+                "occurred_at": datetime.now(UTC).isoformat(),
+                "platform_status": "rejected",
+            },
+            admin=True,
+        )
+        self.assertTrue(resolved["resolved_unknown"])
+
+    def test_account_execution_status_reflects_admin_resolution(self):
+        account_id = "execution-status"
+        credential, _ = self.bootstrap_account(account_id)
+        request_id = "execution-status-r1"
+        self.request(
+            "POST",
+            "/v1/evaluate",
+            {
+                "account_id": account_id,
+                "request": _open_request(datetime.now(UTC).isoformat()),
+            },
+            credential=credential,
+            request_id=request_id,
+        )
+        self.request(
+            "POST",
+            "/v1/execution-result",
+            {
+                "account_id": account_id,
+                "request_id": request_id,
+                "outcome": "unknown",
+                "action": "open",
+                "symbol": "EURUSD",
+                "occurred_at": datetime.now(UTC).isoformat(),
+                "platform_status": "timeout",
+            },
+            credential=credential,
+        )
+        _, blocked = self.request(
+            "POST",
+            "/v1/execution-status",
+            {"account_id": account_id},
+            credential=credential,
+        )
+        self.assertTrue(blocked["risk_increase_blocked"])
+        self.assertEqual(blocked["unknown_execution_records"], 1)
+        self.assertFalse(blocked["reconciliation_complete"])
+
+        self.request(
+            "POST",
+            "/v1/execution-result",
+            {
+                "account_id": account_id,
+                "request_id": request_id,
+                "outcome": "failure",
+                "action": "open",
+                "symbol": "EURUSD",
+                "occurred_at": datetime.now(UTC).isoformat(),
+                "platform_status": "rejected",
+            },
+            admin=True,
+        )
+        _, cleared = self.request(
+            "POST",
+            "/v1/execution-status",
+            {"account_id": account_id},
+            credential=credential,
+        )
+        self.assertFalse(cleared["risk_increase_blocked"])
+        self.assertEqual(cleared["unknown_execution_records"], 0)
+        self.assertTrue(cleared["reconciliation_complete"])
+
+    def test_ready_rejects_orphaned_unknown_execution_record(self):
+        account_id = "orphaned-unknown-ready"
+        self.bootstrap_account(account_id)
+        with closing(sqlite3.connect(self.state_path)) as connection:
+            connection.execute(
+                """
+                INSERT INTO executions (
+                    account_id, request_id, request_hash, action, symbol,
+                    outcome, response_json, created_at
+                ) VALUES (?, ?, ?, 'open', 'EURUSD', 'unknown', ?, ?)
+                """,
+                (
+                    account_id,
+                    "orphaned-unknown-r1",
+                    "f" * 64,
+                    json.dumps({"ok": True, "outcome": "unknown"}),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            connection.commit()
+        with self.assertRaises(HTTPError) as context:
+            self.request("GET", "/ready", admin=True)
+        self.assertEqual(context.exception.code, 503)
+        body = json.loads(context.exception.read())
+        self.assertIn(
+            "one or more execution outcomes are unknown",
+            body["readiness_reasons"],
+        )
+        context.exception.close()
 
     def test_account_credential_is_bound_to_account_and_scope(self):
         credential, _ = self.bootstrap_account("bound-account")
@@ -1851,6 +2611,18 @@ class CredentialQualificationAPITests(unittest.TestCase):
             admin=True,
         )
         self.assertNotIn("secret", listed["credentials"][0])
+
+    def test_credential_rotation_rejects_boolean_overlap(self):
+        _, credential_id = self.bootstrap_account("rotation-input")
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                f"/v1/admin/credentials/{credential_id}/rotate",
+                {"overlap_seconds": True},
+                admin=True,
+            )
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
 
     def test_settlement_endpoint_accepts_account_settlement_scope(self):
         now = datetime.now(UTC)

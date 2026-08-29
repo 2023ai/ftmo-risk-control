@@ -27,6 +27,7 @@ X-Account-Credential: <one-account-secret>
   "ok": true,
   "service": "ftmo-risk-api",
   "rule_version": "ftmo-v5-2026-08-26",
+  "rule_config_consistent": true,
   "ready_for_risk_increase": true,
   "readiness_reasons": [],
   "news_data_age_seconds": 0,
@@ -35,12 +36,15 @@ X-Account-Credential: <one-account-secret>
   "database_up": true,
   "unknown_execution_records": 0,
   "account_credentials_required": true,
+  "tls_enabled": false,
   "mtls_enabled": false,
   "mtls_client_certificate_required": false
 }
 ```
 
-新闻和休市字段还包含最近持久化时间、年龄、配置阈值、覆盖起止时间、当前所需覆盖窗口、是否过期和规则版本。规则版本不匹配的持久化快照不会被加载。
+新闻和休市字段还包含最近持久化时间、年龄、配置阈值、覆盖起止时间、当前所需覆盖窗口、是否过期和规则版本。规则版本不匹配的持久化快照不会被加载。`rule_config_consistent=false` 表示同一 `rule_version` 已被检测到不同的风险规则配置；服务仍返回健康与排障信息，但新增风险评估返回 `REJECT_RULE_DRIFT`，`/ready` 返回 `503`。
+
+`tls_enabled` 表示监听器是否使用服务器 TLS；`mtls_enabled` 和 `mtls_client_certificate_required` 只在服务端要求并验证客户端证书时为 `true`。普通 HTTPS/TLS 不等于 mTLS。
 
 ## `GET /ready`
 
@@ -278,6 +282,8 @@ X-Account-Credential: <one-account-secret>
 ## `POST /v1/execution-result`
 
 平台执行后回传结果。明确失败的开仓会释放开仓频率名额，明确失败的修改会释放修改冷却预留；超时、仅确认已受理或结果未知时使用 `outcome: "unknown"`，保留预留并在服务器端锁住该账户的新增风险。关闭、减仓和撤单仍可评估。平台最终核对到结果后，可用相同 `request_id` 和相同动作/品种补报 `success` 或 `failure` 解除未知状态；补报 `failure` 会释放相应预留。相同最终结果重试返回保存结果；同一 ID 复用不同动作或品种会被拒绝。
+
+已批准的评估请求具有一次性消费语义：同一 `request_id` 在执行结果尚未回传时再次调用 `/v1/evaluate`，也会返回 `REJECT_REQUEST_REPLAY`，不会重新返回 `ALLOW`。未知执行状态下的重试会继续返回 `REJECT_UNKNOWN_EXECUTION`，直至最终结果完成核对。
 
 ```json
 {

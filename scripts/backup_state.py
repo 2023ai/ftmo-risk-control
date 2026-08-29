@@ -22,7 +22,11 @@ def main() -> None:
     state_path = Path(args.state).expanduser()
     if not state_path.is_file():
         parser.error(f"state database does not exist: {state_path}")
-    destination = StateStore(state_path).backup_to(Path(args.output))
+    store = StateStore(state_path)
+    try:
+        destination = store.backup_to(Path(args.output))
+    finally:
+        store.close()
     print(
         json.dumps(
             {

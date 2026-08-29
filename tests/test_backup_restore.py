@@ -1,6 +1,8 @@
 import os
 import stat
+import sqlite3
 import tempfile
+from contextlib import closing
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -90,6 +92,101 @@ class BackupRestoreTests(unittest.TestCase):
                 restore(self.backup, self.destination)
         finally:
             server.server_close()
+
+    def test_restore_accepts_an_inactive_advisory_server_lock(self):
+        server = make_server(
+            "127.0.0.1",
+            0,
+            "config/ftmo-v2.json",
+            auth_token="admin-token",
+            state_path=self.destination,
+        )
+        server.server_close()
+
+        restored_path = restore(self.backup, self.destination)
+
+        self.assertEqual(restored_path, self.destination.resolve())
+        self.assertEqual(
+            StateStore(restored_path).get_account("restore-account").snapshot.balance,
+            Decimal("101000"),
+        )
+
+    def test_restore_rejects_incomplete_backup_without_creating_destination(self):
+        incomplete = self.directory / "incomplete.db"
+        with closing(sqlite3.connect(incomplete)) as connection:
+            connection.execute(
+                "CREATE TABLE accounts (account_id TEXT PRIMARY KEY)"
+            )
+            connection.execute(
+                "CREATE TABLE calendar_snapshots (calendar_type TEXT PRIMARY KEY)"
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "required risk state tables"):
+            restore(incomplete, self.destination)
+        self.assertFalse(self.destination.exists())
+
+    def test_restore_rejects_backup_without_risk_reservations(self):
+        incomplete = self.directory / "missing-reservations.db"
+        with closing(sqlite3.connect(self.backup)) as source_connection, closing(
+            sqlite3.connect(incomplete)
+        ) as target_connection:
+            source_connection.backup(target_connection)
+            target_connection.commit()
+        with closing(sqlite3.connect(incomplete)) as connection:
+            connection.execute("DROP TABLE risk_reservations")
+            connection.commit()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "risk_reservations",
+        ):
+            restore(incomplete, self.destination)
+        self.assertFalse(self.destination.exists())
+
+    def test_restore_migrates_a_v1_backup_without_rule_fingerprints(self):
+        legacy = self.directory / "v1-backup.db"
+        with closing(sqlite3.connect(self.backup)) as source_connection, closing(
+            sqlite3.connect(legacy)
+        ) as target_connection:
+            source_connection.backup(target_connection)
+            target_connection.commit()
+        with closing(sqlite3.connect(legacy)) as connection:
+            connection.execute("DROP TABLE rule_config_fingerprints")
+            connection.execute("PRAGMA user_version = 1")
+            connection.commit()
+
+        restored_path = restore(legacy, self.destination)
+
+        restored = StateStore(restored_path)
+        self.assertTrue(restored.database_healthy())
+        self.assertTrue(
+            restored.pin_rule_config_fingerprint(
+                rule_version="restore-v2-rules",
+                config_fingerprint="a" * 64,
+            )
+        )
+
+    def test_restore_rejects_symbolic_link_destination(self):
+        outside = self.directory / "outside.db"
+        outside.write_bytes(b"do not replace")
+        os.symlink(outside, self.destination)
+
+        with self.assertRaisesRegex(ValueError, "symbolic link"):
+            restore(self.backup, self.destination)
+        self.assertEqual(outside.read_bytes(), b"do not replace")
+
+    def test_restore_rejects_symbolic_link_parent_directory(self):
+        real_parent = self.directory / "real-destination"
+        real_parent.mkdir()
+        linked_parent = self.directory / "linked-destination"
+        os.symlink(real_parent, linked_parent)
+        target = linked_parent / "destination.db"
+
+        with self.assertRaisesRegex(ValueError, "symbolic link"):
+            restore(self.backup, target)
+        self.assertFalse(target.exists())
+        self.assertEqual(list(real_parent.iterdir()), [])
 
 
 if __name__ == "__main__":

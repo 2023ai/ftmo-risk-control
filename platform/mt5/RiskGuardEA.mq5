@@ -43,6 +43,9 @@ string JsonQuote(string value)
 {
    StringReplace(value, "\\", "\\\\");
    StringReplace(value, "\"", "\\\"");
+   StringReplace(value, "\r", "\\r");
+   StringReplace(value, "\n", "\\n");
+   StringReplace(value, "\t", "\\t");
    return "\"" + value + "\"";
 }
 
@@ -72,11 +75,31 @@ string NextRequestId(string action)
          "%I64d.%I64u",
          AccountInfoInteger(ACCOUNT_LOGIN),
          MagicNumber);
-   double current = GlobalVariableCheck(counter_name)
-      ? GlobalVariableGet(counter_name)
-      : 0.0;
-   double next = current + 1.0;
-   if(GlobalVariableSet(counter_name, next) == 0)
+   double next = 0.0;
+   bool reserved = false;
+   for(int attempt = 0; attempt < 16; attempt++)
+   {
+      if(!GlobalVariableCheck(counter_name))
+      {
+         // The initial write is harmless if two EA instances start together;
+         // the compare-and-set below serializes every increment.
+         GlobalVariableSet(counter_name, 0.0);
+      }
+      double current = GlobalVariableGet(counter_name);
+      if(current < 0.0 || current > 9007199254740000.0)
+      {
+         current = 0.0;
+         GlobalVariableSet(counter_name, current);
+      }
+      next = current + 1.0;
+      if(GlobalVariableSetOnCondition(counter_name, next, current))
+      {
+         reserved = true;
+         break;
+      }
+      Sleep(1);
+   }
+   if(!reserved)
    {
       next = (double)GetTickCount64();
    }
@@ -90,9 +113,59 @@ string UlongText(ulong value)
    return StringFormat("%I64u", value);
 }
 
+string UpperText(string value)
+{
+   StringToUpper(value);
+   return value;
+}
+
 bool JsonTrue(string json, string field)
 {
    return StringFind(json, "\"" + field + "\":true") >= 0;
+}
+
+bool JsonFalse(string json, string field)
+{
+   return StringFind(json, "\"" + field + "\":false") >= 0;
+}
+
+bool JsonBooleanPresent(string json, string field)
+{
+   return JsonTrue(json, field) || JsonFalse(json, field);
+}
+
+bool JsonStringMatches(string json, string field, string expected)
+{
+   return StringFind(
+      json,
+      "\"" + field + "\":" + JsonQuote(expected)) >= 0;
+}
+
+bool AccountSyncAccepted(string json, string request_id)
+{
+   return JsonTrue(json, "ok") &&
+      JsonStringMatches(json, "account_id", AccountId) &&
+      JsonStringMatches(json, "request_id", request_id);
+}
+
+bool ExecutionReportAccepted(string json, string request_id)
+{
+   return JsonTrue(json, "ok") &&
+      JsonTrue(json, "execution_recorded") &&
+      JsonStringMatches(json, "account_id", AccountId) &&
+      JsonStringMatches(json, "request_id", request_id);
+}
+
+bool GuardStatusAccepted(string json, string symbol, string request_id)
+{
+   return JsonTrue(json, "ok") &&
+      JsonStringMatches(json, "account_id", AccountId) &&
+      JsonStringMatches(json, "request_id", request_id) &&
+      JsonStringMatches(json, "symbol", UpperText(symbol)) &&
+      JsonBooleanPresent(json, "open_blocked") &&
+      JsonBooleanPresent(json, "force_flat") &&
+      JsonBooleanPresent(json, "cancel_pending") &&
+      JsonBooleanPresent(json, "emergency_alert");
 }
 
 bool PostJson(
@@ -147,6 +220,10 @@ bool PostJson(
 
 double CurrentOpenRisk()
 {
+   if(!MathIsValidNumber(InitialCapital) || InitialCapital <= 0.0)
+   {
+      return 0.0;
+   }
    double total = 0.0;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -154,13 +231,15 @@ double CurrentOpenRisk()
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0 || !PositionSelectByTicket(ticket))
       {
-         continue;
+         // An unreadable position must never disappear from the risk total.
+         return InitialCapital;
       }
 
       string symbol = PositionGetString(POSITION_SYMBOL);
       double volume = PositionGetDouble(POSITION_VOLUME);
       double stop_loss = PositionGetDouble(POSITION_SL);
-      if(stop_loss <= 0.0)
+      if(!MathIsValidNumber(volume) || volume <= 0.0 ||
+         !MathIsValidNumber(stop_loss) || stop_loss <= 0.0)
       {
          return InitialCapital;
       }
@@ -180,7 +259,12 @@ double CurrentOpenRisk()
          position_type == POSITION_TYPE_BUY
          ? tick.bid
          : tick.ask;
-      if(current_price <= 0.0)
+      if(!MathIsValidNumber(current_price) || current_price <= 0.0)
+      {
+         return InitialCapital;
+      }
+      if((position_type == POSITION_TYPE_BUY && stop_loss >= current_price) ||
+         (position_type == POSITION_TYPE_SELL && stop_loss <= current_price))
       {
          return InitialCapital;
       }
@@ -200,6 +284,10 @@ double CurrentOpenRisk()
       if(profit < 0.0)
       {
          total += MathAbs(profit);
+         if(!MathIsValidNumber(total) || total < 0.0)
+         {
+            return InitialCapital;
+         }
       }
    }
 
@@ -240,7 +328,14 @@ double CurrentOpenRisk()
       double volume = OrderGetDouble(ORDER_VOLUME_CURRENT);
       double open_price = OrderGetDouble(ORDER_PRICE_OPEN);
       double stop_loss = OrderGetDouble(ORDER_SL);
-      if(stop_loss <= 0.0)
+      if(!MathIsValidNumber(volume) || volume <= 0.0 ||
+         !MathIsValidNumber(open_price) || open_price <= 0.0 ||
+         !MathIsValidNumber(stop_loss) || stop_loss <= 0.0)
+      {
+         return InitialCapital;
+      }
+      if((calc_type == ORDER_TYPE_BUY && stop_loss >= open_price) ||
+         (calc_type == ORDER_TYPE_SELL && stop_loss <= open_price))
       {
          return InitialCapital;
       }
@@ -258,6 +353,10 @@ double CurrentOpenRisk()
       if(profit < 0.0)
       {
          total += MathAbs(profit);
+         if(!MathIsValidNumber(total) || total < 0.0)
+         {
+            return InitialCapital;
+         }
       }
    }
    return total;
@@ -295,12 +394,17 @@ bool SyncAccount()
       "\"as_of\":" + JsonQuote(IsoUtcNow())
       + "}";
 
+   string request_id = NextRequestId("sync");
    string response;
-   return PostJson(
+   if(!PostJson(
       "/v1/account-sync",
       payload,
-      NextRequestId("sync"),
-      response);
+      request_id,
+      response))
+   {
+      return false;
+   }
+   return AccountSyncAccepted(response, request_id);
 }
 
 bool LossPerLot(
@@ -321,16 +425,26 @@ bool LossPerLot(
    {
       return false;
    }
+   if(!MathIsValidNumber(profit))
+   {
+      return false;
+   }
    loss_per_lot = MathAbs(profit);
-   return loss_per_lot > 0.0;
+   return MathIsValidNumber(loss_per_lot) && loss_per_lot > 0.0;
 }
 
 double NormalizeVolumeForSymbol(string symbol, double requested_volume)
 {
+   if(!MathIsValidNumber(requested_volume) || requested_volume <= 0.0)
+   {
+      return 0.0;
+   }
    double min_volume = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double max_volume = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
    double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-   if(min_volume <= 0.0 || max_volume <= 0.0 || step <= 0.0)
+   if(!MathIsValidNumber(min_volume) || !MathIsValidNumber(max_volume) ||
+      !MathIsValidNumber(step) || min_volume <= 0.0 ||
+      max_volume <= 0.0 || step <= 0.0)
    {
       return 0.0;
    }
@@ -369,6 +483,17 @@ bool EvaluateRequest(
    {
       return false;
    }
+   if(!JsonTrue(response, "ok") ||
+      !JsonStringMatches(response, "account_id", AccountId) ||
+      !JsonStringMatches(response, "request_id", request_id))
+   {
+      return false;
+   }
+   if(StringFind(response, "REJECT_UNKNOWN_EXECUTION") >= 0)
+   {
+      UnknownExecutionLock = true;
+      GlobalVariableSet(UnknownLockName(), 1.0);
+   }
    return JsonTrue(response, "allowed");
 }
 
@@ -397,11 +522,24 @@ void ReportExecution(
       "\"platform_order_id\":" + JsonQuote(platform_order_id)
       + "}";
    string response;
-   if(!PostJson(
+   bool reported = PostJson(
+      "/v1/execution-result",
+      payload,
+      NextRequestId("execution"),
+      response);
+   reported = reported && ExecutionReportAccepted(response, request_id);
+   if(!reported)
+   {
+      // The body keeps the original request_id, so a transport retry is
+      // idempotent at the server even when the first response was lost.
+      reported = PostJson(
          "/v1/execution-result",
          payload,
-         NextRequestId("execution"),
-         response))
+         NextRequestId("execution-retry"),
+         response);
+      reported = reported && ExecutionReportAccepted(response, request_id);
+   }
+   if(!reported)
    {
       UnknownExecutionLock = true;
       GlobalVariableSet(UnknownLockName(), 1.0);
@@ -409,6 +547,51 @@ void ReportExecution(
          "RiskGuard: execution audit unresolved request_id=%s",
          request_id);
    }
+}
+
+bool RefreshUnknownExecutionLock()
+{
+   string payload =
+      "{\"account_id\":" + JsonQuote(AccountId) + "}";
+   string request_id = NextRequestId("execution-status");
+   string response;
+   if(!PostJson(
+         "/v1/execution-status",
+         payload,
+         request_id,
+         response))
+   {
+      return false;
+   }
+   if(!JsonTrue(response, "ok") ||
+      !JsonStringMatches(response, "account_id", AccountId) ||
+      !JsonStringMatches(response, "request_id", request_id) ||
+      !JsonBooleanPresent(response, "risk_increase_blocked") ||
+      !JsonBooleanPresent(response, "reconciliation_complete"))
+   {
+      return false;
+   }
+   if(JsonTrue(response, "risk_increase_blocked"))
+   {
+      UnknownExecutionLock = true;
+      GlobalVariableSet(UnknownLockName(), 1.0);
+      return true;
+   }
+   if(JsonFalse(response, "reconciliation_complete"))
+   {
+      // A pending reservation may not be visible as an unknown execution
+      // yet. Keep the local fail-closed lock until the server is complete.
+      UnknownExecutionLock = true;
+      GlobalVariableSet(UnknownLockName(), 1.0);
+      return true;
+   }
+   if(JsonFalse(response, "risk_increase_blocked"))
+   {
+      UnknownExecutionLock = false;
+      GlobalVariableDel(UnknownLockName());
+      return true;
+   }
+   return false;
 }
 
 bool TradeRetcodeSuccessful(uint retcode)
@@ -473,10 +656,21 @@ bool RiskGuardMarket(
    double take_profit,
    string idea_id)
 {
+   if(!MathIsValidNumber(volume) || !MathIsValidNumber(stop_loss) ||
+      !MathIsValidNumber(take_profit) || volume <= 0.0 ||
+      stop_loss <= 0.0 || take_profit < 0.0)
+   {
+      Print("RiskGuard: market request contains invalid numeric values");
+      return false;
+   }
    if(UnknownExecutionLock)
    {
-      Print("RiskGuard: new risk blocked by unknown execution lock");
-      return false;
+      RefreshUnknownExecutionLock();
+      if(UnknownExecutionLock)
+      {
+         Print("RiskGuard: new risk blocked by unknown execution lock");
+         return false;
+      }
    }
    volume = NormalizeVolumeForSymbol(symbol, volume);
    if(volume <= 0.0 || stop_loss <= 0.0)
@@ -494,6 +688,11 @@ bool RiskGuardMarket(
 
    bool is_buy = order_type == ORDER_TYPE_BUY;
    double entry_price = is_buy ? tick.ask : tick.bid;
+   if(!MathIsValidNumber(entry_price) || entry_price <= 0.0)
+   {
+      Print("RiskGuard: current entry price is invalid");
+      return false;
+   }
    if((is_buy && stop_loss >= entry_price) ||
       (!is_buy && stop_loss <= entry_price))
    {
@@ -518,6 +717,7 @@ bool RiskGuardMarket(
       "{"
       "\"symbol\":" + JsonQuote(symbol) + ","
       "\"action\":\"open\","
+      "\"side\":" + JsonQuote(is_buy ? "buy" : "sell") + ","
       "\"requested_at\":" + JsonQuote(IsoUtcNow()) + ","
       "\"volume\":\"" + DoubleToString(volume, 8) + "\","
       "\"entry_price\":\"" + DoubleToString(entry_price, 8) + "\","
@@ -644,7 +844,8 @@ bool RiskGuardClose(ulong position_ticket)
 
 bool RiskGuardClosePartial(ulong position_ticket, double volume)
 {
-   if(volume <= 0.0 || !PositionSelectByTicket(position_ticket))
+   if(!MathIsValidNumber(volume) || volume <= 0.0 ||
+      !PositionSelectByTicket(position_ticket))
    {
       return false;
    }
@@ -692,6 +893,11 @@ bool RiskGuardModifyPosition(
    double take_profit,
    bool is_risk_increasing)
 {
+   if(!MathIsValidNumber(stop_loss) || !MathIsValidNumber(take_profit))
+   {
+      Print("RiskGuard: position modification contains invalid prices");
+      return false;
+   }
    if(!PositionSelectByTicket(position_ticket))
    {
       return false;
@@ -723,6 +929,11 @@ bool RiskGuardModifyPosition(
    }
    double current_price =
       position_type == POSITION_TYPE_BUY ? tick.bid : tick.ask;
+   if(!MathIsValidNumber(current_price) || current_price <= 0.0)
+   {
+      Print("RiskGuard: current modification price is invalid");
+      return false;
+   }
    if((position_type == POSITION_TYPE_BUY && stop_loss >= current_price) ||
       (position_type == POSITION_TYPE_SELL && stop_loss <= current_price))
    {
@@ -732,6 +943,11 @@ bool RiskGuardModifyPosition(
    double current_risk = InitialCapital;
    double new_risk = 0.0;
    double profit = 0.0;
+   if(!MathIsValidNumber(current_stop))
+   {
+      Print("RiskGuard: current stop loss is invalid");
+      return false;
+   }
    if(current_stop > 0.0 &&
       OrderCalcProfit(
          order_type,
@@ -763,8 +979,18 @@ bool RiskGuardModifyPosition(
       Print("RiskGuard: unable to calculate modified stop risk");
       return false;
    }
+   if(!MathIsValidNumber(current_risk) || !MathIsValidNumber(new_risk) ||
+      current_risk < 0.0 || new_risk < 0.0)
+   {
+      Print("RiskGuard: position risk calculation is invalid");
+      return false;
+   }
    double additional_risk = MathMax(0.0, new_risk - current_risk);
-   bool effective_risk_increasing = additional_risk > 0.01;
+   bool effective_risk_increasing = additional_risk > 0.00000001;
+   if(effective_risk_increasing && UnknownExecutionLock)
+   {
+      RefreshUnknownExecutionLock();
+   }
    if(effective_risk_increasing && UnknownExecutionLock)
    {
       Print(
@@ -777,10 +1003,12 @@ bool RiskGuardModifyPosition(
       "{"
       "\"symbol\":" + JsonQuote(symbol) + ","
       "\"action\":\"modify\","
+      "\"side\":" + JsonQuote(
+         position_type == POSITION_TYPE_BUY ? "buy" : "sell") + ","
       "\"requested_at\":" + JsonQuote(IsoUtcNow()) + ","
       "\"stop_loss\":\"" + DoubleToString(stop_loss, 8) + "\","
       "\"additional_risk\":\"" +
-         DoubleToString(additional_risk, 2) + "\","
+         DoubleToString(additional_risk, 8) + "\","
       "\"is_risk_increasing\":" +
          (effective_risk_increasing ? "true" : "false")
       + "}";
@@ -856,19 +1084,90 @@ bool GuardStatus(string path, string symbol, string &response)
       "\"symbol\":" + JsonQuote(symbol) + ","
       "\"now\":" + JsonQuote(IsoUtcNow())
       + "}";
-   return PostJson(
+   string request_id = NextRequestId("status");
+   if(!PostJson(
       path,
       payload,
-      NextRequestId("news"),
-      response);
+      request_id,
+      response))
+   {
+      return false;
+   }
+   return GuardStatusAccepted(response, symbol, request_id);
+}
+
+struct GuardStatusCacheEntry
+{
+   string symbol;
+   bool news_ok;
+   string news_response;
+   bool market_ok;
+   string market_response;
+};
+
+int FindGuardStatusCache(
+   GuardStatusCacheEntry &cache[],
+   string symbol)
+{
+   string normalized = UpperText(symbol);
+   for(int i = 0; i < ArraySize(cache); i++)
+   {
+      if(cache[i].symbol == normalized)
+      {
+         return i;
+      }
+   }
+   return -1;
+}
+
+bool EnsureGuardStatusCache(
+   GuardStatusCacheEntry &cache[],
+   string symbol)
+{
+   int existing = FindGuardStatusCache(cache, symbol);
+   if(existing >= 0)
+   {
+      return true;
+   }
+   int index = ArraySize(cache);
+   if(ArrayResize(cache, index + 1) != index + 1)
+   {
+      return false;
+   }
+   cache[index].symbol = UpperText(symbol);
+   cache[index].news_ok =
+      GuardStatus("/v1/news-status", symbol, cache[index].news_response);
+   cache[index].market_ok =
+      GuardStatus("/v1/market-status", symbol, cache[index].market_response);
+   return true;
 }
 
 void RunNewsGuard()
 {
    if(!SyncAccount())
    {
-      Print("RiskGuard: news guard cannot sync account");
-      return;
+      Print("RiskGuard: account sync failed; continuing defensive guard");
+   }
+   RefreshUnknownExecutionLock();
+
+   GuardStatusCacheEntry cache[];
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+      {
+         continue;
+      }
+      EnsureGuardStatusCache(cache, PositionGetString(POSITION_SYMBOL));
+   }
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0 || !OrderSelect(ticket))
+      {
+         continue;
+      }
+      EnsureGuardStatusCache(cache, OrderGetString(ORDER_SYMBOL));
    }
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -879,12 +1178,16 @@ void RunNewsGuard()
          continue;
       }
       string symbol = PositionGetString(POSITION_SYMBOL);
-      string news_response;
-      string market_response;
-      bool news_ok =
-         GuardStatus("/v1/news-status", symbol, news_response);
-      bool market_ok =
-         GuardStatus("/v1/market-status", symbol, market_response);
+      int cache_index = FindGuardStatusCache(cache, symbol);
+      if(cache_index < 0)
+      {
+         Alert("FTMO RiskGuard emergency: status cache unavailable: ", symbol);
+         continue;
+      }
+      string news_response = cache[cache_index].news_response;
+      string market_response = cache[cache_index].market_response;
+      bool news_ok = cache[cache_index].news_ok;
+      bool market_ok = cache[cache_index].market_ok;
       bool force_flat =
          (news_ok && JsonTrue(news_response, "force_flat")) ||
          (market_ok && JsonTrue(market_response, "force_flat"));
@@ -911,12 +1214,16 @@ void RunNewsGuard()
          continue;
       }
       string symbol = OrderGetString(ORDER_SYMBOL);
-      string news_response;
-      string market_response;
-      bool news_ok =
-         GuardStatus("/v1/news-status", symbol, news_response);
-      bool market_ok =
-         GuardStatus("/v1/market-status", symbol, market_response);
+      int cache_index = FindGuardStatusCache(cache, symbol);
+      if(cache_index < 0)
+      {
+         PrintFormat("RiskGuard: status cache unavailable ticket=%I64u", ticket);
+         continue;
+      }
+      string news_response = cache[cache_index].news_response;
+      string market_response = cache[cache_index].market_response;
+      bool news_ok = cache[cache_index].news_ok;
+      bool market_ok = cache[cache_index].market_ok;
       bool cancel_pending =
          (news_ok && JsonTrue(news_response, "cancel_pending")) ||
          (market_ok && JsonTrue(market_response, "cancel_pending"));
@@ -950,8 +1257,33 @@ int OnInit()
       Print("RiskGuard: AccountCredential is required");
       return INIT_PARAMETERS_INCORRECT;
    }
+   if(!MathIsValidNumber(InitialCapital) ||
+      !MathIsValidNumber(BootstrapDayStartBalance) ||
+      !MathIsValidNumber(BootstrapHighestSettledBalance) ||
+      !MathIsValidNumber(EstimatedCostsPerTrade) ||
+      InitialCapital <= 0.0 ||
+      BootstrapDayStartBalance <= 0.0 ||
+      BootstrapHighestSettledBalance < InitialCapital ||
+      EstimatedCostsPerTrade < 0.0)
+   {
+      Print(
+         "RiskGuard: capital, bootstrap balances, and estimated costs "
+         + "are invalid");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(RiskApiTimeoutMs <= 0 || NewsGuardIntervalSeconds <= 0)
+   {
+      Print(
+         "RiskGuard: RiskApiTimeoutMs and NewsGuardIntervalSeconds "
+         + "must be positive");
+      return INIT_PARAMETERS_INCORRECT;
+   }
    LoadUnknownExecutionLock();
-   EventSetTimer(MathMax(1, NewsGuardIntervalSeconds));
+   if(!EventSetTimer(NewsGuardIntervalSeconds))
+   {
+      Print("RiskGuard: unable to start defensive timer");
+      return INIT_FAILED;
+   }
    if(!SyncAccount())
    {
       Print(
